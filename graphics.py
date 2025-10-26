@@ -7,7 +7,8 @@ W, H = 1920, 1080
 BAR_H = 320
 PAD = 64
 
-def _load_font(path, size, fallback=24):
+from PIL import ImageFont
+def _load_font(path, size):
     try:
         return ImageFont.truetype(path, size)
     except Exception:
