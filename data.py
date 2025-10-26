@@ -1,63 +1,82 @@
-
+# data.py — лёгкая версия для Vercel Free
 import os
 from pathlib import Path
-import requests
-from nba_api.stats.static import players
-from nba_api.stats.endpoints import commonplayerinfo
+from PIL import Image, ImageDraw
 
 ASSETS = Path("assets")
 CACHE = ASSETS / "cache"
 CACHE.mkdir(parents=True, exist_ok=True)
 
+# Мини-палитры (добавим позже все 30)
 TEAM_PALETTES = {
-    1610612759: ("#000000", "#191A1C", "#FFFFFF"),  # SAS
-    1610612755: ("#006BB6", "#002B5C", "#ED174C"),  # PHI
-    1610612740: ("#0C2340", "#C8102E", "#85714D"),  # NOP (пример)
-    1610612762: ("#002B5C", "#6CAEDF", "#FFFFFF"),  # UTA (пример)
+    1610612759: ("#000000", "#191A1C", "#FFFFFF"),  # Spurs
+    1610612740: ("#0C2340", "#C8102E", "#85714D"),  # Pelicans
+}
+
+# Мини-словарь игроков для теста (можно дополнять)
+PLAYER_INDEX = {
+    "victor wembanyama": {
+        "id": 1641705,
+        "full_name": "Victor Wembanyama",
+        "display": "VICTOR WEMBANYAMA",
+        "team_id": 1610612759,
+        "team_name": "San Antonio Spurs",
+    },
+    "виктор вембаньяма": {
+        "id": 1641705,
+        "full_name": "Victor Wembanyama",
+        "display": "ВИКТОР ВЕМБАНЬЯМА",
+        "team_id": 1610612759,
+        "team_name": "San Antonio Spurs",
+    },
+    "zion williamson": {
+        "id": 1629627,
+        "full_name": "Zion Williamson",
+        "display": "ZION WILLIAMSON",
+        "team_id": 1610612740,
+        "team_name": "New Orleans Pelicans",
+    },
+    "зайон уильямсон": {
+        "id": 1629627,
+        "full_name": "Zion Williamson",
+        "display": "ЗАЙОН УИЛЬЯМСОН",
+        "team_id": 1610612740,
+        "team_name": "New Orleans Pelicans",
+    },
 }
 
 def find_player_by_name(name: str):
-    name = name.strip()
-    found = players.find_players_by_full_name(name)
-    if not found:
+    key = (name or "").strip().lower()
+    p = PLAYER_INDEX.get(key)
+    if not p:
         return None
-    p = found[0]
-    pid = p["id"]
-    info = commonplayerinfo.CommonPlayerInfo(player_id=pid).get_dict()["resultSets"][0]["rowSet"][0]
-    team_id = info[18]
-    team_name = info[20]
-    display = info[3]
-    return {
-        "id": pid,
-        "full_name": p["full_name"],
-        "display": display,
-        "team_id": team_id,
-        "team_name": team_name,
-    }
+    return p
 
 def ensure_headshot_png(player_id: int, fallback_name: str) -> str:
-    url = f"https://cdn.nba.com/headshots/nba/latest/1040x760/{player_id}.png"
+    """Пытаемся взять headshot из NBA CDN, иначе рисуем плейсхолдер."""
     path = CACHE / f"head_{player_id}.png"
     if not path.exists():
         try:
-            r = requests.get(url, timeout=20)
+            import requests
+            url = f"https://cdn.nba.com/headshots/nba/latest/1040x760/{player_id}.png"
+            r = requests.get(url, timeout=10)
             r.raise_for_status()
             with open(path, "wb") as f:
                 f.write(r.content)
         except Exception:
-            from PIL import Image, ImageDraw
-            im = Image.new("RGBA", (1040, 760), (128, 128, 128, 255))
-            d = ImageDraw.Draw(im); d.text((20, 20), fallback_name, fill=(255,255,255,255))
+            im = Image.new("RGBA", (1040, 760), (60, 60, 60, 255))
+            d = ImageDraw.Draw(im)
+            d.text((40, 40), fallback_name, fill=(255, 255, 255, 255))
             im.save(path)
     return str(path)
 
 def ensure_team_logo_png(team_id: int):
-    import cairosvg
-    svg_url = f"https://cdn.nba.com/logos/nba/{team_id}/global/L/logo.svg"
+    """Берём PNG логотип из assets/cache если есть, иначе плейсхолдер-иконка."""
     png_path = CACHE / f"logo_{team_id}.png"
-    if not png_path.exists():
-        r = requests.get(svg_url, timeout=20)
-        r.raise_for_status()
-        cairosvg.svg2png(bytestring=r.content, write_to=str(png_path), output_width=320, output_height=320)
+    if png_path.exists():
+        colors = TEAM_PALETTES.get(team_id, ("#FF6A00", "#1A1A1A", "#FFFFFF"))
+        return str(png_path), colors
+    # плейсхолдер — звезда
+    placeholder = ASSETS / "icons" / "star.png"
     colors = TEAM_PALETTES.get(team_id, ("#FF6A00", "#1A1A1A", "#FFFFFF"))
-    return str(png_path), colors
+    return str(placeholder), colors
