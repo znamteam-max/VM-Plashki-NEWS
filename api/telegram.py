@@ -1,10 +1,13 @@
-# /api/telegram.py — Vercel Serverless (FastAPI)
+# /api/telegram.py — Vercel Serverless (FastAPI) для Telegram webhook
 # Работают пути:
 #  GET  /api/telegram
 #  GET  /api/telegram/healthz
-#  POST /api/telegram?secret=...             (рекомендовано для вебхука)
+#  POST /api/telegram?secret=...             (рекомендуемый вебхук)
 #  POST /api/telegram/webhook/<secret>       (альтернатива)
-#  — а также их «укороченные» аналоги "/" и "/webhook/..." на всякий случай.
+#
+# Требуемые переменные окружения (Vercel → Settings → Environment Variables, Production):
+#   BOT_TOKEN       — токен бота от @BotFather
+#   WEBHOOK_SECRET  — строка-секрет, должна совпадать с тем, что в URL вебхука
 
 import os
 import re
@@ -17,19 +20,25 @@ app = FastAPI()
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "hook")
 
+# число + (опц.)% + короткая подпись
 STAT_PAIR_RE = re.compile(
     r"(?P<num>[-+]?\d+(?:[.,]\d+)?)\s*([%]?)\s*(?P<label>[A-Za-zА-Яа-яёЁ+\-/ ]{0,20})"
 )
 
-# ---------- утилиты ----------
+# ---------- разбор команды ----------
 def parse_card(text: str):
-    # /card Имя | 25 очков, 12 подборов | impact | подпись(опц.)
+    """
+    Ожидается:
+      /card Имя Игрока | 25 очков, 12 подборов, 3 блокшота | impact | подпись(опц.)
+    Возвращает: (name, stats[:6], template, note)
+    """
     if not text or not text.lower().startswith("/card"):
         return None
     body = text.split(" ", 1)[1] if " " in text else ""
     parts = [p.strip() for p in body.split("|")]
     if len(parts) < 2:
         return None
+
     name = parts[0]
     raw_stats = parts[1]
     template = (parts[2].strip().lower() if len(parts) >= 3 and parts[2] else "single")
@@ -46,17 +55,17 @@ def parse_card(text: str):
             stats.append((num, label))
     return name, stats[:6], template, note
 
-
-def tg_send_photo(chat_id: int, png_bytes: bytes, caption: str | None = None):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    files = {"photo": ("card.png", png_bytes, "image/png")}
+# ---------- отправка PNG как файла (без сжатия) ----------
+def tg_send_png(chat_id: int, png_bytes: bytes, caption: str | None = None):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+    files = {"document": ("card.png", png_bytes, "image/png")}
     data = {"chat_id": chat_id}
     if caption:
         data["caption"] = caption
     r = requests.post(url, data=data, files=files, timeout=30)
     return r.ok, r.text
 
-
+# ---------- общий обработчик апдейта ----------
 async def handle_update(update: dict) -> JSONResponse:
     msg = update.get("message") or update.get("edited_message") or update.get("channel_post")
     if not msg:
@@ -71,13 +80,16 @@ async def handle_update(update: dict) -> JSONResponse:
                 "/card Имя Игрока | 25 очков, 12 подборов, 3 блокшота | impact | подпись\n"
                 "Шаблоны: single, pair, single_note, impact, bad")
         try:
-            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                          json={"chat_id": chat_id, "text": hint}, timeout=15)
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": hint},
+                timeout=15,
+            )
         except Exception:
             pass
         return JSONResponse({"ok": True})
 
-    # ленивые импорты генератора и лёгких данных (без записи в read-only)
+    # ленивые импорты, чтобы не падать при холодном старте
     from graphics import render_card
     from data import find_player_by_name, ensure_headshot_png, ensure_team_logo_png
 
@@ -85,16 +97,20 @@ async def handle_update(update: dict) -> JSONResponse:
     player = find_player_by_name(name)
     if not player:
         try:
-            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                          json={"chat_id": chat_id, "text": "Игрок не найден. Уточните имя."}, timeout=15)
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": "Игрок не найден. Уточните имя."},
+                timeout=15,
+            )
         except Exception:
             pass
         return JSONResponse({"ok": True})
 
-    # ассеты (логотип — PNG из assets или плейсхолдер; headshot — скачиваем в /tmp)
+    # ассеты (логотип — PNG из репо/плейсхолдер; headshot — кэш в /tmp)
     logo_path, team_colors = ensure_team_logo_png(player["team_id"])
     head_path = ensure_headshot_png(player["id"], player["full_name"])
 
+    # рендер и отправка
     png_bytes = render_card(
         template=template,
         player_name=player["display"] or player["full_name"],
@@ -106,12 +122,14 @@ async def handle_update(update: dict) -> JSONResponse:
         note=note,
     )
 
-    ok, resp = tg_send_photo(chat_id, png_bytes)
+    ok, resp = tg_send_png(chat_id, png_bytes)
     if not ok:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      json={"chat_id": chat_id, "text": f"Ошибка отправки изображения: {resp}"}, timeout=15)
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage}",
+            json={"chat_id": chat_id, "text": f"Ошибка отправки изображения: {resp}"},
+            timeout=15,
+        )
     return JSONResponse({"ok": True})
-
 
 # ---------- health ----------
 @app.get("/")
@@ -128,7 +146,6 @@ def health():
         ],
     }
 
-
 # ---------- webhook: секрет в query ----------
 @app.post("/")
 @app.post("/api/telegram")
@@ -136,11 +153,13 @@ async def webhook_query(request: Request, secret: str = Query(default="")):
     if not BOT_TOKEN:
         raise HTTPException(status_code=500, detail="BOT_TOKEN not set")
     if secret != WEBHOOK_SECRET:
-        # маскируем как 404: без секрета — Not Found
+        # маскируем как 404, чтобы нельзя было дёргать без секрета
         raise HTTPException(status_code=404, detail="Not found")
-    update = await request.json()
+    try:
+        update = await request.json()
+    except Exception:
+        return JSONResponse({"ok": True})
     return await handle_update(update)
-
 
 # ---------- webhook: секрет в path ----------
 @app.post("/webhook/{secret}")
@@ -150,5 +169,8 @@ async def webhook_path(request: Request, secret: str):
         raise HTTPException(status_code=500, detail="BOT_TOKEN not set")
     if secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=404, detail="Not found")
-    update = await request.json()
+    try:
+        update = await request.json()
+    except Exception:
+        return JSONResponse({"ok": True})
     return await handle_update(update)
