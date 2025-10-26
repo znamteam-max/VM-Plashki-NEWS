@@ -1,0 +1,6 @@
+python-telegram-bot==21.6
+pillow==10.4.0
+requests==2.32.3
+nba_api==1.6.1
+cairosvg==2.7.1
+python-dotenv==1.0.1
