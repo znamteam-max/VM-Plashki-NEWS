@@ -1,5 +1,3 @@
-# graphics.py — правильные bbox (без налезаний) + нормальные отступы + динамическая ширина
-
 from typing import List, Tuple, Optional
 from PIL import Image, ImageDraw, ImageFont
 import io
@@ -8,16 +6,22 @@ import io
 W, H = 1920, 1080
 
 # Панель
-BAR_H          = 360     # побольше воздуха по вертикали
+BAR_H          = 380
 PAD_L          = 56
 PAD_R          = 56
 TOP_IN         = 36
 BOT_IN         = 32
 
 # Интервалы
-NAME_STATS_GAP = 32      # между ИМЕНЕМ и метриками
-BLOCK_HGAP     = 64      # между блоками метрик
-INNER_VGAP     = 18      # между числом и подписью внутри блока
+NAME_STATS_GAP = 42      # между ИМЕНЕМ и метриками
+BLOCK_HGAP     = 68      # между блоками метрик
+INNER_VGAP     = 22      # между значением и подписью в блоке
+
+# Доп. паддинги для «воздуха», чтобы слои НЕ липли
+NAME_PAD_TOP       = 10
+NAME_PAD_BOTTOM    = 12
+BLOCK_PAD_TOP      = 8
+BLOCK_PAD_BOTTOM   = 10
 
 # Размеры головы/логотипа
 HEAD_SIZE      = 380
@@ -35,7 +39,7 @@ def _load_font(path: str, size: int):
     except Exception:
         return ImageFont.load_default()
 
-# Базовые размеры шрифтов
+# Базовые размеры
 BASE_NAME = 60
 BASE_VAL  = 50
 BASE_LBL  = 36
@@ -43,36 +47,37 @@ TAG_MAX_W = 280
 TAG_MAX_S = 42
 
 def _text_img(text: str, font: ImageFont.FreeTypeFont, fill=(255,255,255,255)) -> Image.Image:
-    """Рисует текст БЕЗ обрезаний: учитывает отрицательные отступы bbox."""
-    # сначала считаем bbox через textbbox (даёт реальные границы)
-    probe = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    # рисуем с учётом реального bbox (без «срезов»)
+    probe = Image.new("RGBA", (1, 1))
     d = ImageDraw.Draw(probe)
-    left, top, right, bottom = d.textbbox((0, 0), text, font=font)
-    w, h = right - left, bottom - top
-    img = Image.new("RGBA", (max(1, w), max(1, h)), (0, 0, 0, 0))
-    ImageDraw.Draw(img).text((-left, -top), text, font=font, fill=fill)
+    l, t, r, b = d.textbbox((0, 0), text, font=font)
+    w, h = r - l, b - t
+    img = Image.new("RGBA", (max(1, w), max(1, h)), (0,0,0,0))
+    ImageDraw.Draw(img).text((-l, -t), text, font=font, fill=fill)
     return img
 
+def _pad_v(img: Image.Image, top: int, bottom: int) -> Image.Image:
+    if top <= 0 and bottom <= 0:
+        return img
+    out = Image.new("RGBA", (img.width, img.height + max(0, top) + max(0, bottom)), (0,0,0,0))
+    out.alpha_composite(img, (0, max(0, top)))
+    return out
+
 def _fit_text_to_width(text: str, font_path: str, max_w: int, max_size: int, min_size: int = 26):
-    """Подбираем размер шрифта по ширине и возвращаем готовую картинку текста."""
     lo, hi = min_size, max_size
-    best_font = _load_font(font_path, lo)
-
-    probe = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    probe = Image.new("RGBA", (1, 1))
     d = ImageDraw.Draw(probe)
-
+    best = _load_font(font_path, lo)
     while lo <= hi:
         mid = (lo + hi) // 2
         f = _load_font(font_path, mid)
         l, t, r, b = d.textbbox((0, 0), text, font=f)
-        w = r - l
-        if w <= max_w:
-            best_font = f
+        if r - l <= max_w:
+            best = f
             lo = mid + 1
         else:
             hi = mid - 1
-
-    return _text_img(text, best_font), best_font
+    return _text_img(text, best), best
 
 def _circle_crop(path: str, d: int) -> Image.Image:
     im = Image.open(path).convert("RGBA")
@@ -102,16 +107,19 @@ def _metric_line(
         val_img = _text_img(v,   f_val, color)
         lbl_img = _text_img(lab, f_lbl, color) if lab else Image.new("RGBA", (1,1), (0,0,0,0))
 
-        # вертикальная сборка: значение сверху, подпись снизу, между ними vgap
         w = max(val_img.width, lbl_img.width)
         h = val_img.height + vgap + lbl_img.height
+
         block = Image.new("RGBA", (w, h), (0,0,0,0))
         block.alpha_composite(val_img, ((w - val_img.width)//2, 0))
         block.alpha_composite(lbl_img, ((w - lbl_img.width)//2, val_img.height + vgap))
 
+        # внешний вертикальный «воздух» блока
+        block = _pad_v(block, BLOCK_PAD_TOP, BLOCK_PAD_BOTTOM)
+
         blocks.append(block)
-        total_w += w
-        max_h = max(max_h, h)
+        total_w += block.width
+        max_h = max(max_h, block.height)
 
     total_w += hgap * (len(blocks) - 1) if blocks else 0
     line = Image.new("RGBA", (max(1,total_w), max_h), (0,0,0,0))
@@ -134,7 +142,7 @@ def render_card(
     primary, dark, light = team_colors
     canvas = Image.new("RGBA", (W, H), (0,0,0,0))
 
-    # -------- элементы заранее (чтобы посчитать ширину панели) --------
+    # Элементы заранее
     head = _circle_crop(headshot_path, HEAD_SIZE)
 
     logo_raw = Image.open(team_logo_path).convert("RGBA").resize((LOGO_SIZE, LOGO_SIZE), Image.LANCZOS)
@@ -143,24 +151,25 @@ def render_card(
     logo_circle.putalpha(m)
     logo_circle.alpha_composite(logo_raw, ((LOGO_D - LOGO_SIZE)//2, (LOGO_D - LOGO_SIZE)//2))
 
-    # Имя (с подгонкой по ширине)
+    # Имя
     name_area_x = PAD_L + head.width + 36
     name_max_w  = W - name_area_x - PAD_R
-    name_img, name_font = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, name_max_w, BASE_NAME, 28)
+    name_img, _ = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, name_max_w, BASE_NAME, 28)
+    name_img    = _pad_v(name_img, NAME_PAD_TOP, NAME_PAD_BOTTOM)  # гарантированный отступ
 
-    # Метрики (значение+подпись) — уже без обрезаний
+    # Метрики
     f_val = _load_font(F_EXO_PATH, BASE_VAL)
     f_lbl = _load_font(F_SB_PATH,  BASE_LBL)
     stats_line = _metric_line(stats, f_val, f_lbl)
 
-    # Высотный лимит для метрик
+    # Высотный лимит
     avail_h_for_stats = BAR_H - TOP_IN - name_img.height - NAME_STATS_GAP - BOT_IN
     if avail_h_for_stats < 1: avail_h_for_stats = 1
     if stats_line.height > avail_h_for_stats:
         k = avail_h_for_stats / stats_line.height
         stats_line = stats_line.resize((max(1,int(stats_line.width*k)), max(1,int(stats_line.height*k))), Image.LANCZOS)
 
-    # Тег impact справа от имени
+    # Impact tag
     star_img = tag_img = None
     if template == "impact":
         try:
@@ -169,14 +178,14 @@ def render_card(
             star_img = None
         tag_img, _ = _fit_text_to_width("ДЕЛАЕТ РАЗНИЦУ", F_SB_PATH, TAG_MAX_W, TAG_MAX_S, 22)
 
-    # Бокс заметки справа (single_note)
+    # Note (single_note)
     note_box_w = 0
     note_img = None
     if template == "single_note" and note:
         note_box_w = 520
         note_img, _ = _fit_text_to_width(note, F_SB_PATH, note_box_w - 40, 40, 22)
 
-    # Правая граница по содержимому
+    # Правая граница
     right_by_name = name_area_x + name_img.width
     if template == "impact":
         right_by_name += 16 + (star_img.width if star_img else 0) + (12 if star_img else 0) + (tag_img.width if tag_img else 0)
@@ -184,18 +193,16 @@ def render_card(
     content_right  = max(right_by_name, right_by_stats)
     bar_w = min(W, content_right + PAD_R)
     if template == "single_note" and note_box_w:
-        bar_w = max(bar_w, PAD_L + head.width + 36 + name_img.width + 120, W - PAD_R)  # панель растягиваем до правого края для бокса
+        bar_w = max(bar_w, W - PAD_R)
 
-    # -------- рисуем --------
+    # Панель
     bar_y = H - BAR_H
     panel = Image.new("RGBA", (bar_w, BAR_H), (0,0,0,0))
     ImageDraw.Draw(panel).rounded_rectangle((0,0,bar_w,BAR_H), 28, fill=primary)
     canvas.alpha_composite(panel, (0, bar_y))
 
-    # Головa/логотип
-    head_x = PAD_L
-    head_y = bar_y - head.height//3
-    canvas.alpha_composite(head, (head_x, head_y))
+    # Голова/логотип
+    canvas.alpha_composite(head, (PAD_L, bar_y - head.height//3))
     canvas.alpha_composite(logo_circle, (PAD_L + head.width - 120, bar_y + 28))
 
     # Имя
@@ -203,7 +210,7 @@ def render_card(
     name_y = bar_y + TOP_IN
     canvas.alpha_composite(name_img, (name_x, name_y))
 
-    # Impact-tag справа от имени
+    # Impact tag
     if template == "impact":
         cur_x = name_x + name_img.width + 16
         if star_img:
@@ -212,12 +219,12 @@ def render_card(
         if tag_img:
             canvas.alpha_composite(tag_img, (cur_x, name_y + 6))
 
-    # Метрики (строго ниже имени, с явным зазором)
+    # Метрики (гарантированный зазор от имени)
     stats_x = name_x
     stats_y = name_y + name_img.height + NAME_STATS_GAP
     canvas.alpha_composite(stats_line, (stats_x, stats_y))
 
-    # Бокс заметки справа
+    # Note box
     if template == "single_note" and note_box_w and note_img:
         box = Image.new("RGBA", (note_box_w, BAR_H), (0,0,0,0))
         ImageDraw.Draw(box).rounded_rectangle((0,0,note_box_w,BAR_H), 24, fill=(255,255,255,35))
