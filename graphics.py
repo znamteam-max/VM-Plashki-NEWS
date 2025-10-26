@@ -1,26 +1,30 @@
-# graphics.py — аккуратные отступы + авто-масштаб + динамическая ширина плашки
+# graphics.py — правильные bbox (без налезаний) + нормальные отступы + динамическая ширина
 
 from typing import List, Tuple, Optional
 from PIL import Image, ImageDraw, ImageFont
 import io
 
-# Размеры холста
+# Холст
 W, H = 1920, 1080
 
-# Геометрия панели
-BAR_H          = 340      # высота нижней плашки
-PAD_L          = 56       # левый внешний отступ панели
-PAD_R          = 56       # правый внешний отступ панели (к краю панели, не холста)
-TOP_IN         = 28       # верхний внутренний отступ внутри панели
-BOT_IN         = 26       # нижний внутренний отступ внутри панели
-NAME_STATS_GAP = 28       # между именем и строкой метрик
-BLOCK_HGAP     = 56       # горизонтальный зазор между блоками метрик
-INNER_VGAP     = 14       # вертикальный зазор между числом и подписью
-HEAD_SIZE      = 380      # диаметр головы
-LOGO_D         = 170      # круг с логотипом
-LOGO_SIZE      = 150      # размер логотипа внутри круга
+# Панель
+BAR_H          = 360     # побольше воздуха по вертикали
+PAD_L          = 56
+PAD_R          = 56
+TOP_IN         = 36
+BOT_IN         = 32
 
-# Пути шрифтов (если их нет — используем системный дефолт)
+# Интервалы
+NAME_STATS_GAP = 32      # между ИМЕНЕМ и метриками
+BLOCK_HGAP     = 64      # между блоками метрик
+INNER_VGAP     = 18      # между числом и подписью внутри блока
+
+# Размеры головы/логотипа
+HEAD_SIZE      = 380
+LOGO_D         = 170
+LOGO_SIZE      = 150
+
+# Шрифты
 F_BOLD_PATH = "assets/fonts/Montserrat-Bold.ttf"
 F_SB_PATH   = "assets/fonts/Montserrat-SemiBold.ttf"
 F_EXO_PATH  = "assets/fonts/Exo2-Bold.ttf"
@@ -31,31 +35,44 @@ def _load_font(path: str, size: int):
     except Exception:
         return ImageFont.load_default()
 
-# Базовые размеры шрифтов (будут ещё подгоняться)
+# Базовые размеры шрифтов
 BASE_NAME = 60
-BASE_VAL  = 48
-BASE_LBL  = 34
-TAG_MAX_W = 260
-TAG_MAX_S = 40
+BASE_VAL  = 50
+BASE_LBL  = 36
+TAG_MAX_W = 280
+TAG_MAX_S = 42
 
-def _fit_text_to_width(text: str, font_path: str, max_w: int, max_size: int, min_size: int = 24):
-    size_lo, size_hi = min_size, max_size
-    best = _load_font(font_path, size_lo)
-    # бинарный поиск размера
-    while size_lo <= size_hi:
-        mid = (size_lo + size_hi) // 2
+def _text_img(text: str, font: ImageFont.FreeTypeFont, fill=(255,255,255,255)) -> Image.Image:
+    """Рисует текст БЕЗ обрезаний: учитывает отрицательные отступы bbox."""
+    # сначала считаем bbox через textbbox (даёт реальные границы)
+    probe = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    d = ImageDraw.Draw(probe)
+    left, top, right, bottom = d.textbbox((0, 0), text, font=font)
+    w, h = right - left, bottom - top
+    img = Image.new("RGBA", (max(1, w), max(1, h)), (0, 0, 0, 0))
+    ImageDraw.Draw(img).text((-left, -top), text, font=font, fill=fill)
+    return img
+
+def _fit_text_to_width(text: str, font_path: str, max_w: int, max_size: int, min_size: int = 26):
+    """Подбираем размер шрифта по ширине и возвращаем готовую картинку текста."""
+    lo, hi = min_size, max_size
+    best_font = _load_font(font_path, lo)
+
+    probe = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    d = ImageDraw.Draw(probe)
+
+    while lo <= hi:
+        mid = (lo + hi) // 2
         f = _load_font(font_path, mid)
-        w = f.getbbox(text)[2] - f.getbbox(text)[0]
+        l, t, r, b = d.textbbox((0, 0), text, font=f)
+        w = r - l
         if w <= max_w:
-            best = f
-            size_lo = mid + 1
+            best_font = f
+            lo = mid + 1
         else:
-            size_hi = mid - 1
-    # картинка текста
-    bbox = best.getbbox(text)
-    img  = Image.new("RGBA", (bbox[2]-bbox[0], bbox[3]-bbox[1]), (0,0,0,0))
-    ImageDraw.Draw(img).text((0,0), text, font=best, fill=(255,255,255,255))
-    return img, best
+            hi = mid - 1
+
+    return _text_img(text, best_font), best_font
 
 def _circle_crop(path: str, d: int) -> Image.Image:
     im = Image.open(path).convert("RGBA")
@@ -79,26 +96,18 @@ def _metric_line(
 ) -> Image.Image:
     blocks, total_w, max_h = [], 0, 0
     for v, lab in stats:
-        v = str(v)
+        v   = str(v)
         lab = (lab or "").upper().strip()
 
-        vb  = f_val.getbbox(v)
-        vimg= Image.new("RGBA", (vb[2]-vb[0], vb[3]-vb[1]), (0,0,0,0))
-        ImageDraw.Draw(vimg).text((0,0), v, font=f_val, fill=color)
+        val_img = _text_img(v,   f_val, color)
+        lbl_img = _text_img(lab, f_lbl, color) if lab else Image.new("RGBA", (1,1), (0,0,0,0))
 
-        if lab:
-            lb  = f_lbl.getbbox(lab)
-            limg= Image.new("RGBA", (lb[2]-lb[0], lb[3]-lb[1]), (0,0,0,0))
-            ImageDraw.Draw(limg).text((0,0), lab, font=f_lbl, fill=color)
-        else:
-            limg= Image.new("RGBA", (1,1), (0,0,0,0))
-
-        h = vimg.height + vgap + limg.height
-        w = max(vimg.width, limg.width)
-
+        # вертикальная сборка: значение сверху, подпись снизу, между ними vgap
+        w = max(val_img.width, lbl_img.width)
+        h = val_img.height + vgap + lbl_img.height
         block = Image.new("RGBA", (w, h), (0,0,0,0))
-        block.alpha_composite(vimg, ((w - vimg.width)//2, 0))
-        block.alpha_composite(limg, ((w - limg.width)//2, vimg.height + vgap))
+        block.alpha_composite(val_img, ((w - val_img.width)//2, 0))
+        block.alpha_composite(lbl_img, ((w - lbl_img.width)//2, val_img.height + vgap))
 
         blocks.append(block)
         total_w += w
@@ -125,113 +134,97 @@ def render_card(
     primary, dark, light = team_colors
     canvas = Image.new("RGBA", (W, H), (0,0,0,0))
 
-    # ===== заранее собираем элементы, чтобы посчитать нужную ширину панели =====
+    # -------- элементы заранее (чтобы посчитать ширину панели) --------
     head = _circle_crop(headshot_path, HEAD_SIZE)
 
-    # Лого в круге
     logo_raw = Image.open(team_logo_path).convert("RGBA").resize((LOGO_SIZE, LOGO_SIZE), Image.LANCZOS)
     logo_circle = Image.new("RGBA", (LOGO_D, LOGO_D), (255,255,255,255))
     m = Image.new("L", (LOGO_D, LOGO_D), 0); ImageDraw.Draw(m).ellipse((0,0,LOGO_D,LOGO_D), fill=255)
     logo_circle.putalpha(m)
     logo_circle.alpha_composite(logo_raw, ((LOGO_D - LOGO_SIZE)//2, (LOGO_D - LOGO_SIZE)//2))
 
-    # Имя с подбором размера под ширину
+    # Имя (с подгонкой по ширине)
     name_area_x = PAD_L + head.width + 36
-    # пока не знаем ширину панели, предполагаем максимум до правого края холста
-    name_max_w = W - name_area_x - PAD_R
-    name_img, name_font = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, name_max_w, BASE_NAME, 26)
+    name_max_w  = W - name_area_x - PAD_R
+    name_img, name_font = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, name_max_w, BASE_NAME, 28)
 
-    # Строка метрик
+    # Метрики (значение+подпись) — уже без обрезаний
     f_val = _load_font(F_EXO_PATH, BASE_VAL)
     f_lbl = _load_font(F_SB_PATH,  BASE_LBL)
     stats_line = _metric_line(stats, f_val, f_lbl)
 
-    # По высоте метрики должны влезть в панель
-    avail_h_for_stats = BAR_H - TOP_IN - (name_img.height + NAME_STATS_GAP) - BOT_IN
-    if avail_h_for_stats < 1:
-        avail_h_for_stats = 1
+    # Высотный лимит для метрик
+    avail_h_for_stats = BAR_H - TOP_IN - name_img.height - NAME_STATS_GAP - BOT_IN
+    if avail_h_for_stats < 1: avail_h_for_stats = 1
     if stats_line.height > avail_h_for_stats:
         k = avail_h_for_stats / stats_line.height
         stats_line = stats_line.resize((max(1,int(stats_line.width*k)), max(1,int(stats_line.height*k))), Image.LANCZOS)
 
-    # Элементы шаблонов справа от имени
+    # Тег impact справа от имени
     star_img = tag_img = None
-    extra_right = 0
     if template == "impact":
         try:
             star_img = Image.open("assets/icons/star.png").convert("RGBA").resize((64,64), Image.LANCZOS)
         except Exception:
             star_img = None
-        tag_text = "ДЕЛАЕТ РАЗНИЦУ"
-        tag_img, _ = _fit_text_to_width(tag_text, F_SB_PATH, TAG_MAX_W, TAG_MAX_S, 22)
-        extra_right = (star_img.width + 16 + tag_img.width) if star_img else tag_img.width
+        tag_img, _ = _fit_text_to_width("ДЕЛАЕТ РАЗНИЦУ", F_SB_PATH, TAG_MAX_W, TAG_MAX_S, 22)
 
-    # Для single_note справа может быть прямоугольник — учитываем его как правую границу
+    # Бокс заметки справа (single_note)
     note_box_w = 0
     note_img = None
     if template == "single_note" and note:
         note_box_w = 520
         note_img, _ = _fit_text_to_width(note, F_SB_PATH, note_box_w - 40, 40, 22)
 
-    # Правая граница по содержимому (имя + звезда/тег, метрики, бокс заметки)
-    right_by_name  = name_area_x + name_img.width + (16 + (star_img.width if star_img else 0) + (tag_img.width if tag_img else 0)) if template == "impact" else name_area_x + name_img.width
+    # Правая граница по содержимому
+    right_by_name = name_area_x + name_img.width
+    if template == "impact":
+        right_by_name += 16 + (star_img.width if star_img else 0) + (12 if star_img else 0) + (tag_img.width if tag_img else 0)
     right_by_stats = name_area_x + stats_line.width
-    right_by_note  = W - PAD_R if note_box_w else 0  # бокс прижмём справа панели, его ширина учтётся в самой панели
-    content_right  = max(right_by_name, right_by_stats, right_by_note)
-
-    # Ширина панели = контент + правый внутренний отступ, но не больше ширины холста
+    content_right  = max(right_by_name, right_by_stats)
     bar_w = min(W, content_right + PAD_R)
-    if template == "single_note" and note:
-        # добавляем пространство под правый бокс
-        bar_w = min(W, max(bar_w, W - PAD_R))  # панель дотянем до позиции бокса (он прижат к правому краю панели)
+    if template == "single_note" and note_box_w:
+        bar_w = max(bar_w, PAD_L + head.width + 36 + name_img.width + 120, W - PAD_R)  # панель растягиваем до правого края для бокса
 
-    # ===== рисуем панель нужной ширины и раскладываем элементы =====
+    # -------- рисуем --------
     bar_y = H - BAR_H
     panel = Image.new("RGBA", (bar_w, BAR_H), (0,0,0,0))
     ImageDraw.Draw(panel).rounded_rectangle((0,0,bar_w,BAR_H), 28, fill=primary)
+    canvas.alpha_composite(panel, (0, bar_y))
 
-    # Куда ставим элементы на панели
+    # Головa/логотип
     head_x = PAD_L
     head_y = bar_y - head.height//3
-    canvas.alpha_composite(panel, (0, bar_y))
     canvas.alpha_composite(head, (head_x, head_y))
-
-    # Лого
-    logo_x = PAD_L + head.width - 120
-    logo_y = bar_y + 28
-    canvas.alpha_composite(logo_circle, (logo_x, logo_y))
+    canvas.alpha_composite(logo_circle, (PAD_L + head.width - 120, bar_y + 28))
 
     # Имя
     name_x = name_area_x
     name_y = bar_y + TOP_IN
     canvas.alpha_composite(name_img, (name_x, name_y))
 
-    # Тег impact (звезда + текст) — справа от имени, не заезжает на метрики
+    # Impact-tag справа от имени
     if template == "impact":
         cur_x = name_x + name_img.width + 16
         if star_img:
             canvas.alpha_composite(star_img, (cur_x, name_y - 2))
             cur_x += star_img.width + 12
         if tag_img:
-            # ставим на уровне имени с небольшим смещением
             canvas.alpha_composite(tag_img, (cur_x, name_y + 6))
 
-    # Метрики
+    # Метрики (строго ниже имени, с явным зазором)
     stats_x = name_x
     stats_y = name_y + name_img.height + NAME_STATS_GAP
     canvas.alpha_composite(stats_line, (stats_x, stats_y))
 
-    # Бокс заметки (single_note) — прижимаем к правому краю панели
-    if template == "single_note" and note and note_img:
-        box_w = 520
-        box = Image.new("RGBA", (box_w, BAR_H), (0,0,0,0))
-        ImageDraw.Draw(box).rounded_rectangle((0,0,box_w,BAR_H), 24, fill=(255,255,255,35))
-        box.alpha_composite(note_img, ((box_w - note_img.width)//2, (BAR_H - note_img.height)//2))
-        box_x = bar_w - PAD_R - box_w
-        box_y = bar_y
-        canvas.alpha_composite(box, (box_x, box_y))
+    # Бокс заметки справа
+    if template == "single_note" and note_box_w and note_img:
+        box = Image.new("RGBA", (note_box_w, BAR_H), (0,0,0,0))
+        ImageDraw.Draw(box).rounded_rectangle((0,0,note_box_w,BAR_H), 24, fill=(255,255,255,35))
+        box.alpha_composite(note_img, ((note_box_w - note_img.width)//2, (BAR_H - note_img.height)//2))
+        canvas.alpha_composite(box, (bar_w - PAD_R - note_box_w, bar_y))
 
-    # Выход — PNG с прозрачностью
+    # PNG
     bio = io.BytesIO()
     canvas.save(bio, format="PNG")
     return bio.getvalue()
