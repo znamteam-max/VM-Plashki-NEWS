@@ -1,10 +1,18 @@
 # /api/telegram.py — FastAPI webhook для Telegram (Vercel)
-# Пути:
-#  GET  /api/telegram, /api/telegram/z
+# Поддерживает:
+#  GET  /api/telegram
+#  GET  /api/telegram/healthz
 #  POST /api/telegram?secret=...
 #  POST /api/telegram/webhook/<secret>
+#
+# Команды:
+#  /card Имя | 25 очков, 12 подборов | impact | подпись(опц.)
+#  /alias Неправильно = Правильное Имя
 
-import os, re, json, requests
+import os
+import re
+import json
+import requests
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import JSONResponse
 
@@ -13,11 +21,13 @@ app = FastAPI()
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "hook")
 
+# число + (возможный %) + ярлык
 STAT_PAIR_RE = re.compile(
     r"(?P<num>[-+]?\d+(?:[.,]\d+)?)\s*([%]?)\s*(?P<label>[A-Za-zА-Яа-яёЁ+\-/ ]{0,20})"
 )
 
 # ---------- парсинг команд ----------
+
 def parse_card(text: str):
     """
     /card Имя | 25 очков, 12 подборов, 3 блокшота | impact | подпись(опц.)
@@ -40,14 +50,16 @@ def parse_card(text: str):
         if m:
             num = m.group("num").replace(",", ".")
             label = (m.group("label") or "").strip()
+            # если написали "45%" без ярлыка — оставим как "%":
             if m.group(2) == "%" and not label:
                 label = "%"
             stats.append((num, label))
     return name, stats[:6], template, note, raw_stats
 
+
 def parse_alias(text: str):
     """
-    /alias неправильное = Правильное Имя
+    /alias Неправильно = Правильное Имя
     -> (alias_text, correct_text)
     """
     if not text or not text.lower().startswith("/alias"):
@@ -59,7 +71,9 @@ def parse_alias(text: str):
     return m[0].strip(), m[1].strip()
 
 # ---------- Telegram helpers ----------
+
 def tg_send_png(chat_id: int, png_bytes: bytes, caption: str | None = None):
+    """Отправляем как документ — сохранит прозрачность PNG и не пережмёт JPG."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
     files = {"document": ("card.png", png_bytes, "image/png")}
     data = {"chat_id": chat_id}
@@ -68,6 +82,7 @@ def tg_send_png(chat_id: int, png_bytes: bytes, caption: str | None = None):
     r = requests.post(url, data=data, files=files, timeout=30)
     return r.ok, r.text
 
+
 def tg_send_message(chat_id: int, text: str, reply_to_message_id: int | None = None, reply_markup: dict | None = None):
     payload = {"chat_id": chat_id, "text": text}
     if reply_to_message_id:
@@ -75,33 +90,39 @@ def tg_send_message(chat_id: int, text: str, reply_to_message_id: int | None = N
         payload["allow_sending_without_reply"] = True
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload, timeout=15)
-    return r.ok
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload, timeout=15)
+
 
 def tg_answer_callback(callback_id: str, text: str = ""):
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
-                  json={"callback_query_id": callback_id, "text": text}, timeout=10)
+    requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
+        json={"callback_query_id": callback_id, "text": text},
+        timeout=10,
+    )
 
 # ---------- основной обработчик ----------
+
 async def handle_update(update: dict) -> JSONResponse:
+    # ленивые импорты
     from graphics import render_card
     from data import (
         find_player_by_name, ensure_headshot_png, ensure_team_logo_png,
         get_player_by_id, suggest_players, add_alias
     )
 
-    # 1) callback-кнопки (выбор игрока из подсказок)
+    # 1) обрабатываем callback-кнопки (выбор игрока из подсказок)
     if "callback_query" in update:
         cq = update["callback_query"]
         data = cq.get("data") or ""
         chat_id = cq["message"]["chat"]["id"]
+
         if data.startswith("pick:"):
             try:
                 pid = int(data.split(":", 1)[1])
             except Exception:
                 tg_answer_callback(cq["id"], "Ошибка выбора")
                 return JSONResponse({"ok": True})
-            # исходная команда — это сообщение, на которое мы ответили подсказками
+
             origin = cq["message"].get("reply_to_message")
             if not origin or not origin.get("text"):
                 tg_answer_callback(cq["id"], "Не нашёл исходную команду — отправьте /card заново.")
@@ -112,7 +133,7 @@ async def handle_update(update: dict) -> JSONResponse:
                 tg_answer_callback(cq["id"], "Не смог разобрать исходную команду.")
                 return JSONResponse({"ok": True})
 
-            name, stats, template, note, _raw = parsed
+            _name, stats, template, note, _raw = parsed
             player = get_player_by_id(pid)
             if not player:
                 tg_answer_callback(cq["id"], "Игрок не найден по ID.")
@@ -120,6 +141,7 @@ async def handle_update(update: dict) -> JSONResponse:
 
             logo_path, team_colors = ensure_team_logo_png(player["team_id"])
             head_path = ensure_headshot_png(player["id"], player["full_name"])
+
             png_bytes = render_card(
                 template=template,
                 player_name=player["display"] or player["full_name"],
@@ -134,7 +156,7 @@ async def handle_update(update: dict) -> JSONResponse:
             tg_send_png(chat_id, png_bytes)
             return JSONResponse({"ok": True})
 
-        # неизвестная callback-кнопка
+        # неизвестный callback
         tg_answer_callback(cq["id"])
         return JSONResponse({"ok": True})
 
@@ -171,17 +193,16 @@ async def handle_update(update: dict) -> JSONResponse:
         tg_send_message(chat_id, hint)
         return JSONResponse({"ok": True})
 
-    name, stats, template, note, raw_stats = parsed
+    name, stats, template, note, _raw = parsed
     player = find_player_by_name(name)
     if not player:
         # подсказки
+        from data import suggest_players
         suggestions = suggest_players(name, limit=5)
         if not suggestions:
             tg_send_message(chat_id, "Игрок не найден. Уточните имя.\n"
                                      "Можно задать алиас: /alias Вася = Vasilije Micic")
             return JSONResponse({"ok": True})
-
-        # строим инлайн-клавиатуру выбора — сообщение отправляем reply на исходную /card
         kb = {"inline_keyboard": [[{"text": s["display"], "callback_data": f"pick:{s['id']}"}] for s in suggestions]}
         tg_send_message(
             chat_id,
@@ -191,10 +212,7 @@ async def handle_update(update: dict) -> JSONResponse:
         )
         return JSONResponse({"ok": True})
 
-    # нашли игрока — рендерим карточку
-    from graphics import render_card
-    from data import ensure_headshot_png, ensure_team_logo_png
-
+    # нашли игрока — рендерим
     logo_path, team_colors = ensure_team_logo_png(player["team_id"])
     head_path = ensure_headshot_png(player["id"], player["full_name"])
 
@@ -213,25 +231,13 @@ async def handle_update(update: dict) -> JSONResponse:
         tg_send_message(chat_id, f"Ошибка отправки изображения: {resp}")
     return JSONResponse({"ok": True})
 
-# ----------  ----------
-@app.get("/")
-@app.get("/api/telegram")
-@app.get("/api/telegram/z")
-def ():
-    return {
-        "ok": True,
-        "endpoints": [
-            "GET  /api/telegram",
-            "GET  /api/telegram/z",
-            "POST /api/telegram?secret=...",
-            "POST /api/telegram/webhook/<secret>",
-        ],
-    }
+# ---------- health ----------
 
 @app.get("/")
 @app.get("/api/telegram")
 @app.get("/api/telegram/healthz")
 def health():
+    # показываем размер индекса игроков (для диагностики)
     try:
         from data import players_count
         count = players_count()
@@ -249,6 +255,7 @@ def health():
     }
 
 # ---------- webhook ----------
+
 @app.post("/")
 @app.post("/api/telegram")
 async def webhook_query(request: Request, secret: str = Query(default="")):
