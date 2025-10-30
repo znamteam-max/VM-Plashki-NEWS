@@ -1,4 +1,4 @@
-# graphics.py — логотип рядом с фото, мягкий градиент, мелкие подписи метрик
+# graphics.py — логотип поверх фото, мягкий градиент, мелкие подписи метрик
 
 from typing import List, Tuple, Optional
 from PIL import Image, ImageDraw, ImageFont
@@ -15,11 +15,11 @@ TOP_IN         = 22
 BOT_IN         = 20
 
 # Интервалы
-NAME_STATS_GAP = 18
+NAME_STATS_GAP = 30
 BLOCK_HGAP     = 56
-INNER_VGAP     = 20
+INNER_VGAP     = 20  # зазор между числом и подписью (чуть больше)
 
-# Доп. вертикальные паддинги (тонкие, чтобы текст не «лип»)
+# «Антиллипкие» паддинги
 NAME_PAD_TOP       = 4
 NAME_PAD_BOTTOM    = 6
 BLOCK_PAD_TOP      = 4
@@ -27,9 +27,11 @@ BLOCK_PAD_BOTTOM   = 6
 
 # Размеры головы/логотипа
 HEAD_SIZE   = 360
-LOGO_D      = 150
-LOGO_SIZE   = 132
-LOGO_GAP    = -100     # логотип почти вплотную к фото (уменьшено)
+LOGO_D      = 140   # диаметр круга под логотип
+LOGO_SIZE   = 124   # размер логотипа внутри круга
+# Позиция логотипа на голове (нижний-левый сектор)
+LOGO_OFFSET_X = 18  # чем больше — правее (внутрь головы)
+LOGO_OFFSET_Y = 210 # чем больше — ниже по голове
 
 # Шрифты
 F_BOLD_PATH = "assets/fonts/Montserrat-Bold.ttf"
@@ -43,11 +45,9 @@ def _load_font(path: str, size: int):
         return ImageFont.load_default()
 
 # Базовые размеры шрифтов
-BASE_NAME = 60   # ИМЯ — без изменений
-BASE_VAL  = 50   # ЧИСЛО — без изменений
-BASE_LBL  = 28   # ПОДПИСИ («ОЧКИ», «ПОДБОРЫ») — МЕНЬШЕ
-TAG_MAX_W = 260
-TAG_MAX_S = 40
+BASE_NAME = 60   # ИМЯ — как было
+BASE_VAL  = 50   # ЧИСЛО — как было
+BASE_LBL  = 28   # ПОДПИСИ — меньше
 
 # ---------- текст без «срезов» ----------
 def _text_img(text: str, font: ImageFont.FreeTypeFont, fill=(255,255,255,255)) -> Image.Image:
@@ -94,7 +94,7 @@ def _circle_crop(path: str, d: int) -> Image.Image:
     out.paste(im, (0,0), mask)
     return out
 
-# ---------- цвет и градиент ----------
+# ---------- цвет и мягкий градиент ----------
 def _hex_to_rgb(h: str) -> Tuple[int,int,int]:
     h = h.strip()
     if h.startswith("#"): h = h[1:]
@@ -104,7 +104,6 @@ def _clamp(c: int) -> int:
     return max(0, min(255, c))
 
 def _shade(rgb: Tuple[int,int,int], k: float) -> Tuple[int,int,int]:
-    # k<1 — темнее на |1-k|*100%, k>1 — светлее
     return (_clamp(int(rgb[0]*k)), _clamp(int(rgb[1]*k)), _clamp(int(rgb[2]*k)))
 
 def _rounded_horizontal_gradient(width: int, height: int, radius: int,
@@ -148,7 +147,6 @@ def _metric_line(
         block.alpha_composite(lbl_img, ((w - lbl_img.width)//2, val_img.height + vgap))
 
         block = _pad_v(block, BLOCK_PAD_TOP, BLOCK_PAD_BOTTOM)
-
         blocks.append(block)
         total_w += block.width
         max_h = max(max_h, block.height)
@@ -174,33 +172,24 @@ def render_card(
 ) -> bytes:
     primary_hex, dark_hex, light_hex = team_colors
     primary_rgb = _hex_to_rgb(primary_hex)
-    # очень мягкий градиент: слева на ~10% темнее основного
+    # мягкий градиент: слева на ~10% темнее
     left_rgb  = _shade(primary_rgb, 0.65)
     right_rgb = primary_rgb
 
     canvas = Image.new("RGBA", (W, H), (0,0,0,0))
 
-    # Логотип (слева) → Фото (рядом с минимальным зазором)
-    logo_raw = Image.open(team_logo_path).convert("RGBA").resize((LOGO_SIZE, LOGO_SIZE), Image.LANCZOS)
-    logo_circle = Image.new("RGBA", (LOGO_D, LOGO_D), (255,255,255,255))
-    m = Image.new("L", (LOGO_D, LOGO_D), 0); ImageDraw.Draw(m).ellipse((0,0,LOGO_D,LOGO_D), fill=255)
-    logo_circle.putalpha(m)
-    logo_circle.alpha_composite(logo_raw, ((LOGO_D - LOGO_SIZE)//2, (LOGO_D - LOGO_SIZE)//2))
-
+    # Фото игрока
     head = _circle_crop(headshot_path, HEAD_SIZE)
 
-    # Координаты левой колонны
-    logo_x = PAD_L
-    head_x = logo_x + LOGO_D + LOGO_GAP
-
+    # Панель с градиентом нужной ширины (считаем чуть позже)
     # Текстовая зона
-    name_area_x = head_x + head.width + 36
+    name_area_x = PAD_L + HEAD_SIZE + 36  # слева голову ставим с отступом PAD_L
     name_max_w  = W - name_area_x - PAD_R
     name_img, _ = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, name_max_w, BASE_NAME, 28)
     name_img    = _pad_v(name_img, NAME_PAD_TOP, NAME_PAD_BOTTOM)
 
-    f_val = _load_font(F_EXO_PATH, BASE_VAL)   # числа — как были
-    f_lbl = _load_font(F_SB_PATH,  BASE_LBL)   # подписи — МЕНЬШЕ
+    f_val = _load_font(F_EXO_PATH, BASE_VAL)   # цифры
+    f_lbl = _load_font(F_SB_PATH,  BASE_LBL)   # подписи — меньше
     stats_line = _metric_line(stats, f_val, f_lbl)
 
     # Высотный лимит для метрик
@@ -217,41 +206,47 @@ def render_card(
             star_img = Image.open("assets/icons/star.png").convert("RGBA").resize((56,56), Image.LANCZOS)
         except Exception:
             star_img = None
-        tag_img, _ = _fit_text_to_width("ДЕЛАЕТ РАЗНИЦУ", F_SB_PATH, TAG_MAX_W, TAG_MAX_S, 22)
+        tag_img, _ = _fit_text_to_width("ДЕЛАЕТ РАЗНИЦУ", F_SB_PATH, 260, 40, 22)
 
-    # Примечание (single_note)
-    note_box_w = 0
-    note_img = None
-    if template == "single_note" and note:
-        note_box_w = 480
-        note_img, _ = _fit_text_to_width(note, F_SB_PATH, note_box_w - 40, 38, 20)
-
-    # Правая граница (динамическая ширина панели)
-    right_by_name = name_area_x + name_img.width
-    if template == "impact":
-        right_by_name += 14 + (star_img.width if star_img else 0) + (10 if star_img else 0) + (tag_img.width if tag_img else 0)
+    # Правая граница панели (динамика)
+    right_by_name  = name_area_x + name_img.width + (14 + (star_img.width if star_img else 0) + (10 if star_img else 0) + (tag_img.width if tag_img else 0) if template == "impact" else 0)
     right_by_stats = name_area_x + stats_line.width
     content_right  = max(right_by_name, right_by_stats)
     bar_w = min(W, content_right + PAD_R)
-    if template == "single_note" and note_box_w:
-        bar_w = max(bar_w, W - PAD_R)
 
-    # Панель с мягким ГРАДИЕНТОМ
+    # --- Панель с градиентом ---
     bar_y = H - BAR_H
-    panel = _rounded_horizontal_gradient(
-        width=bar_w,
-        height=BAR_H,
-        radius=24,
-        left_rgb=left_rgb,    # слегка темнее
-        right_rgb=right_rgb,  # основной цвет
-    )
+    panel = _rounded_horizontal_gradient(bar_w, BAR_H, 24, left_rgb, right_rgb)
     canvas.alpha_composite(panel, (0, bar_y))
 
-    # Размещение логотипа и фото
-    logo_y = bar_y + (BAR_H - LOGO_D)//2
+    # Размещаем голову
+    head_x = PAD_L
     head_y = bar_y - head.height//3
-    canvas.alpha_composite(logo_circle, (logo_x, logo_y))
     canvas.alpha_composite(head, (head_x, head_y))
+
+    # ЛОГОТИП СВЕРХУ ФОТО (поверх головы)
+    # Собираем круг с белой подложкой + лёгкая тень
+    logo_raw = Image.open(team_logo_path).convert("RGBA").resize((LOGO_SIZE, LOGO_SIZE), Image.LANCZOS)
+    # тень
+    shadow = Image.new("RGBA", (LOGO_D+6, LOGO_D+6), (0,0,0,0))
+    sh_mask = Image.new("L", (LOGO_D+6, LOGO_D+6), 0)
+    ImageDraw.Draw(sh_mask).ellipse((3,3,LOGO_D+3,LOGO_D+3), fill=90)
+    shadow.putalpha(sh_mask)
+
+    # белый круг
+    logo_circle = Image.new("RGBA", (LOGO_D, LOGO_D), (255,255,255,255))
+    mask = Image.new("L", (LOGO_D, LOGO_D), 0)
+    ImageDraw.Draw(mask).ellipse((0,0,LOGO_D,LOGO_D), fill=255)
+    logo_circle.putalpha(mask)
+    logo_circle.alpha_composite(logo_raw, ((LOGO_D - LOGO_SIZE)//2, (LOGO_D - LOGO_SIZE)//2))
+
+    # позиция на голове: нижний-левый сектор
+    logo_x = head_x + LOGO_OFFSET_X
+    logo_y = head_y + LOGO_OFFSET_Y
+
+    # сначала тень (подложка), потом круг с логотипом — ЧЁТКО ПОВЕРХ ФОТО
+    canvas.alpha_composite(shadow, (logo_x - 3, logo_y - 3))
+    canvas.alpha_composite(logo_circle, (logo_x, logo_y))
 
     # Имя
     name_x = name_area_x
@@ -271,13 +266,6 @@ def render_card(
     stats_x = name_x
     stats_y = name_y + name_img.height + NAME_STATS_GAP
     canvas.alpha_composite(stats_line, (stats_x, stats_y))
-
-    # Примечание справа
-    if template == "single_note" and note_box_w and note_img:
-        box = Image.new("RGBA", (note_box_w, BAR_H), (0,0,0,0))
-        ImageDraw.Draw(box).rounded_rectangle((0,0,note_box_w,BAR_H), 20, fill=(255,255,255,35))
-        box.alpha_composite(note_img, ((note_box_w - note_img.width)//2, (BAR_H - note_img.height)//2))
-        canvas.alpha_composite(box, (bar_w - PAD_R - note_box_w, bar_y))
 
     # PNG
     bio = io.BytesIO()
