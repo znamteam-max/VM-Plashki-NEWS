@@ -29,7 +29,7 @@ BLOCK_PAD_BOTTOM   = 6
 HEAD_SIZE   = 360
 LOGO_D      = 150
 LOGO_SIZE   = 132
-LOGO_GAP    = 0     # логотип почти вплотную к фото (уменьшено)
+LOGO_GAP    = -20     # логотип почти вплотную к фото (уменьшено)
 
 # Шрифты
 F_BOLD_PATH = "assets/fonts/Montserrat-Bold.ttf"
