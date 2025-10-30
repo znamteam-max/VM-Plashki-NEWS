@@ -100,7 +100,7 @@ RU_NAME_OVERRIDES: Dict[str,str] = {
     "lebron james":"Леброн Джеймс",
     "stephen curry":"Стефен Карри",
     "kevin durant":"Кевин Дюрант",
-    "giannis antetokounmpo":"Яннис Адетокумбо",
+    "giannis antetokounmpo":"Яннис Адетокунбо",
     "joel embiid":"Джоэл Эмбиид",
     "anthony davis":"Энтони Дэвис",
     "kyrie irving":"Кайри Ирвинг",
@@ -121,7 +121,6 @@ FALLBACK_PLAYERS = [
     {"personId":"203954","firstName":"Joel","lastName":"Embiid","teamId":"1610612755"},    # PHI
     {"personId":"201142","firstName":"Kevin","lastName":"Durant","teamId":"1610612756"},   # PHX
     {"personId":"1629029","firstName":"Luka","lastName":"Doncic","teamId":"1610612742"},   # DAL
-    {"personId":"203076","firstName":"Damian","lastName":"Lillard","teamId":"1610612749"}, # дубль на случай апдейтов
 ]
 
 # ===== алиасы, задаваемые из бота =====
@@ -167,10 +166,6 @@ def _fetch_players_payload() -> Dict[str, Any]:
                 return j
         except Exception:
             pass
-
-    def players_count() -> int:
-    _ensure_index()
-    return len(_PLAYERS["_byid"]) if _PLAYERS else 0
 
     # 2) сетевые источники (несколько URL на случай, если один лег)
     urls = [
@@ -269,20 +264,14 @@ def get_player_by_id(pid: int) -> Optional[Dict[str, Any]]:
     _ensure_index()
     return _PLAYERS["_byid"].get(int(pid)) if _PLAYERS else None
 
+def players_count() -> int:
+    _ensure_index()
+    return len(_PLAYERS["_byid"]) if _PLAYERS else 0
+
 def _apply_alias(q_norm: str) -> Optional[str]:
     """Если q_norm — алиас, вернуть базовый ascii-key."""
     base = _ALIASES.get(q_norm)
     return base
-
-# ...это уже ниже по файлу, рядом с другими функциями...
-
-def get_player_by_id(pid: int):
-    _ensure_index()
-    return _PLAYERS["_byid"].get(int(pid)) if _PLAYERS else None
-
-def players_count() -> int:
-    _ensure_index()
-    return len(_PLAYERS["_byid"]) if _PLAYERS else 0
 
 def find_player_by_name(query: str) -> Optional[Dict[str, Any]]:
     """Возвращает {id, full_name (лат), display (РУС), team_id, team_name}."""
@@ -304,7 +293,7 @@ def find_player_by_name(query: str) -> Optional[Dict[str, Any]]:
     if rec:
         return rec
 
-    # 3) Кири -> лат
+    # 3) Кириллица -> лат
     if re.search("[а-яё]", q):
         lat_guess = _normalize_key(cyr2lat(query))
         rec = _PLAYERS["_bykey"].get(lat_guess)
@@ -346,7 +335,6 @@ def suggest_players(query: str, limit: int = 5) -> List[Dict[str, Any]]:
         for key in keys:
             k = _normalize_key(key)
             r = SequenceMatcher(None, q, k).ratio()
-            # лёгкие бусты
             if k.startswith(q) or any(w.startswith(q) for w in k.split()):
                 r += 0.1
             s = max(s, r)
