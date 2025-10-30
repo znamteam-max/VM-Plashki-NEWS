@@ -29,7 +29,7 @@ BLOCK_PAD_BOTTOM   = 6
 HEAD_SIZE   = 360
 LOGO_D      = 150
 LOGO_SIZE   = 132
-LOGO_GAP    = 6     # логотип почти вплотную к фото (уменьшено)
+LOGO_GAP    = 0     # логотип почти вплотную к фото (уменьшено)
 
 # Шрифты
 F_BOLD_PATH = "assets/fonts/Montserrat-Bold.ttf"
@@ -175,7 +175,7 @@ def render_card(
     primary_hex, dark_hex, light_hex = team_colors
     primary_rgb = _hex_to_rgb(primary_hex)
     # очень мягкий градиент: слева на ~10% темнее основного
-    left_rgb  = _shade(primary_rgb, 0.90)
+    left_rgb  = _shade(primary_rgb, 0.85)
     right_rgb = primary_rgb
 
     canvas = Image.new("RGBA", (W, H), (0,0,0,0))
