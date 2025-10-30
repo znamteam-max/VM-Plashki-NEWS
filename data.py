@@ -274,6 +274,16 @@ def _apply_alias(q_norm: str) -> Optional[str]:
     base = _ALIASES.get(q_norm)
     return base
 
+# ...это уже ниже по файлу, рядом с другими функциями...
+
+def get_player_by_id(pid: int):
+    _ensure_index()
+    return _PLAYERS["_byid"].get(int(pid)) if _PLAYERS else None
+
+def players_count() -> int:
+    _ensure_index()
+    return len(_PLAYERS["_byid"]) if _PLAYERS else 0
+
 def find_player_by_name(query: str) -> Optional[Dict[str, Any]]:
     """Возвращает {id, full_name (лат), display (РУС), team_id, team_name}."""
     if not query:
