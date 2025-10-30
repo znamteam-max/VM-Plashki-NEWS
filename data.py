@@ -141,26 +141,84 @@ _load_aliases()
 # ===== загрузка игроков (всегда онлайн + ретраи) =====
 def _fetch_players_payload() -> Dict[str, Any]:
     """
-    Всегда пытаемся получить из сети. Несколько URL + ретраи.
-    Если все источники недоступны — вернём фоллбек.
+    Пытаемся получить список игроков через stats.nba.com (commonallplayers),
+    с нужными заголовками. Если не вышло — пробуем старые data.nba.net/data.nba.com.
+    В самом конце — короткий фоллбек.
+    Возвращаем payload в формате {"league": {"standard": [ {personId, firstName, lastName, teamId}, ... ]}}
+    чтобы остальной код (_build_index) работал без изменений.
     """
-    seasons = ["2025", "2024", "2023"]
-    urls = (
-        [f"https://data.nba.net/prod/v1/{y}/players.json" for y in seasons] +
-        [f"https://data.nba.com/data/10s/prod/v1/{y}/players.json" for y in seasons]
-    )
-    for u in urls:
-        for attempt in range(2):  # 2 попытки на URL
-            try:
-                r = requests.get(u, timeout=12)
-                if r.ok:
-                    j = r.json()
-                    std = j.get("league", {}).get("standard", [])
-                    if std:
-                        return j
-            except Exception:
-                pass
-            time.sleep(0.3)
+    # --- 1) stats.nba.com (нужны headers)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://www.nba.com/",
+        "Origin": "https://www.nba.com",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+        "x-nba-stats-origin": "stats",
+        "x-nba-stats-token": "true",
+        # Не просим br, чтобы не требовать brotli в зависимостях:
+        "Accept-Encoding": "gzip, deflate",
+    }
+    # Три сезона на случай межсезонья
+    seasons = ["2025-26", "2024-25", "2023-24"]
+    for season in seasons:
+        url = ("https://stats.nba.com/stats/commonallplayers"
+               f"?LeagueID=00&Season={season}&IsOnlyCurrentSeason=1")
+        try:
+            r = requests.get(url, headers=headers, timeout=12)
+            if r.ok:
+                j = r.json()
+                rs = None
+                # разные варианты ключей в ответе
+                if isinstance(j.get("resultSets"), list) and j["resultSets"]:
+                    rs = j["resultSets"][0]
+                elif isinstance(j.get("resultSet"), dict):
+                    rs = j["resultSet"]
+
+                if rs:
+                    headers_list = rs.get("headers") or []
+                    rows = rs.get("rowSet") or []
+                    # индексы нужных колонок
+                    idx = {h: i for i, h in enumerate(headers_list)}
+                    need = ("PERSON_ID", "FIRST_NAME", "LAST_NAME", "TEAM_ID")
+                    if all(k in idx for k in need):
+                        out = []
+                        for row in rows:
+                            person_id = str(row[idx["PERSON_ID"]])
+                            first = row[idx["FIRST_NAME"]] or ""
+                            last  = row[idx["LAST_NAME"]] or ""
+                            team_id = str(row[idx["TEAM_ID"]] or "0")
+                            out.append({
+                                "personId": person_id,
+                                "firstName": first,
+                                "lastName": last,
+                                "teamId": team_id,
+                            })
+                        if out:
+                            return {"league": {"standard": out}}
+        except Exception:
+            pass
+
+    # --- 2) старые JSON (иногда работают)
+    urls_legacy = [
+        "https://data.nba.net/prod/v1/2025/players.json",
+        "https://data.nba.net/prod/v1/2024/players.json",
+        "https://data.nba.com/data/10s/prod/v1/2025/players.json",
+        "https://data.nba.com/data/10s/prod/v1/2024/players.json",
+    ]
+    for u in urls_legacy:
+        try:
+            r = requests.get(u, timeout=12)
+            if r.ok:
+                j = r.json()
+                if j.get("league", {}).get("standard"):
+                    return j
+        except Exception:
+            continue
+
+    # --- 3) фоллбек
     return {"league": {"standard": FALLBACK_PLAYERS}}
 
 def _build_index() -> Dict[str, Any]:
