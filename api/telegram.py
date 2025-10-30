@@ -1,6 +1,6 @@
 # /api/telegram.py — FastAPI webhook для Telegram (Vercel)
 # Пути:
-#  GET  /api/telegram, /api/telegram/healthz
+#  GET  /api/telegram, /api/telegram/z
 #  POST /api/telegram?secret=...
 #  POST /api/telegram/webhook/<secret>
 
@@ -213,13 +213,33 @@ async def handle_update(update: dict) -> JSONResponse:
         tg_send_message(chat_id, f"Ошибка отправки изображения: {resp}")
     return JSONResponse({"ok": True})
 
-# ---------- health ----------
+# ----------  ----------
+@app.get("/")
+@app.get("/api/telegram")
+@app.get("/api/telegram/z")
+def ():
+    return {
+        "ok": True,
+        "endpoints": [
+            "GET  /api/telegram",
+            "GET  /api/telegram/z",
+            "POST /api/telegram?secret=...",
+            "POST /api/telegram/webhook/<secret>",
+        ],
+    }
+
 @app.get("/")
 @app.get("/api/telegram")
 @app.get("/api/telegram/healthz")
 def health():
+    try:
+        from data import players_count
+        count = players_count()
+    except Exception:
+        count = -1
     return {
         "ok": True,
+        "players_indexed": count,
         "endpoints": [
             "GET  /api/telegram",
             "GET  /api/telegram/healthz",
