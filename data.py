@@ -100,7 +100,7 @@ RU_NAME_OVERRIDES: Dict[str,str] = {
     "lebron james":"Леброн Джеймс",
     "stephen curry":"Стефен Карри",
     "kevin durant":"Кевин Дюрант",
-    "giannis antetokounmpo":"Яннис Адетокунбо",
+    "giannis antetokounmpo":"Яннис Адетокумбо",
     "joel embiid":"Джоэл Эмбиид",
     "anthony davis":"Энтони Дэвис",
     "kyrie irving":"Кайри Ирвинг",
@@ -108,6 +108,21 @@ RU_NAME_OVERRIDES: Dict[str,str] = {
     "domantas sabonis":"Домантас Сабонис",
     "alperen sengun":"Алперен Шенгюн",
 }
+
+# --- Минимальный фоллбек на случай проблем с сетью/эндпоинтами ---
+FALLBACK_PLAYERS = [
+    {"personId":"203999","firstName":"Nikola","lastName":"Jokic","teamId":"1610612743"},  # DEN
+    {"personId":"201939","firstName":"Stephen","lastName":"Curry","teamId":"1610612744"}, # GSW
+    {"personId":"2544","firstName":"LeBron","lastName":"James","teamId":"1610612747"},    # LAL
+    {"personId":"1641707","firstName":"Victor","lastName":"Wembanyama","teamId":"1610612759"}, # SAS
+    {"personId":"1629627","firstName":"Zion","lastName":"Williamson","teamId":"1610612740"},   # NOP
+    {"personId":"203507","firstName":"Giannis","lastName":"Antetokounmpo","teamId":"1610612749"}, # MIL
+    {"personId":"203076","firstName":"Damian","lastName":"Lillard","teamId":"1610612749"}, # MIL
+    {"personId":"203954","firstName":"Joel","lastName":"Embiid","teamId":"1610612755"},    # PHI
+    {"personId":"201142","firstName":"Kevin","lastName":"Durant","teamId":"1610612756"},   # PHX
+    {"personId":"1629029","firstName":"Luka","lastName":"Doncic","teamId":"1610612742"},   # DAL
+    {"personId":"203076","firstName":"Damian","lastName":"Lillard","teamId":"1610612749"}, # дубль на случай апдейтов
+]
 
 # ===== алиасы, задаваемые из бота =====
 _ALIASES: Dict[str, str] = {}  # key(normalized alias) -> normalized base ascii-key
@@ -137,24 +152,43 @@ _load_aliases()
 
 # ===== загрузка игроков с NBA CDN =====
 def _fetch_players_payload() -> Dict[str, Any]:
+    """
+    Пытаемся получить актуальный список игроков:
+      1) сначала локальный снапшот assets/players.json (если ты его положишь в репозиторий),
+      2) затем несколько проверенных эндпоинтов NBA,
+      3) если ничего не сработало — возвращаем фоллбек-лист ключевых игроков.
+    """
+    # 1) локальный снапшот (рекомендуется положить в репо для 100% стабильности)
     local = ASSETS / "players.json"
-    if local.exists():
+    if local.exists() and local.stat().st_size > 0:
         try:
-            return json.loads(local.read_text(encoding="utf-8"))
+            j = json.loads(local.read_text(encoding="utf-8"))
+            if j.get("league", {}).get("standard"):
+                return j
         except Exception:
             pass
+
+    # 2) сетевые источники (несколько URL на случай, если один лег)
     urls = [
+        # Классический working-эндпоинт
+        "https://data.nba.net/prod/v1/2025/players.json",
+        "https://data.nba.net/prod/v1/2024/players.json",
+        # Альтернатива (иногда доступна, иногда нет)
         "https://data.nba.com/data/10s/prod/v1/2025/players.json",
         "https://data.nba.com/data/10s/prod/v1/2024/players.json",
     ]
     for u in urls:
         try:
-            r = requests.get(u, timeout=10)
+            r = requests.get(u, timeout=12)
             if r.ok:
-                return r.json()
+                j = r.json()
+                if j.get("league", {}).get("standard"):
+                    return j
         except Exception:
             continue
-    return {"league": {"standard": []}}
+
+    # 3) фоллбек — минимальный список, чтобы бот не был "пустым"
+    return {"league": {"standard": FALLBACK_PLAYERS}}
 
 def _build_index() -> Dict[str, Any]:
     payload = _fetch_players_payload()
