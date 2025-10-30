@@ -168,6 +168,10 @@ def _fetch_players_payload() -> Dict[str, Any]:
         except Exception:
             pass
 
+    def players_count() -> int:
+    _ensure_index()
+    return len(_PLAYERS["_byid"]) if _PLAYERS else 0
+
     # 2) сетевые источники (несколько URL на случай, если один лег)
     urls = [
         # Классический working-эндпоинт
