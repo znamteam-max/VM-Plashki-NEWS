@@ -188,36 +188,38 @@ async def handle_update(update: dict) -> JSONResponse:
         tg_send_message(chat_id, f"Ошибка отправки изображения: {resp}")
     return JSONResponse({"ok": True})
 
+# ---------- health + refresh на ОДНОМ пути /api/telegram ----------
 @app.get("/")
 @app.get("/api/telegram")
-@app.get("/api/telegram/healthz")
-def health():
+def health_or_refresh(
+    action: str = Query(default=""),   # "", "refresh"
+    secret: str = Query(default="")    # для refresh
+):
     try:
-        from data import players_count
-        count = players_count()
+        from data import players_count, force_refresh_players
     except Exception:
-        count = -1
+        # если импорт не удался — вернём базовый ответ
+        if action == "refresh":
+            raise HTTPException(status_code=500, detail="data import failed")
+        return {"ok": True, "players_indexed": -1, "endpoints": ["GET /api/telegram (action=refresh&secret=...)",
+                                                                 "POST /api/telegram?secret=..."]}
+
+    if action == "refresh":
+        # защищаем секретом
+        if secret != os.environ.get("WEBHOOK_SECRET", "hook"):
+            raise HTTPException(status_code=404, detail="Not found")
+        n = force_refresh_players()
+        return {"ok": True, "refreshed": True, "players_indexed": n}
+
+    # обычный health
     return {
         "ok": True,
-        "players_indexed": count,
+        "players_indexed": players_count(),
         "endpoints": [
-            "GET  /api/telegram",
-            "GET  /api/telegram/healthz",
-            "GET  /api/telegram/refresh?secret=...",
-            "POST /api/telegram?secret=...",
-            "POST /api/telegram/webhook/<secret>",
+            "GET  /api/telegram (action=refresh&secret=...)",
+            "POST /api/telegram?secret=...  (Telegram webhook)",
         ],
     }
-
-# Принудительная перезагрузка индекса (для админа)
-@app.get("/api/telegram/refresh")
-def refresh(secret: str = Query(default="")):
-    if secret != os.environ.get("WEBHOOK_SECRET", "hook"):
-        raise HTTPException(status_code=404, detail="Not found")
-    from data import force_refresh_players, players_count
-    force_refresh_players()
-    return {"ok": True, "players_indexed": players_count()}
-
 # ---------- webhook ----------
 @app.post("/")
 @app.post("/api/telegram")
