@@ -1,10 +1,10 @@
 # scripts/build_players.py
-# Активные игроки: balldontlie (Authorization: Bearer <BL_API_KEY>)
-# Официальные NBA personId: набор зеркал (swar/bttmly/kshvmdn/mtthai), с разными схемами.
+# Активные -> balldontlie (Authorization: Bearer <BL_API_KEY>)
+# personId -> набор зеркал (swar/bttmly/kshvmdn/mtthai) с разными схемами
 # Выход: assets/players.json в формате {"league":{"standard":[{"personId":"201939","firstName":"Stephen","lastName":"Curry","teamId":"1610612744"}, ...]}}
 
 import os, json, re, sys
-from typing import Dict, List, Iterable, Any
+from typing import Dict, List, Iterable, Any, Optional
 import requests
 from unidecode import unidecode
 from pathlib import Path
@@ -41,11 +41,11 @@ TEAM_ABBR_TO_ID: Dict[str, int] = {
     "UTA":1610612762, "MEM":1610612763, "WAS":1610612764, "DET":1610612765, "CHA":1610612766,
 }
 
-# ---------- HTTP сессия ----------
+# ---------- HTTP ----------
 session = requests.Session()
 session.headers.update({
     "Authorization": f"Bearer {BL_KEY}",
-    "User-Agent": "players-sync/1.2"
+    "User-Agent": "players-sync/1.3"
 })
 
 # ---------- balldontlie: активные игроки ----------
@@ -70,78 +70,98 @@ def fetch_active_players_balldontlie() -> List[dict]:
 
     return out
 
-# ---------- загрузка и парсинг зеркал с personId ----------
+# ---------- mirrors helpers ----------
 def _safe_json(url: str) -> Any:
     r = requests.get(url, timeout=40)
     r.raise_for_status()
     try:
         return r.json()
     except Exception:
-        # иногда raw отдает текст — попробуем json.loads вручную
-        txt = r.text
-        return json.loads(txt)
+        return json.loads(r.text)
+
+def _join_name(row: dict) -> str:
+    """
+    Собираем имя игрока из самых разных схем полей.
+    Приоритет: полные поля, дальше конкатенации.
+    """
+    candidates = [
+        row.get("PlayerName"), row.get("PLAYER_NAME"), row.get("playerName"),
+        row.get("full_name"), row.get("fullName"), row.get("name"),
+        row.get("DISPLAY_FIRST_LAST"), row.get("display_first_last"),
+        row.get("DISPLAY_LAST_COMMA_FIRST"), row.get("display_last_comma_first"),
+    ]
+    for nm in candidates:
+        if isinstance(nm, str) and nm.strip():
+            return nm.strip()
+
+    # Конкатенации (snake / camel)
+    fn = (row.get("first_name") or row.get("firstName") or "").strip()
+    ln = (row.get("last_name")  or row.get("lastName")  or "").strip()
+    if fn or ln:
+        return f"{fn} {ln}".strip()
+
+    # Иногда бывает "first" / "last"
+    fn2 = (row.get("first") or "").strip()
+    ln2 = (row.get("last")  or "").strip()
+    if fn2 or ln2:
+        return f"{fn2} {ln2}".strip()
+
+    return ""
+
+def _extract_pid(row: dict) -> Optional[int]:
+    for key in ("PERSON_ID","PersonID","personId","PlayerID","PLAYER_ID","playerId","id"):
+        if key in row and str(row[key]).strip():
+            try:
+                return int(str(row[key]).strip())
+            except Exception:
+                continue
+    return None
 
 def _iter_name_id_from_any(payload: Any) -> Iterable[tuple[str,int]]:
-    """
-    Универсальный парсер разных схем зеркал.
-    На выход: (нормализованное_имя, personId)
-    """
     if payload is None:
         return []
-    # Вариант 1: список объектов [{...}, ...]
+
+    def handle_row(row: dict):
+        pid = _extract_pid(row)
+        nm  = _join_name(row)
+        if pid and nm:
+            yield norm_name(nm), pid
+
     if isinstance(payload, list):
         for row in payload:
             if isinstance(row, dict):
-                pid = (row.get("PlayerID") or row.get("PLAYER_ID") or
-                       row.get("playerId") or row.get("id") or row.get("personId"))
-                nm  = (row.get("PlayerName") or row.get("PLAYER_NAME") or
-                       row.get("playerName") or row.get("full_name") or row.get("fullName") or
-                       (f"{row.get('first_name','')} {row.get('last_name','')}".strip()))
-                if not pid or not nm:
-                    continue
-                try:
-                    pid_int = int(str(pid).strip())
-                except Exception:
-                    continue
-                yield norm_name(nm), pid_int
-            # если пришли строки — пропускаем
+                yield from handle_row(row)
         return
 
-    # Вариант 2: словарь с ключами "players"/"data"
     if isinstance(payload, dict):
-        arr = payload.get("players") or payload.get("data") or payload.get("standard")
-        if isinstance(arr, list):
-            for row in arr:
-                if not isinstance(row, dict):
-                    continue
-                pid = (row.get("PlayerID") or row.get("PLAYER_ID") or
-                       row.get("playerId") or row.get("id") or row.get("personId"))
-                nm  = (row.get("PlayerName") or row.get("PLAYER_NAME") or
-                       row.get("playerName") or row.get("full_name") or row.get("fullName") or
-                       (f"{row.get('first_name','')} {row.get('last_name','')}".strip()))
-                if not pid or not nm:
-                    continue
-                try:
-                    pid_int = int(str(pid).strip())
-                except Exception:
-                    continue
-                yield norm_name(nm), pid_int
+        # разные ключи-коллекции
+        arr_keys = ("players","data","standard","rowSet","items")
+        for k in arr_keys:
+            arr = payload.get(k)
+            if isinstance(arr, list):
+                for row in arr:
+                    if isinstance(row, dict):
+                        yield from handle_row(row)
+                return
+        # возможно, это уже "плоская" запись одного игрока
+        if any(k in payload for k in ("PLAYER_ID","playerId","PERSON_ID","personId","id")):
+            yield from handle_row(payload)
         return
 
-    # Иное — игнор
     return []
 
 def fetch_all_player_ids_historic() -> Dict[str,int]:
     mirrors = [
-        # nba_api (swar) — чаще всего актуальный формат: list[ { "id": 201939, "full_name": "Stephen Curry", ... } ]
+        # swar/nba_api — частая перемена путей, сначала новый layout:
+        "https://raw.githubusercontent.com/swar/nba_api/master/src/nba_api/stats/library/data/players.json",
+        # старые варианты:
         "https://raw.githubusercontent.com/swar/nba_api/master/nba_api/stats/library/data/players.json",
-        # дубликат пути через docs/ (на случай перемещений в репо)
         "https://raw.githubusercontent.com/swar/nba_api/master/docs/nba_api/stats/library/data/players.json",
-        # bttmly/nba — старая, но популярная база
+        # bttmly/nba:
         "https://raw.githubusercontent.com/bttmly/nba/master/data/players.json",
-        # kshvmdn/nba.js — похожая структура
+        # kshvmdn/nba.js:
         "https://raw.githubusercontent.com/kshvmdn/nba.js/master/data/players.json",
-        # mtthai (как у тебя было — оставим как запасной)
+        # mtthai (запасной):
         "https://raw.githubusercontent.com/mtthai/nba-api-client/master/data/players.json",
     ]
     name_to_id: Dict[str,int] = {}
@@ -154,12 +174,13 @@ def fetch_all_player_ids_historic() -> Dict[str,int]:
                     name_to_id[k] = pid
                     added += 1
             print(f"[sync] mirror ok: {url} (+{added}, total={len(name_to_id)})")
-            if len(name_to_id) > 500:  # достаточно
+            # 300+ ID достаточно, дальше доберём сопоставлением по активным именам
+            if len(name_to_id) > 300:
                 break
         except Exception as e:
             print(f"[sync] mirror fail: {url} -> {type(e).__name__}: {e}")
             continue
-    if len(name_to_id) < 100:
+    if len(name_to_id) < 150:
         raise RuntimeError("too few ids from mirrors")
     return name_to_id
 
@@ -169,7 +190,7 @@ def make_output(active_players: List[dict], hist_ids: Dict[str,int]) -> dict:
     missing_ids = 0
     for p in active_players:
         fn = (p.get("first_name") or "").strip()
-        ln = (p.get("last_name") or "").strip()
+        ln = (p.get("last_name")  or "").strip()
         team = p.get("team") or {}
         abbr = (team.get("abbreviation") or "").upper()
         team_id = TEAM_ABBR_TO_ID.get(abbr)
@@ -180,12 +201,11 @@ def make_output(active_players: List[dict], hist_ids: Dict[str,int]) -> dict:
         pid = hist_ids.get(k1)
 
         if not pid:
-            # без дефиса/апострофа
+            # без дефисов/апострофов
             k2 = norm_name(k1.replace("-", " ").replace("'", ""))
             pid = hist_ids.get(k2)
 
         if not pid and " " in k1:
-            # имя + последняя фамилия
             parts = k1.split()
             k3 = norm_name(f"{parts[0]} {parts[-1]}")
             pid = hist_ids.get(k3)
