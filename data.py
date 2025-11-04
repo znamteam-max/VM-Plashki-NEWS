@@ -16,16 +16,27 @@ CACHE.mkdir(parents=True, exist_ok=True)
 
 PLAYERS_CACHE = CACHE / "players_index.json"
 ALIASES_FILE  = CACHE / "aliases.json"
-HEAD_DIR = CACHE / "headshots"; HEAD_DIR.mkdir(exist_ok=True)
+RU_OVERRIDES_FILE   = CACHE / "ru_overrides.json"     # player_id -> "Русское Имя"
+LASTNAME_RULES_FILE = CACHE / "lastname_rules.json"   # "jokic" -> "Йокич"
+
+HEAD_DIR = CACHE / "headshots"
+HEAD_DIR.mkdir(exist_ok=True)
 
 # Логотипы должны лежать в репозитории: assets/cache/logo_<teamId>.png
 LOGO_DIR = ASSETS / "cache"
 ICON_STAR = str((ASSETS / "icons" / "star.png").resolve())
 
 # Поведение загрузчика
-REFRESH_SECONDS = int(os.getenv("PLAYERS_REFRESH_SECONDS", "86400"))  # 1 день
-PLAYERS_OFFLINE = os.getenv("PLAYERS_OFFLINE", "1") == "1"  # по умолчанию офлайн
-PLAYERS_SNAPSHOT_URL = os.getenv("PLAYERS_SNAPSHOT_URL", "").strip()  # опционально — быстрая прямая ссылка на готовый JSON (raw GitHub и т.п.)
+REFRESH_SECONDS    = int(os.getenv("PLAYERS_REFRESH_SECONDS", "86400"))  # 1 день
+PLAYERS_OFFLINE    = os.getenv("PLAYERS_OFFLINE", "1") == "1"  # по умолчанию офлайн
+PLAYERS_SNAPSHOT_URL = os.getenv("PLAYERS_SNAPSHOT_URL", "").strip()  # опционально — прямая ссылка на готовый JSON
+
+# Админы (право управлять /fixlast, /setru и т.п.)
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(",", " ").split() if x.strip().isdigit()}
+
+# Опционально Upstash (персистентность без деплоя)
+UPSTASH_URL   = os.getenv("UPSTASH_URL", "").strip()
+UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "").strip()
 
 # ===== команды: имена и базовый цвет (primary) =====
 TEAM_NAMES: Dict[int, str] = {
@@ -133,6 +144,15 @@ FALLBACK_PLAYERS = [
 # ===== алиасы, задаваемые из бота =====
 _ALIASES: Dict[str, str] = {}  # key(normalized alias) -> normalized base ascii-key
 
+def _json_load(path: Path) -> dict:
+    if path.exists():
+        try: return json.loads(path.read_text(encoding="utf-8"))
+        except Exception: return {}
+    return {}
+def _json_save(path: Path, obj: dict) -> None:
+    try: path.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+    except Exception: pass
+
 def _load_aliases():
     global _ALIASES
     if ALIASES_FILE.exists():
@@ -147,11 +167,88 @@ def add_alias(alias_text: str, base_full_ascii: str) -> bool:
         k = _normalize_key(alias_text)
         base_k = _normalize_key(base_full_ascii)
         _ALIASES[k] = base_k
-        ALIASES_FILE.write_text(json.dumps(_ALIASES), encoding="utf-8")
+        ALIASES_FILE.write_text(json.dumps(_ALIASES, ensure_ascii=False), encoding="utf-8")
         return True
     except Exception:
         return False
 _load_aliases()
+
+# ===== Upstash K/V helpers (опционально) =====
+def _kv_get(key: str) -> Optional[dict]:
+    if not (UPSTASH_URL and UPSTASH_TOKEN):
+        return None
+    try:
+        r = requests.get(f"{UPSTASH_URL}/get/{key}",
+                         headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+                         timeout=5)
+        if r.ok:
+            j = r.json()
+            val = j.get("result")
+            if isinstance(val, str):
+                return json.loads(val)
+            if isinstance(val, dict):
+                return val
+    except Exception:
+        pass
+    return None
+
+def _kv_set(key: str, obj: dict) -> bool:
+    if not (UPSTASH_URL and UPSTASH_TOKEN):
+        return False
+    try:
+        payload = json.dumps(obj, ensure_ascii=False)
+        r = requests.get(f"{UPSTASH_URL}/set/{key}/{payload}",
+                         headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+                         timeout=5)
+        return r.ok
+    except Exception:
+        return False
+
+# ===== Глобальные мапы исправлений =====
+_RU_OVERRIDES: Dict[str, str] = {}      # player_id(str) -> "Русское Имя"
+_LASTNAME_RULES: Dict[str, str] = {}    # latin_last(lower) -> "Йокич"
+
+def _load_overrides():
+    global _RU_OVERRIDES, _LASTNAME_RULES
+    ru = _kv_get("ru_overrides") or _json_load(RU_OVERRIDES_FILE)
+    ln = _kv_get("lastname_rules") or _json_load(LASTNAME_RULES_FILE)
+    _RU_OVERRIDES = {str(k): str(v) for k, v in ru.items()} if isinstance(ru, dict) else {}
+    _LASTNAME_RULES = {str(k).lower(): str(v) for k, v in ln.items()} if isinstance(ln, dict) else {}
+
+def _save_overrides():
+    _json_save(RU_OVERRIDES_FILE, _RU_OVERRIDES)
+    _json_save(LASTNAME_RULES_FILE, _LASTNAME_RULES)
+    _kv_set("ru_overrides", _RU_OVERRIDES)
+    _kv_set("lastname_rules", _LASTNAME_RULES)
+
+_load_overrides()
+
+def _apply_lastname_rules(full_ascii: str, ru_guess: str) -> str:
+    """
+    full_ascii: 'Nikola Jokic' (латиницей)
+    ru_guess:   'Никола Йокич' (текущий вариант)
+    Если есть правило на last ('jokic' -> 'Йокич') — меняем последний токен.
+    """
+    last_lat = _normalize_key(full_ascii).split(" ")[-1]  # 'jokic'
+    fix = _LASTNAME_RULES.get(last_lat)
+    if not fix:
+        return ru_guess
+    parts = ru_guess.split()
+    if not parts:
+        return ru_guess
+    parts[-1] = fix
+    return " ".join(parts)
+
+def _ru_display_for_player(full_ascii: str, pid: int) -> str:
+    # 1) точечный override
+    ru = _RU_OVERRIDES.get(str(pid))
+    if ru:
+        return ru
+    # 2) базовый транслит + ручные RU_NAME_OVERRIDES
+    ascii_key = _normalize_key(full_ascii)
+    ru_guess = RU_NAME_OVERRIDES.get(ascii_key, lat2cyr(full_ascii))
+    # 3) массовое правило по фамилии
+    return _apply_lastname_rules(full_ascii, ru_guess)
 
 # ====== ЗАГРУЗКА SNAPSHOT (офлайн-приоритет) ======
 def _load_local_snapshot() -> Optional[Dict[str, Any]]:
@@ -187,14 +284,20 @@ def _build_index_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     for p in players:
         if not p.get("personId"):
             continue
-        pid = int(p["personId"])
+        try:
+            pid = int(p["personId"])
+        except Exception:
+            continue
         first = p.get("firstName","").strip()
         last  = p.get("lastName","").strip()
-        team_id = int(p.get("teamId") or 0)
+        try:
+            team_id = int(p.get("teamId") or 0)
+        except Exception:
+            team_id = 0
         team_name = TEAM_NAMES.get(team_id, "Free Agent")
         full_ascii = f"{first} {last}".strip()
         ascii_key = _normalize_key(full_ascii)
-        ru_display = RU_NAME_OVERRIDES.get(ascii_key, lat2cyr(full_ascii))
+        ru_display = _ru_display_for_player(full_ascii, pid)
 
         rec = {
             "id": pid,
@@ -211,7 +314,6 @@ def _build_index_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         index["_bykey"][cyr_key] = rec
         index["_bykey"][_normalize_key(full_ascii.replace("-", " "))] = rec
         index["_bykey"][_normalize_key(ru_display.replace("-", " "))] = rec
-
     # короткие алиасы
     aliases = {
         "wemby":"victor wembanyama", "вемба":"victor wembanyama",
@@ -227,14 +329,13 @@ def _build_index_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             index["_bykey"][k] = index["_bykey"][basek]
     return index
 
-_PLAYERS: Dict[str, Any] | None = None
+_PLAYERS: Optional[Dict[str, Any]] = None
 _LAST_LOAD = 0
 
 def _ensure_index(force: bool = False):
     """Офлайн-приоритет: assets → /tmp cache → (опц.) SNAPSHOT_URL → fallback."""
     global _PLAYERS, _LAST_LOAD
     now = time.time()
-
     if _PLAYERS and not force and (now - _LAST_LOAD) < REFRESH_SECONDS:
         return
 
@@ -244,7 +345,7 @@ def _ensure_index(force: bool = False):
         _PLAYERS = _build_index_from_payload(snap)
         _LAST_LOAD = now
         try:
-            PLAYERS_CACHE.write_text(json.dumps(_PLAYERS), encoding="utf-8")
+            PLAYERS_CACHE.write_text(json.dumps(_PLAYERS, ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
         return
@@ -259,15 +360,14 @@ def _ensure_index(force: bool = False):
         except Exception:
             _PLAYERS = None
 
-    # 3) быстрая прямая ссылка (если задана) — не ходим на nba.com
+    # 3) быстрая прямая ссылка (если офлайн=0 и URL задан)
     if not PLAYERS_OFFLINE:
-        # если офлайн=0, разрешим URL; но он быстрый (8s)
         url_snap = _load_snapshot_from_url()
         if url_snap:
             _PLAYERS = _build_index_from_payload(url_snap)
             _LAST_LOAD = now
             try:
-                PLAYERS_CACHE.write_text(json.dumps(_PLAYERS), encoding="utf-8")
+                PLAYERS_CACHE.write_text(json.dumps(_PLAYERS, ensure_ascii=False), encoding="utf-8")
             except Exception:
                 pass
             return
@@ -277,7 +377,7 @@ def _ensure_index(force: bool = False):
     _PLAYERS = _build_index_from_payload({"league":{"standard": FALLBACK_PLAYERS}})
     _LAST_LOAD = now
     try:
-        PLAYERS_CACHE.write_text(json.dumps(_PLAYERS), encoding="utf-8")
+        PLAYERS_CACHE.write_text(json.dumps(_PLAYERS, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
 
