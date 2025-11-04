@@ -1,48 +1,33 @@
-# data.py — онлайн-индекс игроков (лат/кириллица), русское имя, headshots/логотипы, подсказки, алиасы
+# data.py — индекс игроков (лат/кириллица), русское имя, headshots/логотипы, подсказки, алиасы
 import os, json, unicodedata, re, time
 from pathlib import Path
 from typing import Dict, Any, Tuple, List, Optional
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from difflib import SequenceMatcher
-
-# ===== настройки =====
-REFRESH_SECONDS = int(os.getenv("PLAYERS_REFRESH_SECONDS", "21600"))  # 6 часов
-ACTIVE_ONLY     = os.getenv("PLAYERS_ACTIVE_ONLY", "1").lower() in ("1","true","yes")
-
-# Если указан, берём игроков из этого URL (онлайн JSON того же формата, что data.nba.net)
-# Пример: https://<твой-домен>.vercel.app/players.json
-PLAYERS_JSON_URL = os.getenv("PLAYERS_JSON_URL", "").strip()
 
 # ===== пути и кэш =====
 ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "assets"
 ASSETS.mkdir(parents=True, exist_ok=True)
+
+# В Vercel писать можно только в /tmp
 CACHE = Path("/tmp/nba_cache")
 CACHE.mkdir(parents=True, exist_ok=True)
 
 PLAYERS_CACHE = CACHE / "players_index.json"
 ALIASES_FILE  = CACHE / "aliases.json"
 HEAD_DIR = CACHE / "headshots"; HEAD_DIR.mkdir(exist_ok=True)
-LOGO_DIR = ASSETS / "cache"  # ожидаются logo_<teamId>.png
+
+# Логотипы должны лежать в репозитории: assets/cache/logo_<teamId>.png
+LOGO_DIR = ASSETS / "cache"
 ICON_STAR = str((ASSETS / "icons" / "star.png").resolve())
 
-# ===== лог (для диагностики GET action=debug) =====
-DEBUG_LOG: List[str] = []
-def _log(msg: str):
-    try:
-        print(f"[players] {msg}", flush=True)
-    except Exception:
-        pass
-    DEBUG_LOG.append(msg)
-    if len(DEBUG_LOG) > 200:
-        del DEBUG_LOG[:100]
+# Поведение загрузчика
+REFRESH_SECONDS = int(os.getenv("PLAYERS_REFRESH_SECONDS", "86400"))  # 1 день
+PLAYERS_OFFLINE = os.getenv("PLAYERS_OFFLINE", "1") == "1"  # по умолчанию офлайн
+PLAYERS_SNAPSHOT_URL = os.getenv("PLAYERS_SNAPSHOT_URL", "").strip()  # опционально — быстрая прямая ссылка на готовый JSON (raw GitHub и т.п.)
 
-def get_debug_log(max_lines: int = 80) -> List[str]:
-    return DEBUG_LOG[-max_lines:]
-
-# ===== команды: имена и цвета =====
+# ===== команды: имена и базовый цвет (primary) =====
 TEAM_NAMES: Dict[int, str] = {
     1610612737:"Atlanta Hawks", 1610612738:"Boston Celtics", 1610612739:"Cleveland Cavaliers",
     1610612740:"New Orleans Pelicans", 1610612741:"Chicago Bulls", 1610612742:"Dallas Mavericks",
@@ -67,6 +52,7 @@ TEAM_PRIMARY: Dict[int, str] = {
     1610612761:"#BA0C2F", 1610612762:"#002B5C", 1610612763:"#5D76A9",
     1610612764:"#002B5C", 1610612765:"#C8102E", 1610612766:"#00788C",
 }
+
 def _shade(hex_color: str, k: float) -> str:
     hex_color = hex_color.strip().lstrip("#")
     r = int(hex_color[0:2], 16); g = int(hex_color[2:4], 16); b = int(hex_color[4:6], 16)
@@ -122,7 +108,7 @@ RU_NAME_OVERRIDES: Dict[str,str] = {
     "lebron james":"Леброн Джеймс",
     "stephen curry":"Стефен Карри",
     "kevin durant":"Кевин Дюрант",
-    "giannis antetokounmpo":"Яннис Адетокунбо",
+    "giannis antetokounmpo":"Яннис Адетокумбо",
     "joel embiid":"Джоэл Эмбиид",
     "anthony davis":"Энтони Дэвис",
     "kyrie irving":"Кайри Ирвинг",
@@ -131,7 +117,7 @@ RU_NAME_OVERRIDES: Dict[str,str] = {
     "alperen sengun":"Алперен Шенгюн",
 }
 
-# --- фоллбек (если сеть совсем не дала) ---
+# --- минимальный бэкап-лист, чтобы бот не был пустым ---
 FALLBACK_PLAYERS = [
     {"personId":"203999","firstName":"Nikola","lastName":"Jokic","teamId":"1610612743"},
     {"personId":"201939","firstName":"Stephen","lastName":"Curry","teamId":"1610612744"},
@@ -144,8 +130,9 @@ FALLBACK_PLAYERS = [
     {"personId":"1629029","firstName":"Luka","lastName":"Doncic","teamId":"1610612742"},
 ]
 
-# ===== алиасы (пользовательские) =====
-_ALIASES: Dict[str, str] = {}
+# ===== алиасы, задаваемые из бота =====
+_ALIASES: Dict[str, str] = {}  # key(normalized alias) -> normalized base ascii-key
+
 def _load_aliases():
     global _ALIASES
     if ALIASES_FILE.exists():
@@ -166,138 +153,45 @@ def add_alias(alias_text: str, base_full_ascii: str) -> bool:
         return False
 _load_aliases()
 
-# ===== HTTP с ретраями =====
-def _session() -> requests.Session:
-    s = requests.Session()
-    retry = Retry(
-        total=3, backoff_factor=0.4,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"])
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    return s
-
-# ===== загрузка игроков (stats.nba.com + legacy + PLAYERS_JSON_URL) =====
-def _fetch_players_payload() -> Dict[str, Any]:
-    """
-    Возвращаем {"league":{"standard":[{personId,firstName,lastName,teamId}...]}}
-    Источники по приоритету:
-      1) PLAYERS_JSON_URL (если указан)
-      2) stats.nba.com commonallplayers (с мощными заголовками)
-      3) legacy data.nba.net / data.nba.com
-      4) FALLBACK_PLAYERS (9 шт)
-    """
-    sess = _session()
-
-    # 0) Жёстко заданный внешний JSON (удобно: положи players.json в /public проекта)
-    if PLAYERS_JSON_URL:
+# ====== ЗАГРУЗКА SNAPSHOT (офлайн-приоритет) ======
+def _load_local_snapshot() -> Optional[Dict[str, Any]]:
+    p = ASSETS / "players.json"
+    if p.exists() and p.stat().st_size > 1000:
         try:
-            r = sess.get(PLAYERS_JSON_URL, timeout=12)
-            _log(f"custom URL GET: status={getattr(r,'status_code',None)}")
-            if r.ok:
-                j = r.json()
-                std = j.get("league", {}).get("standard", [])
-                _log(f"custom URL parsed: players={len(std)}")
-                if std:
-                    return j
-        except Exception as e:
-            _log(f"custom URL error: {type(e).__name__}: {e}")
+            j = json.loads(p.read_text(encoding="utf-8"))
+            if j.get("league", {}).get("standard"):
+                print("[players] snapshot: assets/players.json OK")
+                return j
+        except Exception:
+            pass
+    print("[players] snapshot: assets/players.json MISSING/SMALL")
+    return None
 
-    # 1) stats.nba.com
-    headers = {
-        "Host": "stats.nba.com",
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
-        "Referer": "https://www.nba.com/",
-        "Origin": "https://www.nba.com",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Connection": "keep-alive",
-        "x-nba-stats-origin": "stats",
-        "x-nba-stats-token": "true",
-        "Accept-Encoding": "gzip, deflate",  # без br
-        # Доп. «браузерные» заголовки
-        "Sec-Fetch-Site": "same-site",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
-        "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", ";Not A Brand";v="24"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-    }
-    seasons = ["2025-26", "2024-25", "2023-24"]
-    for season in seasons:
-        url = ("https://stats.nba.com/stats/commonallplayers"
-               f"?LeagueID=00&Season={season}&IsOnlyCurrentSeason=1")
-        try:
-            r = sess.get(url, headers=headers, timeout=12)
-            _log(f"stats GET {season}: status={getattr(r,'status_code',None)}")
-            if r.ok:
-                j = r.json()
-                rs = None
-                if isinstance(j.get("resultSets"), list) and j["resultSets"]:
-                    rs = j["resultSets"][0]
-                elif isinstance(j.get("resultSet"), dict):
-                    rs = j["resultSet"]
-                if rs:
-                    headers_list = rs.get("headers") or []
-                    rows = rs.get("rowSet") or []
-                    idx = {h: i for i, h in enumerate(headers_list)}
-                    need = ("PERSON_ID", "FIRST_NAME", "LAST_NAME", "TEAM_ID")
-                    if all(k in idx for k in need):
-                        out = []
-                        for row in rows:
-                            out.append({
-                                "personId": str(row[idx["PERSON_ID"]]),
-                                "firstName": row[idx["FIRST_NAME"]] or "",
-                                "lastName":  row[idx["LAST_NAME"]]  or "",
-                                "teamId":    str(row[idx["TEAM_ID"]] or "0"),
-                            })
-                        _log(f"stats parsed {season}: players={len(out)}")
-                        if out:
-                            return {"league": {"standard": out}}
-        except Exception as e:
-            _log(f"stats error {season}: {type(e).__name__}: {e}")
+def _load_snapshot_from_url() -> Optional[Dict[str, Any]]:
+    if not PLAYERS_SNAPSHOT_URL:
+        return None
+    try:
+        r = requests.get(PLAYERS_SNAPSHOT_URL, timeout=8, headers={"User-Agent":"vm-plashki/1.0"})
+        if r.ok:
+            j = r.json()
+            std = j.get("league", {}).get("standard") or []
+            print(f"[players] SNAPSHOT URL OK: players={len(std)}")
+            return j if std else None
+    except Exception as e:
+        print(f"[players] SNAPSHOT URL FAIL: {type(e).__name__}: {e}")
+    return None
 
-    # 2) legacy JSON
-    urls_legacy = [
-        "https://data.nba.net/prod/v1/2025/players.json",
-        "https://data.nba.net/prod/v1/2024/players.json",
-        "https://data.nba.com/data/10s/prod/v1/2025/players.json",
-        "https://data.nba.com/data/10s/prod/v1/2024/players.json",
-    ]
-    for u in urls_legacy:
-        try:
-            r = sess.get(u, timeout=12)
-            _log(f"legacy GET {u.split('/')[-2]}: status={getattr(r,'status_code',None)}")
-            if r.ok:
-                j = r.json()
-                n = len(j.get("league", {}).get("standard", []))
-                _log(f"legacy parsed {u.split('/')[-2]}: players={n}")
-                if n:
-                    return j
-        except Exception as e:
-            _log(f"legacy error: {type(e).__name__}: {e}")
-
-    _log("FALLBACK used (9)")
-    return {"league": {"standard": FALLBACK_PLAYERS}}
-
-def _build_index() -> Dict[str, Any]:
-    payload = _fetch_players_payload()
+def _build_index_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     players = payload.get("league", {}).get("standard", [])
     index: Dict[str, Any] = {"_bykey": {}, "_byid": {}}
-
     for p in players:
         if not p.get("personId"):
-            continue
-        if ACTIVE_ONLY and (p.get("isActive") is False):
             continue
         pid = int(p["personId"])
         first = p.get("firstName","").strip()
         last  = p.get("lastName","").strip()
         team_id = int(p.get("teamId") or 0)
-        team_name = TEAM_NAMES.get(team_id, "Free Agent") if team_id else "Free Agent"
+        team_name = TEAM_NAMES.get(team_id, "Free Agent")
         full_ascii = f"{first} {last}".strip()
         ascii_key = _normalize_key(full_ascii)
         ru_display = RU_NAME_OVERRIDES.get(ascii_key, lat2cyr(full_ascii))
@@ -311,13 +205,14 @@ def _build_index() -> Dict[str, Any]:
         }
         index["_byid"][pid] = rec
 
+        # ключи для поиска
         cyr_key = _normalize_key(ru_display)
         index["_bykey"][ascii_key] = rec
         index["_bykey"][cyr_key] = rec
         index["_bykey"][_normalize_key(full_ascii.replace("-", " "))] = rec
         index["_bykey"][_normalize_key(ru_display.replace("-", " "))] = rec
 
-    # короткие алиасы/прозвища
+    # короткие алиасы
     aliases = {
         "wemby":"victor wembanyama", "вемба":"victor wembanyama",
         "зайон":"zion williamson", "лука":"luka doncic", "йокич":"nikola jokic", "ёкич":"nikola jokic",
@@ -326,70 +221,79 @@ def _build_index() -> Dict[str, Any]:
         "шай":"shai gilgeous alexander",
     }
     for a, base in aliases.items():
-        k = _normalize_key(a); basek = _normalize_key(base)
+        k = _normalize_key(a)
+        basek = _normalize_key(base)
         if basek in index["_bykey"]:
             index["_bykey"][k] = index["_bykey"][basek]
-
     return index
 
-_PLAYERS: Optional[Dict[str, Any]] = None
-_LAST_LOAD = 0.0
+_PLAYERS: Dict[str, Any] | None = None
+_LAST_LOAD = 0
 
-def _ensure_index(force_online: bool = False):
+def _ensure_index(force: bool = False):
+    """Офлайн-приоритет: assets → /tmp cache → (опц.) SNAPSHOT_URL → fallback."""
     global _PLAYERS, _LAST_LOAD
     now = time.time()
 
-    if _PLAYERS and not force_online and (now - _LAST_LOAD) < REFRESH_SECONDS:
+    if _PLAYERS and not force and (now - _LAST_LOAD) < REFRESH_SECONDS:
         return
 
-    if not force_online and PLAYERS_CACHE.exists() and not _PLAYERS:
-        try:
-            data = json.loads(PLAYERS_CACHE.read_text(encoding="utf-8"))
-            if data.get("_byid"):
-                _PLAYERS = data
-                _LAST_LOAD = now
-                _log(f"cache load ok: {len(_PLAYERS.get('_byid', {}))}")
-        except Exception as e:
-            _log(f"cache load error: {e}")
-            _PLAYERS = None
-
-    online = _build_index()
-    if online.get("_byid"):
-        _PLAYERS = online
+    # 1) assets/players.json (репозиторий)
+    snap = _load_local_snapshot()
+    if snap:
+        _PLAYERS = _build_index_from_payload(snap)
         _LAST_LOAD = now
         try:
             PLAYERS_CACHE.write_text(json.dumps(_PLAYERS), encoding="utf-8")
-            _log("cache save ok")
-        except Exception as e:
-            _log(f"cache save error: {e}")
+        except Exception:
+            pass
         return
 
-    if _PLAYERS:
-        _log("using existing cache")
-        return
+    # 2) /tmp cache (предыдущие запуски)
+    if PLAYERS_CACHE.exists():
+        try:
+            _PLAYERS = json.loads(PLAYERS_CACHE.read_text(encoding="utf-8"))
+            _LAST_LOAD = now
+            print("[players] loaded from /tmp cache")
+            return
+        except Exception:
+            _PLAYERS = None
 
-    _PLAYERS = _build_index()
+    # 3) быстрая прямая ссылка (если задана) — не ходим на nba.com
+    if not PLAYERS_OFFLINE:
+        # если офлайн=0, разрешим URL; но он быстрый (8s)
+        url_snap = _load_snapshot_from_url()
+        if url_snap:
+            _PLAYERS = _build_index_from_payload(url_snap)
+            _LAST_LOAD = now
+            try:
+                PLAYERS_CACHE.write_text(json.dumps(_PLAYERS), encoding="utf-8")
+            except Exception:
+                pass
+            return
+
+    # 4) fallback (минимум звёзд — 9 игроков), чтобы бот не падал
+    print("[players] FALLBACK used (9)")
+    _PLAYERS = _build_index_from_payload({"league":{"standard": FALLBACK_PLAYERS}})
     _LAST_LOAD = now
+    try:
+        PLAYERS_CACHE.write_text(json.dumps(_PLAYERS), encoding="utf-8")
+    except Exception:
+        pass
 
-def force_refresh_players() -> int:
-    global _PLAYERS, _LAST_LOAD
-    _PLAYERS = None
-    _LAST_LOAD = 0.0
-    _ensure_index(force_online=True)
+def players_count() -> int:
+    _ensure_index()
     return len(_PLAYERS["_byid"]) if _PLAYERS else 0
 
 def get_player_by_id(pid: int) -> Optional[Dict[str, Any]]:
     _ensure_index()
     return _PLAYERS["_byid"].get(int(pid)) if _PLAYERS else None
 
-def players_count() -> int:
-    _ensure_index()
-    return len(_PLAYERS["_byid"]) if _PLAYERS else 0
-
 def _apply_alias(q_norm: str) -> Optional[str]:
     return _ALIASES.get(q_norm)
 
 def find_player_by_name(query: str) -> Optional[Dict[str, Any]]:
+    """Возвращает {id, full_name (лат), display (РУС), team_id, team_name}."""
     if not query:
         return None
     _ensure_index()
@@ -398,31 +302,37 @@ def find_player_by_name(query: str) -> Optional[Dict[str, Any]]:
 
     q = _normalize_key(query)
 
+    # 1) Алиасы, заданные из бота
     base = _apply_alias(q)
     if base and base in _PLAYERS["_bykey"]:
         return _PLAYERS["_bykey"][base]
 
+    # 2) Прямые совпадения
     rec = _PLAYERS["_bykey"].get(q)
     if rec:
         return rec
 
+    # 3) кириллица -> лат
     if re.search("[а-яё]", q):
         lat_guess = _normalize_key(cyr2lat(query))
         rec = _PLAYERS["_bykey"].get(lat_guess)
         if rec:
             return rec
 
+    # 4) латиница без акцентов
     lat_guess2 = _normalize_key(_strip_accents(query))
     if lat_guess2 != q:
         rec = _PLAYERS["_bykey"].get(lat_guess2)
         if rec:
             return rec
 
+    # 5) лат -> кир транслит (редко помогает)
     cyr_guess = _normalize_key(lat2cyr(query))
     rec = _PLAYERS["_bykey"].get(cyr_guess)
     if rec:
         return rec
 
+    # 6) по фамилии
     last = q.split(" ")[-1]
     if len(last) >= 3:
         for k, r in _PLAYERS["_bykey"].items():
@@ -431,8 +341,40 @@ def find_player_by_name(query: str) -> Optional[Dict[str, Any]]:
 
     return None
 
+def suggest_players(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Топ-совпадения по похожести (для «Игрок не найден»)."""
+    _ensure_index()
+    if not _PLAYERS or not query:
+        return []
+    q = _normalize_key(query)
+    seen, scored = set(), []
+    for rec in _PLAYERS["_byid"].values():
+        keys = [rec["full_name"], rec["display"]]
+        s = 0.0
+        for key in keys:
+            k = _normalize_key(key)
+            r = SequenceMatcher(None, q, k).ratio()
+            if k.startswith(q) or any(w.startswith(q) for w in k.split()):
+                r += 0.1
+            s = max(s, r)
+        scored.append((s, rec))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out: List[Dict[str, Any]] = []
+    for s, rec in scored:
+        if rec["id"] in seen:
+            continue
+        seen.add(rec["id"])
+        out.append(rec)
+        if len(out) >= limit:
+            break
+    return out
+
 # ===== headshots & logos =====
 def ensure_headshot_png(player_id: int, full_name: str) -> str:
+    """
+    Скачиваем headshot в /tmp при первом запросе. Если не вышло — иконка звезды.
+    Важно: короткие таймауты, чтобы не блокировать серверную функцию.
+    """
     path = HEAD_DIR / f"{player_id}.png"
     if path.exists() and path.stat().st_size > 0:
         return str(path)
@@ -442,7 +384,7 @@ def ensure_headshot_png(player_id: int, full_name: str) -> str:
     ]
     for u in urls:
         try:
-            r = requests.get(u, timeout=8)
+            r = requests.get(u, timeout=6, headers={"User-Agent":"vm-plashki/1.0"})
             if r.ok and r.content and r.content[:4] == b"\x89PNG":
                 path.write_bytes(r.content)
                 return str(path)
