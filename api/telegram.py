@@ -1,4 +1,4 @@
-# /api/telegram.py — FastAPI webhook для Telegram (Vercel), с авто-списыванием имён со sports.ru
+# /api/telegram.py — FastAPI webhook для Telegram (Vercel), с кнопкой «Добавить перевод вручную»
 # Поддерживает:
 #  GET  /api/telegram
 #  GET  /api/telegram/healthz
@@ -16,7 +16,7 @@
 #  /delru Nikola Jokic
 #  /name Nikola Jokic
 #  /listfixes
-#  /resolve Nikola Jokic
+#  /resolve John Tonje
 
 import os
 import re
@@ -116,15 +116,16 @@ async def handle_update(update: dict) -> JSONResponse:
         _LASTNAME_RULES, _RU_OVERRIDES, _save_overrides, _load_overrides, _ru_display_for_player,
         sportsru_force,
         set_lastname_rule, del_lastname_rule, set_ru_override, del_ru_override,
-        rebuild_index_inplace
+        rebuild_index_inplace, cyr2lat
     )
 
-    # callback pick
+    # callback buttons
     if "callback_query" in update:
         cq = update["callback_query"]
         data_cb = cq.get("data") or ""
         chat_id = cq["message"]["chat"]["id"]
 
+        # Выбор игрока из подсказок
         if data_cb.startswith("pick:"):
             try:
                 pid = int(data_cb.split(":", 1)[1])
@@ -148,9 +149,7 @@ async def handle_update(update: dict) -> JSONResponse:
                 tg_answer_callback(cq["id"], "Игрок не найден по ID.")
                 return JSONResponse({"ok": True})
 
-            # на всякий случай освежим отображаемое имя (если только что меняли правила)
             display = _ru_display_for_player(player["full_name"], player["id"])
-
             logo_path, team_colors = ensure_team_logo_png(player["team_id"])
             head_path = ensure_headshot_png(player["id"], player["full_name"])
 
@@ -166,6 +165,37 @@ async def handle_update(update: dict) -> JSONResponse:
             )
             tg_answer_callback(cq["id"], f"Выбрано: {display}")
             tg_send_png(chat_id, png_bytes)
+            return JSONResponse({"ok": True})
+
+        # Новый пункт: Добавить перевод вручную
+        if data_cb == "addru":
+            # Попробуем вытащить исходную команду и догадаться EN-вариант из кириллицы
+            origin = cq["message"].get("reply_to_message") or cq["message"]
+            orig_text = origin.get("text") or ""
+            guess_en = None
+            try:
+                parsed = parse_card(orig_text)
+                if parsed:
+                    orig_name = parsed[0]
+                    if re.search("[А-Яа-яЁё]", orig_name):
+                        guess_en = cyr2lat(orig_name)
+            except Exception:
+                guess_en = None
+
+            lines = [
+                "Добавьте правильный перевод имени:",
+                "Формат:",
+                "/setru <EN-имя или ID> | <Имя на русском>",
+                "Примеры:",
+                "/setru Stephen Curry | Стефен Карри",
+                "/setru 201939 | Стефен Карри",
+                "",
+                "После сохранения индекс пересоберётся автоматически, и плашки будут с новым именем.",
+            ]
+            if guess_en:
+                lines.insert(1, f"Предположение EN: {guess_en}")
+            tg_answer_callback(cq["id"])
+            tg_send_message(chat_id, "\n".join(lines))
             return JSONResponse({"ok": True})
 
         tg_answer_callback(cq["id"])
@@ -216,6 +246,7 @@ async def handle_update(update: dict) -> JSONResponse:
             return JSONResponse({"ok": True})
         latin_last = parts[0]
         ru_last    = parts[1]
+        from data import set_lastname_rule
         total = set_lastname_rule(latin_last, ru_last)
         tg_send_message(chat_id, f"Ок. Правило фамилии: {latin_last} → {ru_last}\n"
                                  f"Индекс пересобран ({total} игроков). Новые плашки уже с учётом правила.")
@@ -230,6 +261,7 @@ async def handle_update(update: dict) -> JSONResponse:
         if not k:
             tg_send_message(chat_id, "Формат: /dellast Brooks")
             return JSONResponse({"ok": True})
+        from data import del_lastname_rule
         total = del_lastname_rule(k)
         tg_send_message(chat_id, f"Правило {k} удалено. Индекс пересобран ({total}).")
         return JSONResponse({"ok": True})
@@ -244,7 +276,7 @@ async def handle_update(update: dict) -> JSONResponse:
             tg_send_message(chat_id, "Формат: /setru Dillon Brooks | Диллон Брукс\nили: /setru 1626157 | Диллон Брукс")
             return JSONResponse({"ok": True})
         who, new_ru = parts[0], parts[1]
-        from data import find_player_by_name as _find, get_player_by_id as _get
+        from data import find_player_by_name as _find, get_player_by_id as _get, set_ru_override
         rec = _get(int(who)) if who.isdigit() else _find(who)
         if not rec:
             tg_send_message(chat_id, "Игрок не найден.")
@@ -261,7 +293,7 @@ async def handle_update(update: dict) -> JSONResponse:
         if not who:
             tg_send_message(chat_id, "Формат: /delru 203999 или /delru Nikola Jokic")
             return JSONResponse({"ok": True})
-        from data import find_player_by_name as _find, get_player_by_id as _get
+        from data import find_player_by_name as _find, get_player_by_id as _get, del_ru_override
         rec = _get(int(who)) if who.isdigit() else _find(who)
         if not rec:
             tg_send_message(chat_id, "Игрок не найден.")
@@ -292,7 +324,7 @@ async def handle_update(update: dict) -> JSONResponse:
         if not who:
             tg_send_message(chat_id, "Формат: /resolve John Tonje")
             return JSONResponse({"ok": True})
-        from data import find_player_by_name as _find, sportsru_force
+        from data import find_player_by_name as _find, sportsru_force, rebuild_index_inplace
         rec = _find(who)
         if not rec:
             tg_send_message(chat_id, "Игрок не найден.")
@@ -335,20 +367,21 @@ async def handle_update(update: dict) -> JSONResponse:
     from data import find_player_by_name as _find, _ru_display_for_player
     player = _find(name)
     if not player:
-        from data import suggest_players
-        suggestions = suggest_players(name, limit=5)
-        if not suggestions:
-            tg_send_message(chat_id, "Игрок не найден. Уточните имя.\n"
-                                     "Можно задать алиас: /alias Вася = Vasilije Micic")
-            return JSONResponse({"ok": True})
-        kb = {"inline_keyboard": [[{"text": s["display"], "callback_data": f"pick:{s['id']}"}] for s in suggestions]}
-        tg_send_message(chat_id, "Игрок не найден. Возможно, вы имели в виду:",
-                        reply_to_message_id=msg.get("message_id"), reply_markup=kb)
+        # показываем до 4 подсказок + 5-я кнопка «добавить перевод вручную»
+        suggestions = suggest_players(name, limit=4)
+        buttons = [[{"text": s["display"], "callback_data": f"pick:{s['id']}"}] for s in suggestions]
+        buttons.append([{"text": "➕ Добавить перевод вручную", "callback_data": "addru"}])
+        kb = {"inline_keyboard": buttons}
+        tg_send_message(
+            chat_id,
+            "Игрок не найден. Возможно, вы имели в виду:",
+            reply_to_message_id=msg.get("message_id"),
+            reply_markup=kb
+        )
         return JSONResponse({"ok": True})
 
-    display = _ru_display_for_player(player["full_name"], player["id"])  # на случай свежих правок
+    display = _ru_display_for_player(player["full_name"], player["id"])
 
-    # рендер
     from data import ensure_team_logo_png, ensure_headshot_png
     logo_path, team_colors = ensure_team_logo_png(player["team_id"])
     head_path = ensure_headshot_png(player["id"], player["full_name"])
