@@ -1,9 +1,8 @@
 # scripts/build_players.py
-# Собирает активных игроков из balldontlie и сопоставляет официальные NBA PlayerID.
-# Результат пишет в assets/players.json в формате, совместимом с вашим data.py:
-# {"league":{"standard":[{"personId":"201939","firstName":"Stephen","lastName":"Curry","teamId":"1610612744"}, ...]}}
+# Собирает активных игроков из balldontlie (по ключу) и сопоставляет им официальные NBA personId.
+# Результат: assets/players.json -> {"league":{"standard":[{"personId":"201939","firstName":"Stephen","lastName":"Curry","teamId":"1610612744"}, ...]}}
 
-import os, json, re, unicodedata, sys
+import os, json, re, sys
 from typing import Dict, List
 import requests
 from unidecode import unidecode
@@ -16,18 +15,16 @@ OUT = ASSETS / "players.json"
 
 BL_KEY = os.getenv("BL_API_KEY")
 if not BL_KEY:
-    print("[sync] missing BL_API_KEY", file=sys.stderr)
+    print("[sync] ERROR: missing BL_API_KEY (GitHub → Repo → Settings → Secrets → Actions)", file=sys.stderr)
     sys.exit(1)
 
-# --- утилиты ---
-
+# --- нормализация имён для сопоставления ---
 SUFFIXES = (" jr", " jr.", " sr", " sr.", " ii", " iii", " iv", " v")
 
 def norm_name(s: str) -> str:
     s = unidecode(s or "").lower().strip()
     s = re.sub(r"[^a-z0-9\s\-']", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    # убираем суффиксы из конца ФИО
     for suf in SUFFIXES:
         if s.endswith(suf):
             s = s[: -len(suf)].strip()
@@ -44,84 +41,85 @@ TEAM_ABBR_TO_ID: Dict[str, int] = {
 }
 
 session = requests.Session()
-session.headers.update({"Authorization": BL_KEY, "User-Agent": "players-sync/1.0"})
+session.headers.update({
+    "Authorization": f"Bearer {BL_KEY}",   # ВАЖНО: Bearer <KEY>
+    "User-Agent": "players-sync/1.1"
+})
 
 def fetch_active_players_balldontlie() -> List[dict]:
-    url = "https://api.balldontlie.io/v1/players/active"
+    """Пагинация v1: ?per_page=&page=; фильтр активных: active=true"""
+    base = "https://api.balldontlie.io/v1/players"
     per_page = 100
-    cursor = None
+    page = 1
     out: List[dict] = []
 
     while True:
-        params = {"per_page": per_page}
-        if cursor:
-            params["cursor"] = cursor
-        r = session.get(url, params=params, timeout=40)
+        params = {"per_page": per_page, "page": page, "active": "true"}
+        r = session.get(base, params=params, timeout=40)
         r.raise_for_status()
         j = r.json()
         data = j.get("data") or []
+        meta = j.get("meta") or {}
+        total_pages = int(meta.get("total_pages") or 0)  # у них так называется
         out.extend(data)
-        cursor = j.get("meta", {}).get("next_cursor")
-        if not cursor:
+        # print(f"[sync] page {page}/{total_pages}: +{len(data)}", flush=True)
+        if not data or total_pages == 0 or page >= total_pages:
             break
+        page += 1
+
     return out
 
 def fetch_all_player_ids_historic() -> Dict[str, int]:
     """
-    Берём публичное зеркало базы PlayerID (вся история НБА), чтобы получить официальные personId.
-    Формат на стороне зеркала: список объектов с полями вроде "PlayerID" и "PlayerName".
+    Публичное зеркало всех PlayerID за историю (GitHub).
+    Берём пары (имя → personId) для сопоставления с balldontlie.
     """
-    # зеркало с описанием, что data/players.json содержит все PlayerIDs за историю
-    # https://github.com/mtthai/nba-api-client  (см. README)
     raw_url = "https://raw.githubusercontent.com/mtthai/nba-api-client/master/data/players.json"
     r = requests.get(raw_url, timeout=40)
     r.raise_for_status()
     arr = r.json()
     name_to_id: Dict[str, int] = {}
     for row in arr:
-        # максимально терпимо к схеме
         pid = row.get("PlayerID") or row.get("PLAYER_ID") or row.get("playerId") or row.get("id")
         nm  = row.get("PlayerName") or row.get("PLAYER_NAME") or row.get("playerName") or row.get("name")
-        if not pid or not nm: 
+        if not pid or not nm:
             continue
         try:
             pid = int(pid)
         except Exception:
             continue
-        k = norm_name(nm)
-        name_to_id[k] = pid
+        name_to_id[norm_name(nm)] = pid
     return name_to_id
 
 def make_output(active_players: List[dict], hist_ids: Dict[str,int]) -> dict:
     std = []
     missing_ids = 0
     for p in active_players:
-        fn = p.get("first_name","").strip()
-        ln = p.get("last_name","").strip()
+        fn = (p.get("first_name") or "").strip()
+        ln = (p.get("last_name") or "").strip()
         team = p.get("team") or {}
         abbr = (team.get("abbreviation") or "").upper()
         team_id = TEAM_ABBR_TO_ID.get(abbr)
         if not fn or not ln or not team_id:
             continue
 
-        # ключи сопоставления
         k1 = norm_name(f"{fn} {ln}")
-        # иногда баллдон’тлай даёт middle/суффиксы — попробуем вариант без последнего слова
-        alt = k1.split()
-        if len(alt) >= 3:
-            k2 = norm_name(" ".join([alt[0], alt[-1]]))
-        else:
-            k2 = None
-
-        pid = hist_ids.get(k1) or (hist_ids.get(k2) if k2 else None)
+        pid = hist_ids.get(k1)
 
         if not pid:
-            # ещё одна попытка — без апострофов/дефисов
-            k3 = norm_name(k1.replace("-", " ").replace("'", ""))
+            # варианты без дефиса/апострофа:
+            k2 = norm_name(k1.replace("-", " ").replace("'", ""))
+            pid = hist_ids.get(k2)
+
+        if not pid and " " in k1:
+            # fallback: берем только имя + последнюю фамилию
+            parts = k1.split()
+            k3 = norm_name(f"{parts[0]} {parts[-1]}")
             pid = hist_ids.get(k3)
+
         if not pid:
             missing_ids += 1
-            # пропускаем: без personId не достанем headshot с CDN
+            # без personId не достанем официальный headshot → пропускаем
             continue
 
         std.append({
@@ -138,6 +136,13 @@ def make_output(active_players: List[dict], hist_ids: Dict[str,int]) -> dict:
 def main():
     try:
         active = fetch_active_players_balldontlie()
+    except requests.HTTPError as e:
+        # Покажем подсказку, если ключ не принят
+        if e.response is not None and e.response.status_code == 401:
+            print("[sync] ERROR 401 from balldontlie: проверь BL_API_KEY и формат заголовка 'Authorization: Bearer <KEY>'", file=sys.stderr)
+        else:
+            print(f"[sync] balldontlie HTTPError: {e}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         print(f"[sync] balldontlie error: {type(e).__name__}: {e}", file=sys.stderr)
         sys.exit(1)
