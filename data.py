@@ -3,13 +3,17 @@ import os, json, unicodedata, re, time
 from pathlib import Path
 from typing import Dict, Any, Tuple, List, Optional
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from difflib import SequenceMatcher
 
 # ===== настройки =====
-# Как часто обновлять индекс (сек). 21600 = 6 часов.
-REFRESH_SECONDS = int(os.getenv("PLAYERS_REFRESH_SECONDS", "21600"))
-# Оставлять только активных игроков
-ACTIVE_ONLY = os.getenv("PLAYERS_ACTIVE_ONLY", "1").lower() in ("1","true","yes")
+REFRESH_SECONDS = int(os.getenv("PLAYERS_REFRESH_SECONDS", "21600"))  # 6 часов
+ACTIVE_ONLY     = os.getenv("PLAYERS_ACTIVE_ONLY", "1").lower() in ("1","true","yes")
+
+# Если указан, берём игроков из этого URL (онлайн JSON того же формата, что data.nba.net)
+# Пример: https://<твой-домен>.vercel.app/players.json
+PLAYERS_JSON_URL = os.getenv("PLAYERS_JSON_URL", "").strip()
 
 # ===== пути и кэш =====
 ROOT = Path(__file__).resolve().parent
@@ -141,7 +145,7 @@ FALLBACK_PLAYERS = [
 ]
 
 # ===== алиасы (пользовательские) =====
-_ALIASES: Dict[str, str] = {}  # key(normalized alias) -> normalized base ascii-key
+_ALIASES: Dict[str, str] = {}
 def _load_aliases():
     global _ALIASES
     if ALIASES_FILE.exists():
@@ -162,32 +166,72 @@ def add_alias(alias_text: str, base_full_ascii: str) -> bool:
         return False
 _load_aliases()
 
-# ===== загрузка игроков (stats.nba.com + legacy) =====
+# ===== HTTP с ретраями =====
+def _session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=3, backoff_factor=0.4,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"])
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    return s
+
+# ===== загрузка игроков (stats.nba.com + legacy + PLAYERS_JSON_URL) =====
 def _fetch_players_payload() -> Dict[str, Any]:
     """
-    Тянем список игроков через stats.nba.com (commonallplayers) с «браузерными» заголовками.
-    Если не получилось — пробуем legacy JSON. В самом конце — короткий фоллбек.
     Возвращаем {"league":{"standard":[{personId,firstName,lastName,teamId}...]}}
+    Источники по приоритету:
+      1) PLAYERS_JSON_URL (если указан)
+      2) stats.nba.com commonallplayers (с мощными заголовками)
+      3) legacy data.nba.net / data.nba.com
+      4) FALLBACK_PLAYERS (9 шт)
     """
-    # 1) stats.nba.com (критично указать заголовки)
+    sess = _session()
+
+    # 0) Жёстко заданный внешний JSON (удобно: положи players.json в /public проекта)
+    if PLAYERS_JSON_URL:
+        try:
+            r = sess.get(PLAYERS_JSON_URL, timeout=12)
+            _log(f"custom URL GET: status={getattr(r,'status_code',None)}")
+            if r.ok:
+                j = r.json()
+                std = j.get("league", {}).get("standard", [])
+                _log(f"custom URL parsed: players={len(std)}")
+                if std:
+                    return j
+        except Exception as e:
+            _log(f"custom URL error: {type(e).__name__}: {e}")
+
+    # 1) stats.nba.com
     headers = {
+        "Host": "stats.nba.com",
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
         "Referer": "https://www.nba.com/",
         "Origin": "https://www.nba.com",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
         "Connection": "keep-alive",
         "x-nba-stats-origin": "stats",
         "x-nba-stats-token": "true",
-        "Accept-Encoding": "gzip, deflate",  # без br, чтобы не требовать brotli
+        "Accept-Encoding": "gzip, deflate",  # без br
+        # Доп. «браузерные» заголовки
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", ";Not A Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
     }
     seasons = ["2025-26", "2024-25", "2023-24"]
     for season in seasons:
         url = ("https://stats.nba.com/stats/commonallplayers"
                f"?LeagueID=00&Season={season}&IsOnlyCurrentSeason=1")
         try:
-            r = requests.get(url, headers=headers, timeout=12)
+            r = sess.get(url, headers=headers, timeout=12)
             _log(f"stats GET {season}: status={getattr(r,'status_code',None)}")
             if r.ok:
                 j = r.json()
@@ -216,7 +260,7 @@ def _fetch_players_payload() -> Dict[str, Any]:
         except Exception as e:
             _log(f"stats error {season}: {type(e).__name__}: {e}")
 
-    # 2) legacy JSON (на всякий случай)
+    # 2) legacy JSON
     urls_legacy = [
         "https://data.nba.net/prod/v1/2025/players.json",
         "https://data.nba.net/prod/v1/2024/players.json",
@@ -225,7 +269,7 @@ def _fetch_players_payload() -> Dict[str, Any]:
     ]
     for u in urls_legacy:
         try:
-            r = requests.get(u, timeout=12)
+            r = sess.get(u, timeout=12)
             _log(f"legacy GET {u.split('/')[-2]}: status={getattr(r,'status_code',None)}")
             if r.ok:
                 j = r.json()
@@ -292,29 +336,23 @@ _PLAYERS: Optional[Dict[str, Any]] = None
 _LAST_LOAD = 0.0
 
 def _ensure_index(force_online: bool = False):
-    """
-    При пустом/устаревшем индексе — грузим онлайн и сохраняем в /tmp.
-    Если сеть умерла — берём из кэша /tmp, и только если нет — фоллбек.
-    """
     global _PLAYERS, _LAST_LOAD
     now = time.time()
 
     if _PLAYERS and not force_online and (now - _LAST_LOAD) < REFRESH_SECONDS:
         return
 
-    # попытка загрузить из /tmp кэша, если недавно ломалось
     if not force_online and PLAYERS_CACHE.exists() and not _PLAYERS:
         try:
             data = json.loads(PLAYERS_CACHE.read_text(encoding="utf-8"))
             if data.get("_byid"):
                 _PLAYERS = data
                 _LAST_LOAD = now
-                _log(f"cache load ok: {_PLAYERS and len(_PLAYERS.get('_byid', {}))}")
+                _log(f"cache load ok: {len(_PLAYERS.get('_byid', {}))}")
         except Exception as e:
             _log(f"cache load error: {e}")
             _PLAYERS = None
 
-    # онлайн загрузка
     online = _build_index()
     if online.get("_byid"):
         _PLAYERS = online
@@ -326,17 +364,14 @@ def _ensure_index(force_online: bool = False):
             _log(f"cache save error: {e}")
         return
 
-    # если онлайн пуст, но есть кэш — остаёмся на кэше
     if _PLAYERS:
         _log("using existing cache")
         return
 
-    # последний шанс — фоллбек
     _PLAYERS = _build_index()
     _LAST_LOAD = now
 
 def force_refresh_players() -> int:
-    """Принудительно перегрузить индекс онлайн."""
     global _PLAYERS, _LAST_LOAD
     _PLAYERS = None
     _LAST_LOAD = 0.0
