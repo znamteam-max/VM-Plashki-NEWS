@@ -1,0 +1,128 @@
+name: Sync NBA players.json
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "17 3 * * *"  # каждый день 03:17 UTC
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate public/players.json (500+ active)
+        run: |
+          python - << 'PY'
+          import json, sys, os, time
+          import requests
+
+          def fetch_commonallplayers(season):
+            url = f"https://stats.nba.com/stats/commonallplayers?LeagueID=00&Season={season}&IsOnlyCurrentSeason=1"
+            headers = {
+              "Host": "stats.nba.com",
+              "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+              "Referer": "https://www.nba.com/",
+              "Origin": "https://www.nba.com",
+              "Accept": "application/json, text/plain, */*",
+              "Accept-Language": "en-US,en;q=0.9",
+              "Cache-Control": "no-cache",
+              "Pragma": "no-cache",
+              "Connection": "keep-alive",
+              "x-nba-stats-origin": "stats",
+              "x-nba-stats-token": "true",
+              "Accept-Encoding": "gzip, deflate",
+              "Sec-Fetch-Site": "same-site",
+              "Sec-Fetch-Mode": "cors",
+              "Sec-Fetch-Dest": "empty",
+              "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", ";Not A Brand";v="24"',
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": '"Windows"',
+            }
+            r = requests.get(url, headers=headers, timeout=20)
+            r.raise_for_status()
+            return r.json()
+
+          def parse_rows(j):
+            rs = None
+            if isinstance(j.get("resultSets"), list) and j["resultSets"]:
+              rs = j["resultSets"][0]
+            elif isinstance(j.get("resultSet"), dict):
+              rs = j["resultSet"]
+            if not rs:
+              return []
+
+            headers = rs.get("headers") or []
+            rows    = rs.get("rowSet") or []
+            idx = {h:i for i,h in enumerate(headers)}
+
+            # Нужные поля
+            req = ("PERSON_ID","FIRST_NAME","LAST_NAME","TEAM_ID","ROSTERSTATUS")
+            if not all(k in idx for k in req):
+              return []
+
+            out = []
+            for row in rows:
+              try:
+                person_id = str(row[idx["PERSON_ID"]])
+                first     = (row[idx["FIRST_NAME"]] or "").strip()
+                last      = (row[idx["LAST_NAME"]]  or "").strip()
+                team_id   = str(row[idx["TEAM_ID"]] or "0")
+                roster    = int(row[idx["ROSTERSTATUS"]] or 0)  # 1=active, 0=inactive
+                out.append((person_id, first, last, team_id, roster))
+              except Exception:
+                continue
+            return out
+
+          seasons = ["2025-26","2024-25","2023-24"]
+          all_rows = []
+          seen = set()
+          for s in seasons:
+            try:
+              j = fetch_commonallplayers(s)
+              rows = parse_rows(j)
+              # оставляем только активных
+              active = [r for r in rows if r[4] == 1]
+              for r in active:
+                pid = r[0]
+                if pid not in seen:
+                  seen.add(pid)
+                  all_rows.append(r)
+            except Exception as e:
+              print(f"[sync] season {s} error: {type(e).__name__}: {e}", flush=True)
+              continue
+
+          # Формат как у data.nba.net → league.standard [{personId, firstName, lastName, teamId}]
+          standard = []
+          for pid, first, last, team_id, roster in all_rows:
+            standard.append({
+              "personId": pid,
+              "firstName": first,
+              "lastName": last,
+              "teamId": team_id,
+            })
+
+          out = {"league": {"standard": standard}}
+          os.makedirs("public", exist_ok=True)
+          with open("public/players.json","w",encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, separators=(",",":"))
+          print(f"[sync] wrote public/players.json with {len(standard)} active players")
+          PY
+
+      - name: Commit & push
+        run: |
+          if [ -n "$(git status --porcelain public/players.json)" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add public/players.json
+            git commit -m "chore: update players.json ($(date -u +'%Y-%m-%d %H:%M:%S') UTC)"
+            git push
+          else
+            echo "No changes in players.json"
+          fi
