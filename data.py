@@ -1,9 +1,10 @@
-# data.py — индекс игроков (лат/кириллица), русское имя, headshots/логотипы, подсказки, алиасы
+# data.py — индекс игроков (лат/кириллица), sports.ru-резолвер, RU-оверайды, лого/фото
 import os, json, unicodedata, re, time
 from pathlib import Path
 from typing import Dict, Any, Tuple, List, Optional
 import requests
 from difflib import SequenceMatcher
+from urllib.parse import quote_plus
 
 # ===== пути и кэш =====
 ROOT = Path(__file__).resolve().parent
@@ -18,6 +19,7 @@ PLAYERS_CACHE = CACHE / "players_index.json"
 ALIASES_FILE  = CACHE / "aliases.json"
 RU_OVERRIDES_FILE   = CACHE / "ru_overrides.json"     # player_id -> "Русское Имя"
 LASTNAME_RULES_FILE = CACHE / "lastname_rules.json"   # "jokic" -> "Йокич"
+SPORTSRU_CACHE_FILE = CACHE / "sportsru_names.json"   # ascii_key -> "Русское Имя"
 
 HEAD_DIR = CACHE / "headshots"
 HEAD_DIR.mkdir(exist_ok=True)
@@ -27,14 +29,19 @@ LOGO_DIR = ASSETS / "cache"
 ICON_STAR = str((ASSETS / "icons" / "star.png").resolve())
 
 # Поведение загрузчика
-REFRESH_SECONDS    = int(os.getenv("PLAYERS_REFRESH_SECONDS", "86400"))  # 1 день
-PLAYERS_OFFLINE    = os.getenv("PLAYERS_OFFLINE", "1") == "1"  # по умолчанию офлайн
-PLAYERS_SNAPSHOT_URL = os.getenv("PLAYERS_SNAPSHOT_URL", "").strip()  # опционально — прямая ссылка на готовый JSON
+REFRESH_SECONDS      = int(os.getenv("PLAYERS_REFRESH_SECONDS", "86400"))  # 1 день
+PLAYERS_OFFLINE      = os.getenv("PLAYERS_OFFLINE", "1") == "1"            # офлайн по умолчанию
+PLAYERS_SNAPSHOT_URL = os.getenv("PLAYERS_SNAPSHOT_URL", "").strip()       # опц.: прямая ссылка на готовый JSON
 
-# Админы (право управлять /fixlast, /setru и т.п.)
+# sports.ru резолвер
+SPORTSRU_RESOLVE  = os.getenv("SPORTSRU_RESOLVE", "1") == "1"
+SPORTSRU_TIMEOUT  = int(os.getenv("SPORTSRU_TIMEOUT", "4"))
+SPORTSRU_LANG_HDR = os.getenv("SPORTSRU_LANG", "ru-RU,ru;q=0.9")
+
+# Админы (для /resolve в api)
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(",", " ").split() if x.strip().isdigit()}
 
-# Опционально Upstash (персистентность без деплоя)
+# Опционально Upstash (персистентность без деплоя правок)
 UPSTASH_URL   = os.getenv("UPSTASH_URL", "").strip()
 UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "").strip()
 
@@ -128,7 +135,7 @@ RU_NAME_OVERRIDES: Dict[str,str] = {
     "alperen sengun":"Алперен Шенгюн",
 }
 
-# --- минимальный бэкап-лист, чтобы бот не был пустым ---
+# --- минимальный фоллбек, чтобы бот не был пустым ---
 FALLBACK_PLAYERS = [
     {"personId":"203999","firstName":"Nikola","lastName":"Jokic","teamId":"1610612743"},
     {"personId":"201939","firstName":"Stephen","lastName":"Curry","teamId":"1610612744"},
@@ -141,9 +148,7 @@ FALLBACK_PLAYERS = [
     {"personId":"1629029","firstName":"Luka","lastName":"Doncic","teamId":"1610612742"},
 ]
 
-# ===== алиасы, задаваемые из бота =====
-_ALIASES: Dict[str, str] = {}  # key(normalized alias) -> normalized base ascii-key
-
+# ===== utils =====
 def _json_load(path: Path) -> dict:
     if path.exists():
         try: return json.loads(path.read_text(encoding="utf-8"))
@@ -152,6 +157,9 @@ def _json_load(path: Path) -> dict:
 def _json_save(path: Path, obj: dict) -> None:
     try: path.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
     except Exception: pass
+
+# ===== алиасы для поиска =====
+_ALIASES: Dict[str, str] = {}  # key(normalized alias) -> normalized base ascii-key
 
 def _load_aliases():
     global _ALIASES
@@ -173,7 +181,7 @@ def add_alias(alias_text: str, base_full_ascii: str) -> bool:
         return False
 _load_aliases()
 
-# ===== Upstash K/V helpers (опционально) =====
+# ===== Upstash K/V (опционально) =====
 def _kv_get(key: str) -> Optional[dict]:
     if not (UPSTASH_URL and UPSTASH_TOKEN):
         return None
@@ -207,29 +215,91 @@ def _kv_set(key: str, obj: dict) -> bool:
 # ===== Глобальные мапы исправлений =====
 _RU_OVERRIDES: Dict[str, str] = {}      # player_id(str) -> "Русское Имя"
 _LASTNAME_RULES: Dict[str, str] = {}    # latin_last(lower) -> "Йокич"
+_SPORTSRU_CACHE: Dict[str, str] = {}    # ascii_key -> "Русское Имя"
 
 def _load_overrides():
-    global _RU_OVERRIDES, _LASTNAME_RULES
+    global _RU_OVERRIDES, _LASTNAME_RULES, _SPORTSRU_CACHE
     ru = _kv_get("ru_overrides") or _json_load(RU_OVERRIDES_FILE)
     ln = _kv_get("lastname_rules") or _json_load(LASTNAME_RULES_FILE)
-    _RU_OVERRIDES = {str(k): str(v) for k, v in ru.items()} if isinstance(ru, dict) else {}
-    _LASTNAME_RULES = {str(k).lower(): str(v) for k, v in ln.items()} if isinstance(ln, dict) else {}
+    sc = _json_load(SPORTSRU_CACHE_FILE)
+    _RU_OVERRIDES = {str(k): str(v) for k, v in (ru.items() if isinstance(ru, dict) else [])}
+    _LASTNAME_RULES = {str(k).lower(): str(v) for k, v in (ln.items() if isinstance(ln, dict) else [])}
+    _SPORTSRU_CACHE = {str(k): str(v) for k, v in (sc.items() if isinstance(sc, dict) else [])}
 
 def _save_overrides():
     _json_save(RU_OVERRIDES_FILE, _RU_OVERRIDES)
     _json_save(LASTNAME_RULES_FILE, _LASTNAME_RULES)
+    _json_save(SPORTSRU_CACHE_FILE, _SPORTSRU_CACHE)
     _kv_set("ru_overrides", _RU_OVERRIDES)
     _kv_set("lastname_rules", _LASTNAME_RULES)
 
 _load_overrides()
 
+# ===== sports.ru резолвер =====
+_SPORTS_TITLE_RE = re.compile(r">([А-ЯЁA-Z][^<]{1,80}?)\s*[—\-–]\s*баскетбол", re.IGNORECASE)
+_H1_RE = re.compile(r"<h1[^>]*>([^<]{2,80})</h1>", re.IGNORECASE)
+
+def _sportsru_fetch_ru_name(en_full: str) -> Optional[str]:
+    """
+    Пробуем вытащить кириллицу из выдачи sports.ru/search по заголовку «Имя — баскетбол».
+    Возвращаем None при любой неудаче/таймауте. Таймаут короткий.
+    """
+    try:
+        q = quote_plus(en_full)
+        url = f"https://www.sports.ru/search/?q={q}&sort=rel"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; vm-plashki/1.0)",
+            "Accept-Language": SPORTSRU_LANG_HDR,
+        }
+        r = requests.get(url, headers=headers, timeout=SPORTSRU_TIMEOUT)
+        if not r.ok or not r.text:
+            return None
+        html = r.text
+
+        # 1) искать «… — баскетбол» в первых результатах
+        m = _SPORTS_TITLE_RE.search(html)
+        if m:
+            name = m.group(1).strip()
+            if re.search("[А-Яа-яЁё]", name):
+                return name
+
+        # 2) fallback: h1 на странице результата, если вдруг был редирект
+        m2 = _H1_RE.search(html)
+        if m2:
+            name = m2.group(1).strip()
+            if re.search("[А-Яа-яЁё]", name) and len(name) <= 80:
+                return name
+
+        return None
+    except Exception:
+        return None
+
+def _ru_from_sportsru_cached(full_ascii: str) -> Optional[str]:
+    key = _normalize_key(full_ascii)
+    ru = _SPORTSRU_CACHE.get(key)
+    if ru:
+        return ru
+    ru = _sportsru_fetch_ru_name(full_ascii)
+    if ru:
+        _SPORTSRU_CACHE[key] = ru
+        _json_save(SPORTSRU_CACHE_FILE, _SPORTSRU_CACHE)
+    return ru
+
+def sportsru_force(pid: int, full_ascii: str) -> Optional[str]:
+    """
+    Админская принудительная подтяжка: запросить sports.ru, записать RU-override на игрока (если нашли).
+    """
+    ru = _sportsru_fetch_ru_name(full_ascii)
+    if ru:
+        _RU_OVERRIDES[str(pid)] = ru
+        _SPORTSRU_CACHE[_normalize_key(full_ascii)] = ru
+        _save_overrides()
+        return ru
+    return None
+
+# ===== формирование display-имени =====
 def _apply_lastname_rules(full_ascii: str, ru_guess: str) -> str:
-    """
-    full_ascii: 'Nikola Jokic' (латиницей)
-    ru_guess:   'Никола Йокич' (текущий вариант)
-    Если есть правило на last ('jokic' -> 'Йокич') — меняем последний токен.
-    """
-    last_lat = _normalize_key(full_ascii).split(" ")[-1]  # 'jokic'
+    last_lat = _normalize_key(full_ascii).split(" ")[-1]
     fix = _LASTNAME_RULES.get(last_lat)
     if not fix:
         return ru_guess
@@ -244,13 +314,21 @@ def _ru_display_for_player(full_ascii: str, pid: int) -> str:
     ru = _RU_OVERRIDES.get(str(pid))
     if ru:
         return ru
-    # 2) базовый транслит + ручные RU_NAME_OVERRIDES
+    # 2) sports.ru (быстрый, с коротким таймаутом)
+    if SPORTSRU_RESOLVE:
+        ru2 = _ru_from_sportsru_cached(full_ascii)
+        if ru2:
+            # запоминаем как override, чтобы больше не ходить в сеть
+            _RU_OVERRIDES[str(pid)] = ru2
+            _save_overrides()
+            return ru2
+    # 3) базовый транслит + ручные RU_NAME_OVERRIDES
     ascii_key = _normalize_key(full_ascii)
     ru_guess = RU_NAME_OVERRIDES.get(ascii_key, lat2cyr(full_ascii))
-    # 3) массовое правило по фамилии
+    # 4) массовое правило по фамилии
     return _apply_lastname_rules(full_ascii, ru_guess)
 
-# ====== ЗАГРУЗКА SNAPSHOT (офлайн-приоритет) ======
+# ===== загрузка снапшота игроков =====
 def _load_local_snapshot() -> Optional[Dict[str, Any]]:
     p = ASSETS / "players.json"
     if p.exists() and p.stat().st_size > 1000:
@@ -314,6 +392,7 @@ def _build_index_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         index["_bykey"][cyr_key] = rec
         index["_bykey"][_normalize_key(full_ascii.replace("-", " "))] = rec
         index["_bykey"][_normalize_key(ru_display.replace("-", " "))] = rec
+
     # короткие алиасы
     aliases = {
         "wemby":"victor wembanyama", "вемба":"victor wembanyama",
@@ -350,7 +429,7 @@ def _ensure_index(force: bool = False):
             pass
         return
 
-    # 2) /tmp cache (предыдущие запуски)
+    # 2) /tmp cache
     if PLAYERS_CACHE.exists():
         try:
             _PLAYERS = json.loads(PLAYERS_CACHE.read_text(encoding="utf-8"))
@@ -360,7 +439,7 @@ def _ensure_index(force: bool = False):
         except Exception:
             _PLAYERS = None
 
-    # 3) быстрая прямая ссылка (если офлайн=0 и URL задан)
+    # 3) быстрая ссылка (если офлайн=0 и URL задан)
     if not PLAYERS_OFFLINE:
         url_snap = _load_snapshot_from_url()
         if url_snap:
@@ -372,7 +451,7 @@ def _ensure_index(force: bool = False):
                 pass
             return
 
-    # 4) fallback (минимум звёзд — 9 игроков), чтобы бот не падал
+    # 4) fallback
     print("[players] FALLBACK used (9)")
     _PLAYERS = _build_index_from_payload({"league":{"standard": FALLBACK_PLAYERS}})
     _LAST_LOAD = now
@@ -419,14 +498,14 @@ def find_player_by_name(query: str) -> Optional[Dict[str, Any]]:
         if rec:
             return rec
 
-    # 4) латиница без акцентов
+    # 4) лат без акцентов
     lat_guess2 = _normalize_key(_strip_accents(query))
     if lat_guess2 != q:
         rec = _PLAYERS["_bykey"].get(lat_guess2)
         if rec:
             return rec
 
-    # 5) лат -> кир транслит (редко помогает)
+    # 5) лат -> кир транслит
     cyr_guess = _normalize_key(lat2cyr(query))
     rec = _PLAYERS["_bykey"].get(cyr_guess)
     if rec:
@@ -471,10 +550,6 @@ def suggest_players(query: str, limit: int = 5) -> List[Dict[str, Any]]:
 
 # ===== headshots & logos =====
 def ensure_headshot_png(player_id: int, full_name: str) -> str:
-    """
-    Скачиваем headshot в /tmp при первом запросе. Если не вышло — иконка звезды.
-    Важно: короткие таймауты, чтобы не блокировать серверную функцию.
-    """
     path = HEAD_DIR / f"{player_id}.png"
     if path.exists() and path.stat().st_size > 0:
         return str(path)
