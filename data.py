@@ -41,7 +41,7 @@ SPORTSRU_LANG_HDR = os.getenv("SPORTSRU_LANG", "ru-RU,ru;q=0.9")
 # Админы (для /resolve в api)
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(",", " ").split() if x.strip().isdigit()}
 
-# Опционально Upstash (персистентность без деплоя правок)
+# Опционально Upstash K/V (персистентность без деплоя правок)
 UPSTASH_URL   = os.getenv("UPSTASH_URL", "").strip()
 UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "").strip()
 
@@ -240,10 +240,6 @@ _SPORTS_TITLE_RE = re.compile(r">([А-ЯЁA-Z][^<]{1,80}?)\s*[—\-–]\s*бас
 _H1_RE = re.compile(r"<h1[^>]*>([^<]{2,80})</h1>", re.IGNORECASE)
 
 def _sportsru_fetch_ru_name(en_full: str) -> Optional[str]:
-    """
-    Пробуем вытащить кириллицу из выдачи sports.ru/search по заголовку «Имя — баскетбол».
-    Возвращаем None при любой неудаче/таймауте. Таймаут короткий.
-    """
     try:
         q = quote_plus(en_full)
         url = f"https://www.sports.ru/search/?q={q}&sort=rel"
@@ -255,21 +251,16 @@ def _sportsru_fetch_ru_name(en_full: str) -> Optional[str]:
         if not r.ok or not r.text:
             return None
         html = r.text
-
-        # 1) искать «… — баскетбол» в первых результатах
         m = _SPORTS_TITLE_RE.search(html)
         if m:
             name = m.group(1).strip()
             if re.search("[А-Яа-яЁё]", name):
                 return name
-
-        # 2) fallback: h1 на странице результата, если вдруг был редирект
         m2 = _H1_RE.search(html)
         if m2:
             name = m2.group(1).strip()
             if re.search("[А-Яа-яЁё]", name) and len(name) <= 80:
                 return name
-
         return None
     except Exception:
         return None
@@ -286,9 +277,6 @@ def _ru_from_sportsru_cached(full_ascii: str) -> Optional[str]:
     return ru
 
 def sportsru_force(pid: int, full_ascii: str) -> Optional[str]:
-    """
-    Админская принудительная подтяжка: запросить sports.ru, записать RU-override на игрока (если нашли).
-    """
     ru = _sportsru_fetch_ru_name(full_ascii)
     if ru:
         _RU_OVERRIDES[str(pid)] = ru
@@ -310,22 +298,17 @@ def _apply_lastname_rules(full_ascii: str, ru_guess: str) -> str:
     return " ".join(parts)
 
 def _ru_display_for_player(full_ascii: str, pid: int) -> str:
-    # 1) точечный override
     ru = _RU_OVERRIDES.get(str(pid))
     if ru:
         return ru
-    # 2) sports.ru (быстрый, с коротким таймаутом)
     if SPORTSRU_RESOLVE:
         ru2 = _ru_from_sportsru_cached(full_ascii)
         if ru2:
-            # запоминаем как override, чтобы больше не ходить в сеть
             _RU_OVERRIDES[str(pid)] = ru2
             _save_overrides()
             return ru2
-    # 3) базовый транслит + ручные RU_NAME_OVERRIDES
     ascii_key = _normalize_key(full_ascii)
     ru_guess = RU_NAME_OVERRIDES.get(ascii_key, lat2cyr(full_ascii))
-    # 4) массовое правило по фамилии
     return _apply_lastname_rules(full_ascii, ru_guess)
 
 # ===== загрузка снапшота игроков =====
@@ -576,3 +559,72 @@ def ensure_team_logo_png(team_id: int) -> Tuple[str, Tuple[str,str,str]]:
     dark = _shade(primary, 0.90)
     light = "#FFFFFF"
     return logo_path, (primary, dark, light)
+
+# ======= Переиндексация (главное, чтобы /setru и /fixlast применялись сразу) =======
+def rebuild_index_inplace() -> int:
+    """
+    Полная пересборка in-memory индекса из уже известных игроков (без сетевых загрузок).
+    Сохраняет в /tmp кэш.
+    """
+    global _PLAYERS, _LAST_LOAD
+    _ensure_index()
+    if not _PLAYERS:
+        return 0
+    # исходники берём из текущего _byid
+    items = list(_PLAYERS["_byid"].values())
+    new_index: Dict[str, Any] = {"_bykey": {}, "_byid": {}}
+    for rec in items:
+        pid = int(rec["id"])
+        full_ascii = rec["full_name"]
+        team_id = int(rec.get("team_id") or 0)
+        team_name = rec.get("team_name") or TEAM_NAMES.get(team_id, "Free Agent")
+        ru_display = _ru_display_for_player(full_ascii, pid)
+
+        new_rec = {
+            "id": pid,
+            "full_name": full_ascii,
+            "display": ru_display,
+            "team_id": team_id,
+            "team_name": team_name,
+        }
+        new_index["_byid"][pid] = new_rec
+
+        # ключи для поиска
+        ascii_key = _normalize_key(full_ascii)
+        cyr_key   = _normalize_key(ru_display)
+        new_index["_bykey"][ascii_key] = new_rec
+        new_index["_bykey"][cyr_key]   = new_rec
+        new_index["_bykey"][_normalize_key(full_ascii.replace("-", " "))] = new_rec
+        new_index["_bykey"][_normalize_key(ru_display.replace("-", " "))] = new_rec
+
+    _PLAYERS = new_index
+    _LAST_LOAD = time.time()
+    try:
+        PLAYERS_CACHE.write_text(json.dumps(_PLAYERS, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+    return len(_PLAYERS["_byid"])
+
+def set_lastname_rule(latin_last: str, ru_last: str) -> int:
+    """
+    Добавить/обновить массовое правило по фамилии (например, brooks -> Брукс).
+    Возвращает количество записей после пересборки.
+    """
+    _LASTNAME_RULES[_normalize_key(latin_last)] = ru_last
+    _save_overrides()
+    return rebuild_index_inplace()
+
+def del_lastname_rule(latin_last: str) -> int:
+    _LASTNAME_RULES.pop(_normalize_key(latin_last), None)
+    _save_overrides()
+    return rebuild_index_inplace()
+
+def set_ru_override(pid: int, ru_name: str) -> int:
+    _RU_OVERRIDES[str(int(pid))] = ru_name
+    _save_overrides()
+    return rebuild_index_inplace()
+
+def del_ru_override(pid: int) -> int:
+    _RU_OVERRIDES.pop(str(int(pid)), None)
+    _save_overrides()
+    return rebuild_index_inplace()
