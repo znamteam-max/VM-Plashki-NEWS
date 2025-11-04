@@ -1,4 +1,7 @@
-# /api/telegram.py — FastAPI webhook для Telegram (Vercel), с кнопкой «Добавить перевод вручную»
+# /api/telegram.py — FastAPI webhook для Telegram (Vercel),
+# с интеграцией Cloudflare Worker (через data.py), кнопкой «Добавить перевод вручную»
+# и админ-командами фикса русских имён.
+#
 # Поддерживает:
 #  GET  /api/telegram
 #  GET  /api/telegram/healthz
@@ -10,22 +13,16 @@
 # Команды:
 #  /card Имя | 25 очков, 12 подборов, 3 блокшота | impact | подпись(опц.)
 #  /alias Неправильно = Правильное Имя
-#  /fixlast Jokic = Йокич
-#  /dellast Jokic
-#  /setru Nikola Jokic | Никола Йокич
-#  /delru Nikola Jokic
-#  /name Nikola Jokic
+#  /fixlast Brooks = Брукс
+#  /dellast Brooks
+#  /setru Stephen Curry | Стефен Карри  (или: /setru 201939 | Стефен Карри)
+#  /delru 201939
+#  /name Stephen Curry
 #  /listfixes
-#  /resolve John Tonje
+#  /resolve John Tonje   (best-effort sports.ru)
 
-import os
-import re
-import json
-import requests
-import traceback
-import importlib
+import os, re, json, requests, traceback, importlib
 from typing import Optional
-
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import JSONResponse
 
@@ -34,6 +31,7 @@ app = FastAPI()
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "hook")
 
+# число + (возможный %) + ярлык
 STAT_PAIR_RE = re.compile(
     r"(?P<num>[-+]?\d+(?:[.,]\d+)?)\s*([%]?)\s*(?P<label>[A-Za-zА-Яа-яёЁ+\-/ ]{0,20})"
 )
@@ -42,6 +40,7 @@ def _json_exc(e: Exception):
     tb = traceback.format_exc().splitlines()[-12:]
     return {"ok": False, "error": f"{type(e).__name__}: {e}", "trace": tb}
 
+# ---------- парсинг ----------
 def parse_card(text: str):
     if not text or not text.lower().startswith("/card"):
         return None
@@ -81,7 +80,7 @@ def is_admin(user_id: int) -> bool:
     except Exception:
         return False
 
-# --- Telegram helpers ---
+# ---------- Telegram helpers ----------
 def tg_send_png(chat_id: int, png_bytes: bytes, caption: Optional[str] = None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
     files = {"document": ("card.png", png_bytes, "image/png")}
@@ -107,13 +106,13 @@ def tg_answer_callback(callback_id: str, text: str = ""):
         timeout=10,
     )
 
-# --- core handler ---
+# ---------- core ----------
 async def handle_update(update: dict) -> JSONResponse:
     from graphics import render_card
     from data import (
         find_player_by_name, ensure_headshot_png, ensure_team_logo_png,
         get_player_by_id, suggest_players, add_alias,
-        _LASTNAME_RULES, _RU_OVERRIDES, _save_overrides, _load_overrides, _ru_display_for_player,
+        _LASTNAME_RULES, _RU_OVERRIDES, _save_overrides, _ru_display_for_player,
         sportsru_force,
         set_lastname_rule, del_lastname_rule, set_ru_override, del_ru_override,
         rebuild_index_inplace, cyr2lat
@@ -125,7 +124,6 @@ async def handle_update(update: dict) -> JSONResponse:
         data_cb = cq.get("data") or ""
         chat_id = cq["message"]["chat"]["id"]
 
-        # Выбор игрока из подсказок
         if data_cb.startswith("pick:"):
             try:
                 pid = int(data_cb.split(":", 1)[1])
@@ -167,9 +165,7 @@ async def handle_update(update: dict) -> JSONResponse:
             tg_send_png(chat_id, png_bytes)
             return JSONResponse({"ok": True})
 
-        # Новый пункт: Добавить перевод вручную
         if data_cb == "addru":
-            # Попробуем вытащить исходную команду и догадаться EN-вариант из кириллицы
             origin = cq["message"].get("reply_to_message") or cq["message"]
             orig_text = origin.get("text") or ""
             guess_en = None
@@ -190,7 +186,7 @@ async def handle_update(update: dict) -> JSONResponse:
                 "/setru Stephen Curry | Стефен Карри",
                 "/setru 201939 | Стефен Карри",
                 "",
-                "После сохранения индекс пересоберётся автоматически, и плашки будут с новым именем.",
+                "После сохранения индекс пересоберётся автоматически.",
             ]
             if guess_en:
                 lines.insert(1, f"Предположение EN: {guess_en}")
@@ -216,6 +212,7 @@ async def handle_update(update: dict) -> JSONResponse:
         if not is_admin(user_id):
             tg_send_message(chat_id, "Команда доступна только редакторам.")
             return JSONResponse({"ok": True})
+        from data import _LASTNAME_RULES, _RU_OVERRIDES, _load_overrides
         _load_overrides()
         lines = ["• Фамилии:"]
         if _LASTNAME_RULES:
@@ -249,7 +246,7 @@ async def handle_update(update: dict) -> JSONResponse:
         from data import set_lastname_rule
         total = set_lastname_rule(latin_last, ru_last)
         tg_send_message(chat_id, f"Ок. Правило фамилии: {latin_last} → {ru_last}\n"
-                                 f"Индекс пересобран ({total} игроков). Новые плашки уже с учётом правила.")
+                                 f"Индекс пересобран ({total} игроков).")
         return JSONResponse({"ok": True})
 
     if low.startswith("/dellast"):
@@ -368,6 +365,7 @@ async def handle_update(update: dict) -> JSONResponse:
     player = _find(name)
     if not player:
         # показываем до 4 подсказок + 5-я кнопка «добавить перевод вручную»
+        from data import suggest_players
         suggestions = suggest_players(name, limit=4)
         buttons = [[{"text": s["display"], "callback_data": f"pick:{s['id']}"}] for s in suggestions]
         buttons.append([{"text": "➕ Добавить перевод вручную", "callback_data": "addru"}])
@@ -401,7 +399,7 @@ async def handle_update(update: dict) -> JSONResponse:
         tg_send_message(chat_id, f"Ошибка отправки изображения: {resp}")
     return JSONResponse({"ok": True})
 
-# --- health / service ---
+# ---------- health ----------
 @app.get("/")
 @app.get("/api/telegram")
 @app.get("/api/telegram/healthz")
@@ -450,7 +448,7 @@ def selftest():
     except Exception as e:
         return _json_exc(e)
 
-# --- webhook ---
+# ---------- webhook ----------
 @app.post("/")
 @app.post("/api/telegram")
 async def webhook_query(request: Request, secret: str = Query(default="")):
