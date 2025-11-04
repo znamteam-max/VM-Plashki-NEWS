@@ -24,34 +24,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Generate public/players.json (robust, 500+ active)
+      - name: Generate public/players.json (prefer legacy HTTP)
         shell: bash
         run: |
           python - << 'PY'
-          import json, os, sys, time, requests
+          import json, os, requests
 
-          def get(url, headers=None, timeout=30):
+          def get_json(url, headers=None, timeout=30, verify=True):
               try:
-                  r = requests.get(url, headers=headers or {}, timeout=timeout)
+                  r = requests.get(url, headers=headers or {}, timeout=timeout, allow_redirects=True, verify=verify)
                   r.raise_for_status()
                   return r.json()
               except Exception as e:
                   print(f"[sync] GET fail: {url} -> {type(e).__name__}: {e}", flush=True)
                   return None
 
-          def extract_legacy_players(j):
-              # Ожидаем формат: {"league":{"standard":[...]}}
-              if not j:
-                  return []
+          def extract_legacy_active(j):
+              if not j: return []
               std = j.get("league", {}).get("standard", [])
               out = []
               for p in std:
                   try:
+                      # в legacy JSON у активных isActive = true
                       if not p.get("isActive"):
                           continue
-                      pid = str(p.get("personId", "")).strip()
-                      first = (p.get("firstName","") or "").strip()
-                      last  = (p.get("lastName","")  or "").strip()
+                      pid   = str(p.get("personId") or "").strip()
+                      first = (p.get("firstName") or "").strip()
+                      last  = (p.get("lastName") or "").strip()
                       team  = str(p.get("teamId") or "0")
                       if pid and (first or last):
                           out.append((pid, first, last, team))
@@ -59,47 +58,44 @@ jobs:
                       continue
               return out
 
-          def fetch_from_legacy(years):
-              # 1) data.nba.net (обычно стабильно)
-              for y in years:
-                  url = f"https://data.nba.net/prod/v1/{y}/players.json"
-                  j = get(url, timeout=40)
-                  rows = extract_legacy_players(j)
-                  print(f"[sync] legacy data.nba.net {y}: active={len(rows)}", flush=True)
-                  if len(rows) > 400:
-                      return rows
-              # 2) data.nba.com (альтернативный хост)
-              for y in years:
-                  url = f"https://data.nba.com/data/10s/prod/v1/{y}/players.json"
-                  j = get(url, timeout=40)
-                  rows = extract_legacy_players(j)
-                  print(f"[sync] legacy data.nba.com {y}: active={len(rows)}", flush=True)
-                  if len(rows) > 400:
-                      return rows
-              return []
+          YEARS = ["2025","2024","2023"]
 
-          def fetch_from_stats(seasons):
+          # 1) Сначала пробуем legacy по HTTP (исправляет твой SSL hostname mismatch)
+          rows = []
+          for y in YEARS:
+              j = get_json(f"http://data.nba.net/prod/v1/{y}/players.json", timeout=40, verify=False)
+              cur = extract_legacy_active(j)
+              print(f"[sync] legacy HTTP {y}: active={len(cur)}", flush=True)
+              if len(cur) > len(rows):
+                  rows = cur
+          # 2) Если вдруг HTTP лег — попробуем HTTPS (меньше надежды, но пусть будет)
+          if len(rows) < 400:
+              for y in YEARS:
+                  j = get_json(f"https://data.nba.net/prod/v1/{y}/players.json", timeout=40, verify=True)
+                  cur = extract_legacy_active(j)
+                  print(f"[sync] legacy HTTPS {y}: active={len(cur)}", flush=True)
+                  if len(cur) > len(rows):
+                      rows = cur
+
+          # 3) Последний шанс — stats.nba.com (часто даёт таймауты в CI, но оставим как запасной)
+          if len(rows) < 400:
               headers = {
-                 "Host": "stats.nba.com",
-                 "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
-                 "Referer": "https://www.nba.com/",
-                 "Origin": "https://www.nba.com",
-                 "Accept": "application/json, text/plain, */*",
-                 "Accept-Language": "en-US,en;q=0.9",
-                 "Cache-Control": "no-cache",
-                 "Pragma": "no-cache",
-                 "Connection": "keep-alive",
-                 "x-nba-stats-origin": "stats",
-                 "x-nba-stats-token": "true",
-                 "Accept-Encoding": "gzip, deflate",
+                  "Host": "stats.nba.com",
+                  "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+                  "Referer": "https://www.nba.com/",
+                  "Origin": "https://www.nba.com",
+                  "Accept": "application/json, text/plain, */*",
+                  "x-nba-stats-origin": "stats",
+                  "x-nba-stats-token": "true",
               }
+              seasons = ["2025-26","2024-25","2023-24"]
               seen = set()
-              rows = []
-              for season in seasons:
-                  url = f"https://stats.nba.com/stats/commonallplayers?LeagueID=00&Season={season}&IsOnlyCurrentSeason=1"
-                  j = get(url, headers=headers, timeout=40)
-                  if not j:
+              tmp = []
+              for s in seasons:
+                  j = get_json(f"https://stats.nba.com/stats/commonallplayers?LeagueID=00&Season={s}&IsOnlyCurrentSeason=1",
+                               headers=headers, timeout=40)
+                  if not j: 
                       continue
                   rs = None
                   if isinstance(j.get("resultSets"), list) and j["resultSets"]:
@@ -126,26 +122,19 @@ jobs:
                           first = (row[idx["FIRST_NAME"]] or "").strip()
                           last  = (row[idx["LAST_NAME"]]  or "").strip()
                           team  = str(row[idx["TEAM_ID"]] or "0")
-                          rows.append((pid, first, last, team))
+                          tmp.append((pid, first, last, team))
                           added += 1
                       except Exception:
                           continue
-                  print(f"[sync] stats {season}: added active={added}, total={len(rows)}", flush=True)
-              return rows
+                  print(f"[sync] stats {s}: added={added}, total={len(tmp)}", flush=True)
+              if len(tmp) > len(rows):
+                  rows = tmp
 
-          YEARS   = ["2025","2024","2023"]
-          SEASONS = ["2025-26","2024-25","2023-24"]
-
-          rows = fetch_from_legacy(YEARS)
-          if len(rows) < 400:
-              print("[sync] legacy sources insufficient, trying stats.nba.com…", flush=True)
-              rows = fetch_from_stats(SEASONS)
-
-          # Упаковываем в нужный формат + дедуп по personId
+          # Упаковка + дедуп
           seen = set()
           standard = []
           for pid, first, last, team in rows:
-              if pid in seen:
+              if pid in seen: 
                   continue
               seen.add(pid)
               standard.append({"personId": pid, "firstName": first, "lastName": last, "teamId": team})
