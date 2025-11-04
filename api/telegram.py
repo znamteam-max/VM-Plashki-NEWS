@@ -190,35 +190,45 @@ async def handle_update(update: dict) -> JSONResponse:
 
 @app.get("/")
 @app.get("/api/telegram")
-def health_or_refresh(
-    action: str = Query(default=""),
-    secret: str = Query(default="")
-):
+# --- вместо существующей health() вставь ровно это ---
+
+from typing import Optional
+import importlib
+
+@app.get("/")
+@app.get("/api/telegram")
+@app.get("/api/telegram/healthz")
+def health(action: Optional[str] = Query(default=None), secret: str = Query(default="")):
+    """
+    GET /api/telegram
+    - без параметров: отдаёт здоровье и players_indexed
+    - ?action=refresh&secret=... : принудительно перечитывает индекс игроков (reload(data))
+    """
     try:
-        from data import players_count, force_refresh_players, get_debug_log
+        from data import players_count  # быстрая проверка
+        count_before = players_count()
     except Exception:
-        if action in ("refresh", "debug"):
-            raise HTTPException(status_code=500, detail="data import failed")
-        return {"ok": True, "players_indexed": -1,
-                "endpoints": ["GET /api/telegram (action=refresh|debug&secret=...)", "POST /api/telegram?secret=..."]}
+        count_before = -1
 
+    # refresh по секрету
     if action == "refresh":
-        if secret != os.environ.get("WEBHOOK_SECRET", "hook"):
+        if secret != WEBHOOK_SECRET:
             raise HTTPException(status_code=404, detail="Not found")
-        n = force_refresh_players()
-        return {"ok": True, "refreshed": True, "players_indexed": n}
+        try:
+            import data  # лениво, чтобы не падать на импорт-ошибках при загрузке модуля
+            importlib.reload(data)  # перечитывает assets/players.json и кэш
+            cnt = data.players_count()
+            return {"ok": True, "refreshed": True, "players_indexed": cnt}
+        except Exception as e:
+            # не глушим ошибку — покажем её в ответе
+            return {"ok": False, "refreshed": False, "error": repr(e)}
 
-    if action == "debug":
-        if secret != os.environ.get("WEBHOOK_SECRET", "hook"):
-            raise HTTPException(status_code=404, detail="Not found")
-        return {"ok": True, "log": get_debug_log()}
-
+    # обычный health
     return {
         "ok": True,
-        "players_indexed": players_count(),
+        "players_indexed": count_before,
         "endpoints": [
             "GET  /api/telegram (action=refresh&secret=...)",
-            "GET  /api/telegram (action=debug&secret=...)",
             "POST /api/telegram?secret=...  (Telegram webhook)",
         ],
     }
