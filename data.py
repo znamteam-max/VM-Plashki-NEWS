@@ -1,51 +1,56 @@
-# data.py — индекс игроков (лат/кириллица), sports.ru-резолвер, RU-оверайды, лого/фото
+# data.py — индекс игроков (через Cloudflare Worker-прокси), алиасы, фиксы русских имён,
+# загрузка headshots, логотипы, подсказки.
+#
+# Ожидаемые ENV:
+#   PLAYERS_URL           — ваш Cloudflare Worker, напр.: https://nba-players-proxy.<acct>.workers.dev/?season=2025-26
+#   PLAYERS_REFRESH_SECONDS (опц., по умолчанию 86400)
+#   ADMIN_IDS             — список телеграм-ID редакторов, через запятую (например: "123,456")
+#
+# Папки/файлы (Vercel):
+#   /tmp/nba_cache                  — кэш (переживает в рамках одного контейнера)
+#   /tmp/nba_cache/players_index.json
+#   /tmp/nba_cache/aliases.json
+#   /tmp/nba_cache/ru_overrides.json
+#   /tmp/nba_cache/lastname_rules.json
+#
+# Замечание:
+#   В индекс попадают активные игроки сезона (ROSTERSTATUS=1) из stats.nba.com/commonallplayers,
+#   но забираются через ваш Cloudflare Worker (чтобы обойти ограничения и таймауты).
+#
+
 import os, json, unicodedata, re, time
 from pathlib import Path
 from typing import Dict, Any, Tuple, List, Optional
 import requests
 from difflib import SequenceMatcher
-from urllib.parse import quote_plus
 
 # ===== пути и кэш =====
 ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "assets"
 ASSETS.mkdir(parents=True, exist_ok=True)
 
-# В Vercel писать можно только в /tmp
 CACHE = Path("/tmp/nba_cache")
 CACHE.mkdir(parents=True, exist_ok=True)
 
-PLAYERS_CACHE = CACHE / "players_index.json"
-ALIASES_FILE  = CACHE / "aliases.json"
-RU_OVERRIDES_FILE   = CACHE / "ru_overrides.json"     # player_id -> "Русское Имя"
-LASTNAME_RULES_FILE = CACHE / "lastname_rules.json"   # "jokic" -> "Йокич"
-SPORTSRU_CACHE_FILE = CACHE / "sportsru_names.json"   # ascii_key -> "Русское Имя"
+PLAYERS_CACHE   = CACHE / "players_index.json"
+ALIASES_FILE    = CACHE / "aliases.json"
+OVERRIDES_FILE  = CACHE / "ru_overrides.json"      # pid -> "Русское Имя"
+LASTNAME_FILE   = CACHE / "lastname_rules.json"    # "brooks" -> "Брукс"
 
-HEAD_DIR = CACHE / "headshots"
-HEAD_DIR.mkdir(exist_ok=True)
-
-# Логотипы должны лежать в репозитории: assets/cache/logo_<teamId>.png
-LOGO_DIR = ASSETS / "cache"
+HEAD_DIR = CACHE / "headshots"; HEAD_DIR.mkdir(exist_ok=True)
+LOGO_DIR = ASSETS / "cache"  # ожидаются logo_<teamId>.png
 ICON_STAR = str((ASSETS / "icons" / "star.png").resolve())
 
-# Поведение загрузчика
-REFRESH_SECONDS      = int(os.getenv("PLAYERS_REFRESH_SECONDS", "86400"))  # 1 день
-PLAYERS_OFFLINE      = os.getenv("PLAYERS_OFFLINE", "1") == "1"            # офлайн по умолчанию
-PLAYERS_SNAPSHOT_URL = os.getenv("PLAYERS_SNAPSHOT_URL", "").strip()       # опц.: прямая ссылка на готовый JSON
+# ===== окружение =====
+PLAYERS_URL = os.getenv("PLAYERS_URL", "").strip()
+REFRESH_SECONDS = int(os.getenv("PLAYERS_REFRESH_SECONDS", "86400"))  # 1 день
+ADMIN_IDS_ENV = os.getenv("ADMIN_IDS", "").strip()
+ADMIN_IDS = []
+for tok in re.split(r"[,\s]+", ADMIN_IDS_ENV):
+    if tok.isdigit():
+        ADMIN_IDS.append(int(tok))
 
-# sports.ru резолвер
-SPORTSRU_RESOLVE  = os.getenv("SPORTSRU_RESOLVE", "1") == "1"
-SPORTSRU_TIMEOUT  = int(os.getenv("SPORTSRU_TIMEOUT", "4"))
-SPORTSRU_LANG_HDR = os.getenv("SPORTSRU_LANG", "ru-RU,ru;q=0.9")
-
-# Админы (для /resolve в api)
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(",", " ").split() if x.strip().isdigit()}
-
-# Опционально Upstash K/V (персистентность без деплоя правок)
-UPSTASH_URL   = os.getenv("UPSTASH_URL", "").strip()
-UPSTASH_TOKEN = os.getenv("UPSTASH_TOKEN", "").strip()
-
-# ===== команды: имена и базовый цвет (primary) =====
+# ===== команды и цвета =====
 TEAM_NAMES: Dict[int, str] = {
     1610612737:"Atlanta Hawks", 1610612738:"Boston Celtics", 1610612739:"Cleveland Cavaliers",
     1610612740:"New Orleans Pelicans", 1610612741:"Chicago Bulls", 1610612742:"Dallas Mavericks",
@@ -70,14 +75,13 @@ TEAM_PRIMARY: Dict[int, str] = {
     1610612761:"#BA0C2F", 1610612762:"#002B5C", 1610612763:"#5D76A9",
     1610612764:"#002B5C", 1610612765:"#C8102E", 1610612766:"#00788C",
 }
-
 def _shade(hex_color: str, k: float) -> str:
     hex_color = hex_color.strip().lstrip("#")
     r = int(hex_color[0:2], 16); g = int(hex_color[2:4], 16); b = int(hex_color[4:6], 16)
     r = max(0, min(255, int(r*k))); g = max(0, min(255, int(g*k))); b = max(0, min(255, int(b*k)))
     return f"#{r:02X}{g:02X}{b:02X}"
 
-# ===== нормализация / транслит =====
+# ===== базовые суппорты транслита =====
 def _strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 def _normalize_key(s: str) -> str:
@@ -117,7 +121,7 @@ def cyr2lat(s: str) -> str:
         t.append(CYR_SINGLE.get(ch, ch))
     return " ".join(w.capitalize() for w in "".join(t).split())
 
-# ===== ручные русские имена =====
+# ===== вручную заданные русские формы (для самых популярных кейсов) =====
 RU_NAME_OVERRIDES: Dict[str,str] = {
     "victor wembanyama":"Виктор Вембаньяма",
     "zion williamson":"Зайон Уильямсон",
@@ -135,7 +139,7 @@ RU_NAME_OVERRIDES: Dict[str,str] = {
     "alperen sengun":"Алперен Шенгюн",
 }
 
-# --- минимальный фоллбек, чтобы бот не был пустым ---
+# ===== Фоллбек для старта (минимум) =====
 FALLBACK_PLAYERS = [
     {"personId":"203999","firstName":"Nikola","lastName":"Jokic","teamId":"1610612743"},
     {"personId":"201939","firstName":"Stephen","lastName":"Curry","teamId":"1610612744"},
@@ -148,17 +152,7 @@ FALLBACK_PLAYERS = [
     {"personId":"1629029","firstName":"Luka","lastName":"Doncic","teamId":"1610612742"},
 ]
 
-# ===== utils =====
-def _json_load(path: Path) -> dict:
-    if path.exists():
-        try: return json.loads(path.read_text(encoding="utf-8"))
-        except Exception: return {}
-    return {}
-def _json_save(path: Path, obj: dict) -> None:
-    try: path.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
-    except Exception: pass
-
-# ===== алиасы для поиска =====
+# ===== алиасы, задаваемые из бота =====
 _ALIASES: Dict[str, str] = {}  # key(normalized alias) -> normalized base ascii-key
 
 def _load_aliases():
@@ -175,208 +169,177 @@ def add_alias(alias_text: str, base_full_ascii: str) -> bool:
         k = _normalize_key(alias_text)
         base_k = _normalize_key(base_full_ascii)
         _ALIASES[k] = base_k
-        ALIASES_FILE.write_text(json.dumps(_ALIASES, ensure_ascii=False), encoding="utf-8")
+        ALIASES_FILE.write_text(json.dumps(_ALIASES), encoding="utf-8")
         return True
     except Exception:
         return False
 _load_aliases()
 
-# ===== Upstash K/V (опционально) =====
-def _kv_get(key: str) -> Optional[dict]:
-    if not (UPSTASH_URL and UPSTASH_TOKEN):
-        return None
-    try:
-        r = requests.get(f"{UPSTASH_URL}/get/{key}",
-                         headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
-                         timeout=5)
-        if r.ok:
-            j = r.json()
-            val = j.get("result")
-            if isinstance(val, str):
-                return json.loads(val)
-            if isinstance(val, dict):
-                return val
-    except Exception:
-        pass
-    return None
-
-def _kv_set(key: str, obj: dict) -> bool:
-    if not (UPSTASH_URL and UPSTASH_TOKEN):
-        return False
-    try:
-        payload = json.dumps(obj, ensure_ascii=False)
-        r = requests.get(f"{UPSTASH_URL}/set/{key}/{payload}",
-                         headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
-                         timeout=5)
-        return r.ok
-    except Exception:
-        return False
-
-# ===== Глобальные мапы исправлений =====
-_RU_OVERRIDES: Dict[str, str] = {}      # player_id(str) -> "Русское Имя"
-_LASTNAME_RULES: Dict[str, str] = {}    # latin_last(lower) -> "Йокич"
-_SPORTSRU_CACHE: Dict[str, str] = {}    # ascii_key -> "Русское Имя"
+# ===== персист частных фиксов =====
+_RU_OVERRIDES: Dict[str, str] = {}      # pid(str) -> "Рус Имя"
+_LASTNAME_RULES: Dict[str, str] = {}    # lastname(ascii lower) -> "Рус Фамилия"
 
 def _load_overrides():
-    global _RU_OVERRIDES, _LASTNAME_RULES, _SPORTSRU_CACHE
-    ru = _kv_get("ru_overrides") or _json_load(RU_OVERRIDES_FILE)
-    ln = _kv_get("lastname_rules") or _json_load(LASTNAME_RULES_FILE)
-    sc = _json_load(SPORTSRU_CACHE_FILE)
-    _RU_OVERRIDES = {str(k): str(v) for k, v in (ru.items() if isinstance(ru, dict) else [])}
-    _LASTNAME_RULES = {str(k).lower(): str(v) for k, v in (ln.items() if isinstance(ln, dict) else [])}
-    _SPORTSRU_CACHE = {str(k): str(v) for k, v in (sc.items() if isinstance(sc, dict) else [])}
+    global _RU_OVERRIDES, _LASTNAME_RULES
+    try:
+        if OVERRIDES_FILE.exists():
+            _RU_OVERRIDES = json.loads(OVERRIDES_FILE.read_text(encoding="utf-8"))
+        else:
+            _RU_OVERRIDES = {}
+    except Exception:
+        _RU_OVERRIDES = {}
+    try:
+        if LASTNAME_FILE.exists():
+            _LASTNAME_RULES = json.loads(LASTNAME_FILE.read_text(encoding="utf-8"))
+        else:
+            _LASTNAME_RULES = {}
+    except Exception:
+        _LASTNAME_RULES = {}
 
 def _save_overrides():
-    _json_save(RU_OVERRIDES_FILE, _RU_OVERRIDES)
-    _json_save(LASTNAME_RULES_FILE, _LASTNAME_RULES)
-    _json_save(SPORTSRU_CACHE_FILE, _SPORTSRU_CACHE)
-    _kv_set("ru_overrides", _RU_OVERRIDES)
-    _kv_set("lastname_rules", _LASTNAME_RULES)
+    try:
+        OVERRIDES_FILE.write_text(json.dumps(_RU_OVERRIDES), encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        LASTNAME_FILE.write_text(json.dumps(_LASTNAME_RULES), encoding="utf-8")
+    except Exception:
+        pass
 
 _load_overrides()
 
-# ===== sports.ru резолвер =====
-_SPORTS_TITLE_RE = re.compile(r">([А-ЯЁA-Z][^<]{1,80}?)\s*[—\-–]\s*баскетбол", re.IGNORECASE)
-_H1_RE = re.compile(r"<h1[^>]*>([^<]{2,80})</h1>", re.IGNORECASE)
+def set_ru_override(pid: int, ru: str) -> int:
+    _RU_OVERRIDES[str(int(pid))] = ru.strip()
+    _save_overrides()
+    return rebuild_index_inplace()
 
-def _sportsru_fetch_ru_name(en_full: str) -> Optional[str]:
-    try:
-        q = quote_plus(en_full)
-        url = f"https://www.sports.ru/search/?q={q}&sort=rel"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; vm-plashki/1.0)",
-            "Accept-Language": SPORTSRU_LANG_HDR,
-        }
-        r = requests.get(url, headers=headers, timeout=SPORTSRU_TIMEOUT)
-        if not r.ok or not r.text:
-            return None
-        html = r.text
-        m = _SPORTS_TITLE_RE.search(html)
-        if m:
-            name = m.group(1).strip()
-            if re.search("[А-Яа-яЁё]", name):
-                return name
-        m2 = _H1_RE.search(html)
-        if m2:
-            name = m2.group(1).strip()
-            if re.search("[А-Яа-яЁё]", name) and len(name) <= 80:
-                return name
-        return None
-    except Exception:
-        return None
+def del_ru_override(pid: int) -> int:
+    _RU_OVERRIDES.pop(str(int(pid)), None)
+    _save_overrides()
+    return rebuild_index_inplace()
 
-def _ru_from_sportsru_cached(full_ascii: str) -> Optional[str]:
-    key = _normalize_key(full_ascii)
-    ru = _SPORTSRU_CACHE.get(key)
-    if ru:
-        return ru
-    ru = _sportsru_fetch_ru_name(full_ascii)
-    if ru:
-        _SPORTSRU_CACHE[key] = ru
-        _json_save(SPORTSRU_CACHE_FILE, _SPORTSRU_CACHE)
-    return ru
+def set_lastname_rule(latin_last: str, ru_last: str) -> int:
+    _LASTNAME_RULES[_normalize_key(latin_last)] = ru_last.strip()
+    _save_overrides()
+    return rebuild_index_inplace()
 
-def sportsru_force(pid: int, full_ascii: str) -> Optional[str]:
-    ru = _sportsru_fetch_ru_name(full_ascii)
-    if ru:
-        _RU_OVERRIDES[str(pid)] = ru
-        _SPORTSRU_CACHE[_normalize_key(full_ascii)] = ru
-        _save_overrides()
-        return ru
-    return None
+def del_lastname_rule(latin_last: str) -> int:
+    _LASTNAME_RULES.pop(_normalize_key(latin_last), None)
+    _save_overrides()
+    return rebuild_index_inplace()
 
-# ===== формирование display-имени =====
-def _apply_lastname_rules(full_ascii: str, ru_guess: str) -> str:
-    last_lat = _normalize_key(full_ascii).split(" ")[-1]
-    fix = _LASTNAME_RULES.get(last_lat)
-    if not fix:
-        return ru_guess
-    parts = ru_guess.split()
-    if not parts:
-        return ru_guess
-    parts[-1] = fix
-    return " ".join(parts)
+# ===== загрузка с Cloudflare Worker (stats.nba.com/commonallplayers) =====
+def _fetch_players_from_stats_commonallplayers(url: str) -> Dict[str, Any]:
+    """
+    Ждём ответ формата stats.nba.com/stats/commonallplayers (через ваш воркер).
+    Возвращаем {"league": {"standard": [{"personId","firstName","lastName","teamId"}, ...]}}
+    только для активных (ROSTERSTATUS=1).
+    """
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    sets = j.get("resultSets") or j.get("ResultSets") or []
+    if not sets:
+        return {"league": {"standard": []}}
 
-def _ru_display_for_player(full_ascii: str, pid: int) -> str:
-    ru = _RU_OVERRIDES.get(str(pid))
-    if ru:
-        return ru
-    if SPORTSRU_RESOLVE:
-        ru2 = _ru_from_sportsru_cached(full_ascii)
-        if ru2:
-            _RU_OVERRIDES[str(pid)] = ru2
-            _save_overrides()
-            return ru2
-    ascii_key = _normalize_key(full_ascii)
-    ru_guess = RU_NAME_OVERRIDES.get(ascii_key, lat2cyr(full_ascii))
-    return _apply_lastname_rules(full_ascii, ru_guess)
+    headers = sets[0].get("headers") or sets[0].get("Headers") or []
+    rows = sets[0].get("rowSet") or sets[0].get("RowSet") or []
 
-# ===== загрузка снапшота игроков =====
-def _load_local_snapshot() -> Optional[Dict[str, Any]]:
-    p = ASSETS / "players.json"
-    if p.exists() and p.stat().st_size > 1000:
+    # иногда нужный сет не первый — найдём где есть PERSON_ID
+    for s in sets:
+        h = s.get("headers") or s.get("Headers") or []
+        if "PERSON_ID" in h:
+            headers = h
+            rows = s.get("rowSet") or s.get("RowSet") or []
+            break
+
+    idx = {name: i for i, name in enumerate(headers)}
+    need = ["PERSON_ID", "FIRST_NAME", "LAST_NAME", "TEAM_ID", "ROSTERSTATUS"]
+    if not all(k in idx for k in need):
+        return {"league": {"standard": []}}
+
+    out = []
+    for row in rows:
+        roster = str(row[idx["ROSTERSTATUS"]])
+        if roster not in ("1", "True", "true"):
+            continue
+        pid   = str(row[idx["PERSON_ID"]])
+        first = str(row[idx["FIRST_NAME"]] or "").strip()
+        last  = str(row[idx["LAST_NAME"]] or "").strip()
+        team  = str(row[idx["TEAM_ID"]] or "0")
+        out.append({"personId": pid, "firstName": first, "lastName": last, "teamId": team})
+    return {"league": {"standard": out}}
+
+# ===== сборка индекса =====
+def _fetch_players_payload() -> Dict[str, Any]:
+    # 0) Cloudflare Worker — приоритетно и стабильно
+    if PLAYERS_URL:
         try:
-            j = json.loads(p.read_text(encoding="utf-8"))
+            j = _fetch_players_from_stats_commonallplayers(PLAYERS_URL)
             if j.get("league", {}).get("standard"):
-                print("[players] snapshot: assets/players.json OK")
                 return j
         except Exception:
             pass
-    print("[players] snapshot: assets/players.json MISSING/SMALL")
-    return None
 
-def _load_snapshot_from_url() -> Optional[Dict[str, Any]]:
-    if not PLAYERS_SNAPSHOT_URL:
-        return None
-    try:
-        r = requests.get(PLAYERS_SNAPSHOT_URL, timeout=8, headers={"User-Agent":"vm-plashki/1.0"})
-        if r.ok:
-            j = r.json()
-            std = j.get("league", {}).get("standard") or []
-            print(f"[players] SNAPSHOT URL OK: players={len(std)}")
-            return j if std else None
-    except Exception as e:
-        print(f"[players] SNAPSHOT URL FAIL: {type(e).__name__}: {e}")
-    return None
+    # 1) фоллбек, чтобы бот не «пустел»
+    return {"league": {"standard": FALLBACK_PLAYERS}}
 
-def _build_index_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _ru_display_for_player(full_ascii: str, pid: int | str) -> str:
+    # 1) точечный override по PID
+    ru = _RU_OVERRIDES.get(str(int(pid)))
+    if ru:
+        return ru
+
+    # 2) готовые ручные маппинги на самых популярных
+    base_key = _normalize_key(full_ascii)
+    ru = RU_NAME_OVERRIDES.get(base_key)
+    if not ru:
+        ru = lat2cyr(full_ascii)
+
+    # 3) применим правило фамилии, если есть
+    #    (определяем фамилию по ascii last token из full_ascii)
+    last_ascii = _normalize_key(full_ascii).split(" ")[-1]
+    fix = _LASTNAME_RULES.get(last_ascii)
+    if fix:
+        # заменим последнюю "слово-подобную" часть в ru на фикc
+        parts = ru.split()
+        if parts:
+            parts[-1] = fix
+            ru = " ".join(parts)
+
+    return ru
+
+def _build_index(payload: Dict[str, Any]) -> Dict[str, Any]:
     players = payload.get("league", {}).get("standard", [])
     index: Dict[str, Any] = {"_bykey": {}, "_byid": {}}
     for p in players:
         if not p.get("personId"):
             continue
-        try:
-            pid = int(p["personId"])
-        except Exception:
-            continue
+        pid = int(p["personId"])
         first = p.get("firstName","").strip()
         last  = p.get("lastName","").strip()
-        try:
-            team_id = int(p.get("teamId") or 0)
-        except Exception:
-            team_id = 0
+        team_id = int(p.get("teamId") or 0)
         team_name = TEAM_NAMES.get(team_id, "Free Agent")
         full_ascii = f"{first} {last}".strip()
-        ascii_key = _normalize_key(full_ascii)
-        ru_display = _ru_display_for_player(full_ascii, pid)
 
         rec = {
             "id": pid,
             "full_name": full_ascii,
-            "display": ru_display,
+            "display": _ru_display_for_player(full_ascii, pid),
             "team_id": team_id,
             "team_name": team_name,
         }
         index["_byid"][pid] = rec
 
         # ключи для поиска
-        cyr_key = _normalize_key(ru_display)
+        ascii_key = _normalize_key(full_ascii)
+        cyr_key   = _normalize_key(rec["display"])
         index["_bykey"][ascii_key] = rec
-        index["_bykey"][cyr_key] = rec
+        index["_bykey"][cyr_key]   = rec
         index["_bykey"][_normalize_key(full_ascii.replace("-", " "))] = rec
-        index["_bykey"][_normalize_key(ru_display.replace("-", " "))] = rec
+        index["_bykey"][_normalize_key(rec["display"].replace("-", " "))] = rec
 
-    # короткие алиасы
+    # короткие алиасы (пример)
     aliases = {
         "wemby":"victor wembanyama", "вемба":"victor wembanyama",
         "зайон":"zion williamson", "лука":"luka doncic", "йокич":"nikola jokic", "ёкич":"nikola jokic",
@@ -389,73 +352,98 @@ def _build_index_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         basek = _normalize_key(base)
         if basek in index["_bykey"]:
             index["_bykey"][k] = index["_bykey"][basek]
+
+    # кастомные алиасы (из файла)
+    for k, basek in _ALIASES.items():
+        if basek in index["_bykey"]:
+            index["_bykey"][k] = index["_bykey"][basek]
+
     return index
 
-_PLAYERS: Optional[Dict[str, Any]] = None
+_PLAYERS: Dict[str, Any] | None = None
 _LAST_LOAD = 0
 
-def _ensure_index(force: bool = False):
-    """Офлайн-приоритет: assets → /tmp cache → (опц.) SNAPSHOT_URL → fallback."""
+def _ensure_index():
     global _PLAYERS, _LAST_LOAD
     now = time.time()
-    if _PLAYERS and not force and (now - _LAST_LOAD) < REFRESH_SECONDS:
+    if _PLAYERS and (now - _LAST_LOAD) < REFRESH_SECONDS:
         return
-
-    # 1) assets/players.json (репозиторий)
-    snap = _load_local_snapshot()
-    if snap:
-        _PLAYERS = _build_index_from_payload(snap)
-        _LAST_LOAD = now
-        try:
-            PLAYERS_CACHE.write_text(json.dumps(_PLAYERS, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
-        return
-
-    # 2) /tmp cache
+    # пробуем из кэша
     if PLAYERS_CACHE.exists():
         try:
             _PLAYERS = json.loads(PLAYERS_CACHE.read_text(encoding="utf-8"))
             _LAST_LOAD = now
-            print("[players] loaded from /tmp cache")
             return
         except Exception:
             _PLAYERS = None
-
-    # 3) быстрая ссылка (если офлайн=0 и URL задан)
-    if not PLAYERS_OFFLINE:
-        url_snap = _load_snapshot_from_url()
-        if url_snap:
-            _PLAYERS = _build_index_from_payload(url_snap)
-            _LAST_LOAD = now
-            try:
-                PLAYERS_CACHE.write_text(json.dumps(_PLAYERS, ensure_ascii=False), encoding="utf-8")
-            except Exception:
-                pass
-            return
-
-    # 4) fallback
-    print("[players] FALLBACK used (9)")
-    _PLAYERS = _build_index_from_payload({"league":{"standard": FALLBACK_PLAYERS}})
-    _LAST_LOAD = now
+    # иначе грузим
+    payload = _fetch_players_payload()
+    _PLAYERS = _build_index(payload)
     try:
-        PLAYERS_CACHE.write_text(json.dumps(_PLAYERS, ensure_ascii=False), encoding="utf-8")
+        PLAYERS_CACHE.write_text(json.dumps(_PLAYERS), encoding="utf-8")
     except Exception:
         pass
+    _LAST_LOAD = now
 
-def players_count() -> int:
-    _ensure_index()
-    return len(_PLAYERS["_byid"]) if _PLAYERS else 0
+def rebuild_index_inplace() -> int:
+    """Пересобирает индекс с учётом сохранённых оверрайдов/правил без сетевых запросов,
+       использует последний payload из кэша players_index.json по id/full_name/team_id/team_name.
+       Если кэша нет — честно перезагрузит payload.
+    """
+    global _PLAYERS, _LAST_LOAD
+    now = time.time()
+    base = None
+    if PLAYERS_CACHE.exists():
+        try:
+            base = json.loads(PLAYERS_CACHE.read_text(encoding="utf-8"))
+        except Exception:
+            base = None
+    if not base:
+        payload = _fetch_players_payload()
+        _PLAYERS = _build_index(payload)
+        try:
+            PLAYERS_CACHE.write_text(json.dumps(_PLAYERS), encoding="utf-8")
+        except Exception:
+            pass
+        _LAST_LOAD = now
+        return len(_PLAYERS.get("_byid", {}))
+    # пересчитать display'и
+    out = {"_bykey": {}, "_byid": {}}
+    for pid, rec in base.get("_byid", {}).items():
+        pid_int = int(pid)
+        full_ascii = rec["full_name"]
+        team_id = int(rec.get("team_id") or 0)
+        team_name = TEAM_NAMES.get(team_id, "Free Agent")
+        newrec = {
+            "id": pid_int,
+            "full_name": full_ascii,
+            "display": _ru_display_for_player(full_ascii, pid_int),
+            "team_id": team_id,
+            "team_name": team_name,
+        }
+        out["_byid"][pid_int] = newrec
+        out["_bykey"][_normalize_key(full_ascii)] = newrec
+        out["_bykey"][_normalize_key(newrec["display"])] = newrec
+    _PLAYERS = out
+    try:
+        PLAYERS_CACHE.write_text(json.dumps(_PLAYERS), encoding="utf-8")
+    except Exception:
+        pass
+    _LAST_LOAD = now
+    return len(_PLAYERS.get("_byid", {}))
 
 def get_player_by_id(pid: int) -> Optional[Dict[str, Any]]:
     _ensure_index()
     return _PLAYERS["_byid"].get(int(pid)) if _PLAYERS else None
 
+def players_count() -> int:
+    _ensure_index()
+    return len(_PLAYERS["_byid"]) if _PLAYERS else 0
+
 def _apply_alias(q_norm: str) -> Optional[str]:
     return _ALIASES.get(q_norm)
 
 def find_player_by_name(query: str) -> Optional[Dict[str, Any]]:
-    """Возвращает {id, full_name (лат), display (РУС), team_id, team_name}."""
     if not query:
         return None
     _ensure_index()
@@ -464,17 +452,17 @@ def find_player_by_name(query: str) -> Optional[Dict[str, Any]]:
 
     q = _normalize_key(query)
 
-    # 1) Алиасы, заданные из бота
+    # 1) алиас
     base = _apply_alias(q)
     if base and base in _PLAYERS["_bykey"]:
         return _PLAYERS["_bykey"][base]
 
-    # 2) Прямые совпадения
+    # 2) прямое совпадение
     rec = _PLAYERS["_bykey"].get(q)
     if rec:
         return rec
 
-    # 3) кириллица -> лат
+    # 3) кири -> лат
     if re.search("[а-яё]", q):
         lat_guess = _normalize_key(cyr2lat(query))
         rec = _PLAYERS["_bykey"].get(lat_guess)
@@ -504,7 +492,6 @@ def find_player_by_name(query: str) -> Optional[Dict[str, Any]]:
     return None
 
 def suggest_players(query: str, limit: int = 5) -> List[Dict[str, Any]]:
-    """Топ-совпадения по похожести (для «Игрок не найден»)."""
     _ensure_index()
     if not _PLAYERS or not query:
         return []
@@ -531,6 +518,31 @@ def suggest_players(query: str, limit: int = 5) -> List[Dict[str, Any]]:
             break
     return out
 
+# ===== sports.ru auto (по запросу /resolve) — опционально, best-effort =====
+def sportsru_force(pid: int, full_ascii: str) -> Optional[str]:
+    """
+    Пытаемся найти русскую форму на sports.ru (поиск).
+    Возвращает строку или None. Это best-effort и может не сработать.
+    """
+    try:
+        q = requests.utils.quote(full_ascii)
+        url = f"https://www.sports.ru/search/?q={q}"
+        r = requests.get(url, timeout=10, headers={"User-Agent":"Mozilla/5.0"})
+        if not r.ok:
+            return None
+        # очень грубо: ищем "— баскетболист" или заголовки ссылок с кириллицей
+        m = re.search(r">([А-ЯЁа-яё][^<]{2,50})</a>", r.text)
+        if m:
+            name = m.group(1).strip()
+            # sanity: не слишком длинно и есть пробел
+            if " " in name and len(name) <= 60:
+                _RU_OVERRIDES[str(int(pid))] = name
+                _save_overrides()
+                return name
+    except Exception:
+        return None
+    return None
+
 # ===== headshots & logos =====
 def ensure_headshot_png(player_id: int, full_name: str) -> str:
     path = HEAD_DIR / f"{player_id}.png"
@@ -542,7 +554,7 @@ def ensure_headshot_png(player_id: int, full_name: str) -> str:
     ]
     for u in urls:
         try:
-            r = requests.get(u, timeout=6, headers={"User-Agent":"vm-plashki/1.0"})
+            r = requests.get(u, timeout=8)
             if r.ok and r.content and r.content[:4] == b"\x89PNG":
                 path.write_bytes(r.content)
                 return str(path)
@@ -559,72 +571,3 @@ def ensure_team_logo_png(team_id: int) -> Tuple[str, Tuple[str,str,str]]:
     dark = _shade(primary, 0.90)
     light = "#FFFFFF"
     return logo_path, (primary, dark, light)
-
-# ======= Переиндексация (главное, чтобы /setru и /fixlast применялись сразу) =======
-def rebuild_index_inplace() -> int:
-    """
-    Полная пересборка in-memory индекса из уже известных игроков (без сетевых загрузок).
-    Сохраняет в /tmp кэш.
-    """
-    global _PLAYERS, _LAST_LOAD
-    _ensure_index()
-    if not _PLAYERS:
-        return 0
-    # исходники берём из текущего _byid
-    items = list(_PLAYERS["_byid"].values())
-    new_index: Dict[str, Any] = {"_bykey": {}, "_byid": {}}
-    for rec in items:
-        pid = int(rec["id"])
-        full_ascii = rec["full_name"]
-        team_id = int(rec.get("team_id") or 0)
-        team_name = rec.get("team_name") or TEAM_NAMES.get(team_id, "Free Agent")
-        ru_display = _ru_display_for_player(full_ascii, pid)
-
-        new_rec = {
-            "id": pid,
-            "full_name": full_ascii,
-            "display": ru_display,
-            "team_id": team_id,
-            "team_name": team_name,
-        }
-        new_index["_byid"][pid] = new_rec
-
-        # ключи для поиска
-        ascii_key = _normalize_key(full_ascii)
-        cyr_key   = _normalize_key(ru_display)
-        new_index["_bykey"][ascii_key] = new_rec
-        new_index["_bykey"][cyr_key]   = new_rec
-        new_index["_bykey"][_normalize_key(full_ascii.replace("-", " "))] = new_rec
-        new_index["_bykey"][_normalize_key(ru_display.replace("-", " "))] = new_rec
-
-    _PLAYERS = new_index
-    _LAST_LOAD = time.time()
-    try:
-        PLAYERS_CACHE.write_text(json.dumps(_PLAYERS, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
-    return len(_PLAYERS["_byid"])
-
-def set_lastname_rule(latin_last: str, ru_last: str) -> int:
-    """
-    Добавить/обновить массовое правило по фамилии (например, brooks -> Брукс).
-    Возвращает количество записей после пересборки.
-    """
-    _LASTNAME_RULES[_normalize_key(latin_last)] = ru_last
-    _save_overrides()
-    return rebuild_index_inplace()
-
-def del_lastname_rule(latin_last: str) -> int:
-    _LASTNAME_RULES.pop(_normalize_key(latin_last), None)
-    _save_overrides()
-    return rebuild_index_inplace()
-
-def set_ru_override(pid: int, ru_name: str) -> int:
-    _RU_OVERRIDES[str(int(pid))] = ru_name
-    _save_overrides()
-    return rebuild_index_inplace()
-
-def del_ru_override(pid: int) -> int:
-    _RU_OVERRIDES.pop(str(int(pid)), None)
-    _save_overrides()
-    return rebuild_index_inplace()
