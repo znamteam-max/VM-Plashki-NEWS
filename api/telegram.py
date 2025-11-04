@@ -16,7 +16,7 @@
 #  /delru Nikola Jokic
 #  /name Nikola Jokic
 #  /listfixes
-#  /resolve Nikola Jokic      ← принудительно подтянуть имя со sports.ru и сохранить
+#  /resolve Nikola Jokic
 
 import os
 import re
@@ -114,7 +114,9 @@ async def handle_update(update: dict) -> JSONResponse:
         find_player_by_name, ensure_headshot_png, ensure_team_logo_png,
         get_player_by_id, suggest_players, add_alias,
         _LASTNAME_RULES, _RU_OVERRIDES, _save_overrides, _load_overrides, _ru_display_for_player,
-        sportsru_force
+        sportsru_force,
+        set_lastname_rule, del_lastname_rule, set_ru_override, del_ru_override,
+        rebuild_index_inplace
     )
 
     # callback pick
@@ -146,12 +148,15 @@ async def handle_update(update: dict) -> JSONResponse:
                 tg_answer_callback(cq["id"], "Игрок не найден по ID.")
                 return JSONResponse({"ok": True})
 
+            # на всякий случай освежим отображаемое имя (если только что меняли правила)
+            display = _ru_display_for_player(player["full_name"], player["id"])
+
             logo_path, team_colors = ensure_team_logo_png(player["team_id"])
             head_path = ensure_headshot_png(player["id"], player["full_name"])
 
             png_bytes = render_card(
                 template=template,
-                player_name=player["display"] or player["full_name"],
+                player_name=display,
                 team_name=player["team_name"],
                 team_logo_path=logo_path,
                 team_colors=team_colors,
@@ -159,7 +164,7 @@ async def handle_update(update: dict) -> JSONResponse:
                 stats=stats,
                 note=note,
             )
-            tg_answer_callback(cq["id"], f"Выбрано: {player['display']}")
+            tg_answer_callback(cq["id"], f"Выбрано: {display}")
             tg_send_png(chat_id, png_bytes)
             return JSONResponse({"ok": True})
 
@@ -207,14 +212,13 @@ async def handle_update(update: dict) -> JSONResponse:
         body = text.split(" ",1)[1] if " " in text else ""
         parts = [p.strip() for p in body.split("=",1)]
         if len(parts)!=2 or not parts[0] or not parts[1]:
-            tg_send_message(chat_id, "Формат: /fixlast Jokic = Йокич")
+            tg_send_message(chat_id, "Формат: /fixlast Brooks = Брукс")
             return JSONResponse({"ok": True})
-        latin_last = parts[0].lower()
+        latin_last = parts[0]
         ru_last    = parts[1]
-        _LASTNAME_RULES[latin_last] = ru_last
-        _save_overrides()
+        total = set_lastname_rule(latin_last, ru_last)
         tg_send_message(chat_id, f"Ок. Правило фамилии: {latin_last} → {ru_last}\n"
-                                 f"Новые карточки будут учитывать это автоматически.")
+                                 f"Индекс пересобран ({total} игроков). Новые плашки уже с учётом правила.")
         return JSONResponse({"ok": True})
 
     if low.startswith("/dellast"):
@@ -222,13 +226,12 @@ async def handle_update(update: dict) -> JSONResponse:
             tg_send_message(chat_id, "Команда доступна только редакторам.")
             return JSONResponse({"ok": True})
         body = text.split(" ",1)[1] if " " in text else ""
-        k = body.strip().lower()
+        k = body.strip()
         if not k:
-            tg_send_message(chat_id, "Формат: /dellast Jokic")
+            tg_send_message(chat_id, "Формат: /dellast Brooks")
             return JSONResponse({"ok": True})
-        _LASTNAME_RULES.pop(k, None)
-        _save_overrides()
-        tg_send_message(chat_id, f"Правило {k} удалено.")
+        total = del_lastname_rule(k)
+        tg_send_message(chat_id, f"Правило {k} удалено. Индекс пересобран ({total}).")
         return JSONResponse({"ok": True})
 
     if low.startswith("/setru"):
@@ -238,22 +241,16 @@ async def handle_update(update: dict) -> JSONResponse:
         body = text.split(" ",1)[1] if " " in text else ""
         parts = [p.strip() for p in body.split("|",1)]
         if len(parts)!=2:
-            tg_send_message(chat_id, "Формат: /setru Nikola Jokic | Никола Йокич\nили: /setru 203999 | Никола Йокич")
+            tg_send_message(chat_id, "Формат: /setru Dillon Brooks | Диллон Брукс\nили: /setru 1626157 | Диллон Брукс")
             return JSONResponse({"ok": True})
         who, new_ru = parts[0], parts[1]
-        rec = None
         from data import find_player_by_name as _find, get_player_by_id as _get
-        if who.isdigit():
-            rec = _get(int(who))
-        if not rec:
-            rec = _find(who)
+        rec = _get(int(who)) if who.isdigit() else _find(who)
         if not rec:
             tg_send_message(chat_id, "Игрок не найден.")
             return JSONResponse({"ok": True})
-        pid = str(rec["id"])
-        _RU_OVERRIDES[pid] = new_ru
-        _save_overrides()
-        tg_send_message(chat_id, f"Ок. {rec['full_name']} теперь «{new_ru}».")
+        total = set_ru_override(rec["id"], new_ru)
+        tg_send_message(chat_id, f"Ок. {rec['full_name']} теперь «{new_ru}». Индекс пересобран ({total}).")
         return JSONResponse({"ok": True})
 
     if low.startswith("/delru"):
@@ -269,21 +266,16 @@ async def handle_update(update: dict) -> JSONResponse:
         if not rec:
             tg_send_message(chat_id, "Игрок не найден.")
             return JSONResponse({"ok": True})
-        pid = str(rec["id"])
-        if pid in _RU_OVERRIDES:
-            _RU_OVERRIDES.pop(pid, None)
-            _save_overrides()
-            tg_send_message(chat_id, f"RU-override для {rec['full_name']} удалён.")
-        else:
-            tg_send_message(chat_id, "Override для этого игрока не найден.")
+        total = del_ru_override(rec["id"])
+        tg_send_message(chat_id, f"RU-override для {rec['full_name']} удалён. Индекс пересобран ({total}).")
         return JSONResponse({"ok": True})
 
     if low.startswith("/name"):
         who = text.split(" ",1)[1].strip() if " " in text else ""
         if not who:
-            tg_send_message(chat_id, "Формат: /name Nikola Jokic")
+            tg_send_message(chat_id, "Формат: /name Dillon Brooks")
             return JSONResponse({"ok": True})
-        from data import find_player_by_name as _find
+        from data import find_player_by_name as _find, _ru_display_for_player
         rec = _find(who)
         if not rec:
             tg_send_message(chat_id, "Игрок не найден.")
@@ -293,22 +285,22 @@ async def handle_update(update: dict) -> JSONResponse:
         return JSONResponse({"ok": True})
 
     if low.startswith("/resolve"):
-        # принудительно подтянуть имя со sports.ru и сохранить
         if not is_admin(user_id):
             tg_send_message(chat_id, "Команда доступна только редакторам.")
             return JSONResponse({"ok": True})
         who = text.split(" ",1)[1].strip() if " " in text else ""
         if not who:
-            tg_send_message(chat_id, "Формат: /resolve Nikola Jokic")
+            tg_send_message(chat_id, "Формат: /resolve John Tonje")
             return JSONResponse({"ok": True})
-        from data import find_player_by_name as _find
+        from data import find_player_by_name as _find, sportsru_force
         rec = _find(who)
         if not rec:
             tg_send_message(chat_id, "Игрок не найден.")
             return JSONResponse({"ok": True})
         ru = sportsru_force(rec["id"], rec["full_name"])
         if ru:
-            tg_send_message(chat_id, f"sports.ru: «{ru}». Сохранено как отображаемое имя.")
+            rebuild_index_inplace()
+            tg_send_message(chat_id, f"sports.ru: «{ru}». Сохранено и применено.")
         else:
             tg_send_message(chat_id, "Не удалось получить имя со sports.ru.")
         return JSONResponse({"ok": True})
@@ -340,7 +332,7 @@ async def handle_update(update: dict) -> JSONResponse:
         return JSONResponse({"ok": True})
 
     name, stats, template, note, _raw = parsed
-    from data import find_player_by_name as _find
+    from data import find_player_by_name as _find, _ru_display_for_player
     player = _find(name)
     if not player:
         from data import suggest_players
@@ -354,6 +346,8 @@ async def handle_update(update: dict) -> JSONResponse:
                         reply_to_message_id=msg.get("message_id"), reply_markup=kb)
         return JSONResponse({"ok": True})
 
+    display = _ru_display_for_player(player["full_name"], player["id"])  # на случай свежих правок
+
     # рендер
     from data import ensure_team_logo_png, ensure_headshot_png
     logo_path, team_colors = ensure_team_logo_png(player["team_id"])
@@ -361,7 +355,7 @@ async def handle_update(update: dict) -> JSONResponse:
 
     png_bytes = render_card(
         template=template,
-        player_name=player["display"] or player["full_name"],
+        player_name=display,
         team_name=player["team_name"],
         team_logo_path=logo_path,
         team_colors=team_colors,
