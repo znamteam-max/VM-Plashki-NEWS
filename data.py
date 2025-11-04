@@ -5,9 +5,7 @@ from typing import Dict, Any, Tuple, List, Optional
 import requests
 from difflib import SequenceMatcher
 
-# ===== настройки через ENV =====
-# Всегда брать список ИЗ СЕТИ (игнорировать локальный snapshot)
-PLAYERS_ALWAYS_ONLINE = os.getenv("PLAYERS_ALWAYS_ONLINE", "1").lower() in ("1","true","yes")
+# ===== настройки =====
 # Как часто обновлять индекс (сек). 21600 = 6 часов.
 REFRESH_SECONDS = int(os.getenv("PLAYERS_REFRESH_SECONDS", "21600"))
 # Оставлять только активных игроков
@@ -26,7 +24,33 @@ HEAD_DIR = CACHE / "headshots"; HEAD_DIR.mkdir(exist_ok=True)
 LOGO_DIR = ASSETS / "cache"  # ожидаются logo_<teamId>.png
 ICON_STAR = str((ASSETS / "icons" / "star.png").resolve())
 
-# ===== команды: цвет =====
+# ===== лог (для диагностики GET action=debug) =====
+DEBUG_LOG: List[str] = []
+def _log(msg: str):
+    try:
+        print(f"[players] {msg}", flush=True)
+    except Exception:
+        pass
+    DEBUG_LOG.append(msg)
+    if len(DEBUG_LOG) > 200:
+        del DEBUG_LOG[:100]
+
+def get_debug_log(max_lines: int = 80) -> List[str]:
+    return DEBUG_LOG[-max_lines:]
+
+# ===== команды: имена и цвета =====
+TEAM_NAMES: Dict[int, str] = {
+    1610612737:"Atlanta Hawks", 1610612738:"Boston Celtics", 1610612739:"Cleveland Cavaliers",
+    1610612740:"New Orleans Pelicans", 1610612741:"Chicago Bulls", 1610612742:"Dallas Mavericks",
+    1610612743:"Denver Nuggets", 1610612744:"Golden State Warriors", 1610612745:"Houston Rockets",
+    1610612746:"LA Clippers", 1610612747:"Los Angeles Lakers", 1610612748:"Miami Heat",
+    1610612749:"Milwaukee Bucks", 1610612750:"Minnesota Timberwolves", 1610612751:"Brooklyn Nets",
+    1610612752:"New York Knicks", 1610612753:"Orlando Magic", 1610612754:"Indiana Pacers",
+    1610612755:"Philadelphia 76ers", 1610612756:"Phoenix Suns", 1610612757:"Portland Trail Blazers",
+    1610612758:"Sacramento Kings", 1610612759:"San Antonio Spurs", 1610612760:"Oklahoma City Thunder",
+    1610612761:"Toronto Raptors", 1610612762:"Utah Jazz", 1610612763:"Memphis Grizzlies",
+    1610612764:"Washington Wizards", 1610612765:"Detroit Pistons", 1610612766:"Charlotte Hornets",
+}
 TEAM_PRIMARY: Dict[int, str] = {
     1610612737:"#E03A3E", 1610612738:"#007A33", 1610612739:"#860038",
     1610612740:"#0C2340", 1610612741:"#CE1141", 1610612742:"#00538C",
@@ -103,7 +127,7 @@ RU_NAME_OVERRIDES: Dict[str,str] = {
     "alperen sengun":"Алперен Шенгюн",
 }
 
-# --- фоллбек на случай полной недоступности сети ---
+# --- фоллбек (если сеть совсем не дала) ---
 FALLBACK_PLAYERS = [
     {"personId":"203999","firstName":"Nikola","lastName":"Jokic","teamId":"1610612743"},
     {"personId":"201939","firstName":"Stephen","lastName":"Curry","teamId":"1610612744"},
@@ -116,7 +140,7 @@ FALLBACK_PLAYERS = [
     {"personId":"1629029","firstName":"Luka","lastName":"Doncic","teamId":"1610612742"},
 ]
 
-# ===== алиасы, задаваемые из бота =====
+# ===== алиасы (пользовательские) =====
 _ALIASES: Dict[str, str] = {}  # key(normalized alias) -> normalized base ascii-key
 def _load_aliases():
     global _ALIASES
@@ -138,19 +162,17 @@ def add_alias(alias_text: str, base_full_ascii: str) -> bool:
         return False
 _load_aliases()
 
-# ===== загрузка игроков (всегда онлайн + ретраи) =====
+# ===== загрузка игроков (stats.nba.com + legacy) =====
 def _fetch_players_payload() -> Dict[str, Any]:
     """
-    Пытаемся получить список игроков через stats.nba.com (commonallplayers),
-    с нужными заголовками. Если не вышло — пробуем старые data.nba.net/data.nba.com.
-    В самом конце — короткий фоллбек.
-    Возвращаем payload в формате {"league": {"standard": [ {personId, firstName, lastName, teamId}, ... ]}}
-    чтобы остальной код (_build_index) работал без изменений.
+    Тянем список игроков через stats.nba.com (commonallplayers) с «браузерными» заголовками.
+    Если не получилось — пробуем legacy JSON. В самом конце — короткий фоллбек.
+    Возвращаем {"league":{"standard":[{personId,firstName,lastName,teamId}...]}}
     """
-    # --- 1) stats.nba.com (нужны headers)
+    # 1) stats.nba.com (критично указать заголовки)
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
         "Referer": "https://www.nba.com/",
         "Origin": "https://www.nba.com",
         "Accept": "application/json, text/plain, */*",
@@ -158,50 +180,43 @@ def _fetch_players_payload() -> Dict[str, Any]:
         "Connection": "keep-alive",
         "x-nba-stats-origin": "stats",
         "x-nba-stats-token": "true",
-        # Не просим br, чтобы не требовать brotli в зависимостях:
-        "Accept-Encoding": "gzip, deflate",
+        "Accept-Encoding": "gzip, deflate",  # без br, чтобы не требовать brotli
     }
-    # Три сезона на случай межсезонья
     seasons = ["2025-26", "2024-25", "2023-24"]
     for season in seasons:
         url = ("https://stats.nba.com/stats/commonallplayers"
                f"?LeagueID=00&Season={season}&IsOnlyCurrentSeason=1")
         try:
             r = requests.get(url, headers=headers, timeout=12)
+            _log(f"stats GET {season}: status={getattr(r,'status_code',None)}")
             if r.ok:
                 j = r.json()
                 rs = None
-                # разные варианты ключей в ответе
                 if isinstance(j.get("resultSets"), list) and j["resultSets"]:
                     rs = j["resultSets"][0]
                 elif isinstance(j.get("resultSet"), dict):
                     rs = j["resultSet"]
-
                 if rs:
                     headers_list = rs.get("headers") or []
                     rows = rs.get("rowSet") or []
-                    # индексы нужных колонок
                     idx = {h: i for i, h in enumerate(headers_list)}
                     need = ("PERSON_ID", "FIRST_NAME", "LAST_NAME", "TEAM_ID")
                     if all(k in idx for k in need):
                         out = []
                         for row in rows:
-                            person_id = str(row[idx["PERSON_ID"]])
-                            first = row[idx["FIRST_NAME"]] or ""
-                            last  = row[idx["LAST_NAME"]] or ""
-                            team_id = str(row[idx["TEAM_ID"]] or "0")
                             out.append({
-                                "personId": person_id,
-                                "firstName": first,
-                                "lastName": last,
-                                "teamId": team_id,
+                                "personId": str(row[idx["PERSON_ID"]]),
+                                "firstName": row[idx["FIRST_NAME"]] or "",
+                                "lastName":  row[idx["LAST_NAME"]]  or "",
+                                "teamId":    str(row[idx["TEAM_ID"]] or "0"),
                             })
+                        _log(f"stats parsed {season}: players={len(out)}")
                         if out:
                             return {"league": {"standard": out}}
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f"stats error {season}: {type(e).__name__}: {e}")
 
-    # --- 2) старые JSON (иногда работают)
+    # 2) legacy JSON (на всякий случай)
     urls_legacy = [
         "https://data.nba.net/prod/v1/2025/players.json",
         "https://data.nba.net/prod/v1/2024/players.json",
@@ -211,14 +226,17 @@ def _fetch_players_payload() -> Dict[str, Any]:
     for u in urls_legacy:
         try:
             r = requests.get(u, timeout=12)
+            _log(f"legacy GET {u.split('/')[-2]}: status={getattr(r,'status_code',None)}")
             if r.ok:
                 j = r.json()
-                if j.get("league", {}).get("standard"):
+                n = len(j.get("league", {}).get("standard", []))
+                _log(f"legacy parsed {u.split('/')[-2]}: players={n}")
+                if n:
                     return j
-        except Exception:
-            continue
+        except Exception as e:
+            _log(f"legacy error: {type(e).__name__}: {e}")
 
-    # --- 3) фоллбек
+    _log("FALLBACK used (9)")
     return {"league": {"standard": FALLBACK_PLAYERS}}
 
 def _build_index() -> Dict[str, Any]:
@@ -235,6 +253,7 @@ def _build_index() -> Dict[str, Any]:
         first = p.get("firstName","").strip()
         last  = p.get("lastName","").strip()
         team_id = int(p.get("teamId") or 0)
+        team_name = TEAM_NAMES.get(team_id, "Free Agent") if team_id else "Free Agent"
         full_ascii = f"{first} {last}".strip()
         ascii_key = _normalize_key(full_ascii)
         ru_display = RU_NAME_OVERRIDES.get(ascii_key, lat2cyr(full_ascii))
@@ -244,7 +263,7 @@ def _build_index() -> Dict[str, Any]:
             "full_name": full_ascii,
             "display": ru_display,
             "team_id": team_id,
-            "team_name": "",  # не используем сейчас, можно дополнить
+            "team_name": team_name,
         }
         index["_byid"][pid] = rec
 
@@ -269,8 +288,8 @@ def _build_index() -> Dict[str, Any]:
 
     return index
 
-_PLAYERS: Dict[str, Any] | None = None
-_LAST_LOAD = 0
+_PLAYERS: Optional[Dict[str, Any]] = None
+_LAST_LOAD = 0.0
 
 def _ensure_index(force_online: bool = False):
     """
@@ -290,7 +309,9 @@ def _ensure_index(force_online: bool = False):
             if data.get("_byid"):
                 _PLAYERS = data
                 _LAST_LOAD = now
-        except Exception:
+                _log(f"cache load ok: {_PLAYERS and len(_PLAYERS.get('_byid', {}))}")
+        except Exception as e:
+            _log(f"cache load error: {e}")
             _PLAYERS = None
 
     # онлайн загрузка
@@ -300,12 +321,14 @@ def _ensure_index(force_online: bool = False):
         _LAST_LOAD = now
         try:
             PLAYERS_CACHE.write_text(json.dumps(_PLAYERS), encoding="utf-8")
-        except Exception:
-            pass
+            _log("cache save ok")
+        except Exception as e:
+            _log(f"cache save error: {e}")
         return
 
     # если онлайн пуст, но есть кэш — остаёмся на кэше
     if _PLAYERS:
+        _log("using existing cache")
         return
 
     # последний шанс — фоллбек
@@ -316,7 +339,7 @@ def force_refresh_players() -> int:
     """Принудительно перегрузить индекс онлайн."""
     global _PLAYERS, _LAST_LOAD
     _PLAYERS = None
-    _LAST_LOAD = 0
+    _LAST_LOAD = 0.0
     _ensure_index(force_online=True)
     return len(_PLAYERS["_byid"]) if _PLAYERS else 0
 
