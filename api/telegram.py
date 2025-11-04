@@ -1,14 +1,13 @@
-# /api/telegram.py — FastAPI webhook для Telegram (Vercel)
+# /api/telegram.py — FastAPI webhook для Telegram (Vercel), с авто-списыванием имён со sports.ru
 # Поддерживает:
 #  GET  /api/telegram
 #  GET  /api/telegram/healthz
-#  GET  /api/telegram?action=refresh&secret=...&drop_cache=1&debug=1
-#  GET  /api/debug/players_snapshot
+#  GET  /api/telegram?action=refresh&secret=...&drop_cache=1
 #  GET  /api/telegram/selftest
 #  POST /api/telegram?secret=...
 #  POST /api/telegram/webhook/<secret>
 #
-# Команды в чате:
+# Команды:
 #  /card Имя | 25 очков, 12 подборов, 3 блокшота | impact | подпись(опц.)
 #  /alias Неправильно = Правильное Имя
 #  /fixlast Jokic = Йокич
@@ -17,6 +16,7 @@
 #  /delru Nikola Jokic
 #  /name Nikola Jokic
 #  /listfixes
+#  /resolve Nikola Jokic      ← принудительно подтянуть имя со sports.ru и сохранить
 
 import os
 import re
@@ -34,7 +34,6 @@ app = FastAPI()
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "hook")
 
-# число + (возможный %) + ярлык
 STAT_PAIR_RE = re.compile(
     r"(?P<num>[-+]?\d+(?:[.,]\d+)?)\s*([%]?)\s*(?P<label>[A-Za-zА-Яа-яёЁ+\-/ ]{0,20})"
 )
@@ -43,13 +42,7 @@ def _json_exc(e: Exception):
     tb = traceback.format_exc().splitlines()[-12:]
     return {"ok": False, "error": f"{type(e).__name__}: {e}", "trace": tb}
 
-# ---------- парсинг команд ----------
-
 def parse_card(text: str):
-    """
-    /card Имя | 25 очков, 12 подборов, 3 блокшота | impact | подпись(опц.)
-    -> (name, stats[:6], template, note, raw_stats_text)
-    """
     if not text or not text.lower().startswith("/card"):
         return None
     body = text.split(" ", 1)[1] if " " in text else ""
@@ -73,10 +66,6 @@ def parse_card(text: str):
     return name, stats[:6], template, note, raw_stats
 
 def parse_alias(text: str):
-    """
-    /alias Неправильно = Правильное Имя
-    -> (alias_text, correct_text)
-    """
     if not text or not text.lower().startswith("/alias"):
         return None
     body = text.split(" ", 1)[1] if " " in text else ""
@@ -92,10 +81,8 @@ def is_admin(user_id: int) -> bool:
     except Exception:
         return False
 
-# ---------- Telegram helpers ----------
-
+# --- Telegram helpers ---
 def tg_send_png(chat_id: int, png_bytes: bytes, caption: Optional[str] = None):
-    """Отправляем как документ — сохранит прозрачность PNG и не пережмёт JPG."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
     files = {"document": ("card.png", png_bytes, "image/png")}
     data = {"chat_id": chat_id}
@@ -104,23 +91,14 @@ def tg_send_png(chat_id: int, png_bytes: bytes, caption: Optional[str] = None):
     r = requests.post(url, data=data, files=files, timeout=30)
     return r.ok, r.text
 
-def tg_send_message(
-    chat_id: int,
-    text: str,
-    reply_to_message_id: Optional[int] = None,
-    reply_markup: Optional[dict] = None,
-):
+def tg_send_message(chat_id: int, text: str, reply_to_message_id: Optional[int] = None, reply_markup: Optional[dict] = None):
     payload = {"chat_id": chat_id, "text": text}
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
         payload["allow_sending_without_reply"] = True
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json=payload,
-        timeout=15,
-    )
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload, timeout=15)
 
 def tg_answer_callback(callback_id: str, text: str = ""):
     requests.post(
@@ -129,18 +107,17 @@ def tg_answer_callback(callback_id: str, text: str = ""):
         timeout=10,
     )
 
-# ---------- основной обработчик ----------
-
+# --- core handler ---
 async def handle_update(update: dict) -> JSONResponse:
-    # ленивые импорты
     from graphics import render_card
     from data import (
         find_player_by_name, ensure_headshot_png, ensure_team_logo_png,
         get_player_by_id, suggest_players, add_alias,
-        _LASTNAME_RULES, _RU_OVERRIDES, _save_overrides, _load_overrides, _ru_display_for_player
+        _LASTNAME_RULES, _RU_OVERRIDES, _save_overrides, _load_overrides, _ru_display_for_player,
+        sportsru_force
     )
 
-    # 1) callback-кнопки (выбор игрока из подсказок)
+    # callback pick
     if "callback_query" in update:
         cq = update["callback_query"]
         data_cb = cq.get("data") or ""
@@ -186,11 +163,10 @@ async def handle_update(update: dict) -> JSONResponse:
             tg_send_png(chat_id, png_bytes)
             return JSONResponse({"ok": True})
 
-        # неизвестный callback
         tg_answer_callback(cq["id"])
         return JSONResponse({"ok": True})
 
-    # 2) обычные сообщения
+    # message
     msg = update.get("message") or update.get("edited_message") or update.get("channel_post")
     if not msg:
         return JSONResponse({"ok": True})
@@ -198,10 +174,9 @@ async def handle_update(update: dict) -> JSONResponse:
     chat_id = msg["chat"]["id"]
     text = msg.get("text") or ""
     user_id = (msg.get("from") or {}).get("id", 0)
-
-    # --- админ-команды для фиксов фамилий/имён ---
     low = text.strip().lower()
 
+    # ---- админ-команды ----
     if low.startswith("/listfixes"):
         if not is_admin(user_id):
             tg_send_message(chat_id, "Команда доступна только редакторам.")
@@ -215,12 +190,11 @@ async def handle_update(update: dict) -> JSONResponse:
             lines.append("  (пусто)")
         lines.append("• Точечные имена:")
         if _RU_OVERRIDES:
-            limit = 60
             items = list(_RU_OVERRIDES.items())
-            for pid,ru in items[:limit]:
+            for pid,ru in items[:60]:
                 lines.append(f"  {pid} → {ru}")
-            if len(items) > limit:
-                lines.append(f"  ... и ещё {len(items)-limit}")
+            if len(items) > 60:
+                lines.append(f"  ... и ещё {len(items)-60}")
         else:
             lines.append("  (пусто)")
         tg_send_message(chat_id, "\n".join(lines))
@@ -252,12 +226,9 @@ async def handle_update(update: dict) -> JSONResponse:
         if not k:
             tg_send_message(chat_id, "Формат: /dellast Jokic")
             return JSONResponse({"ok": True})
-        removed = _LASTNAME_RULES.pop(k, None)
+        _LASTNAME_RULES.pop(k, None)
         _save_overrides()
-        if removed is not None:
-            tg_send_message(chat_id, f"Правило {k} удалено.")
-        else:
-            tg_send_message(chat_id, "Такого правила нет.")
+        tg_send_message(chat_id, f"Правило {k} удалено.")
         return JSONResponse({"ok": True})
 
     if low.startswith("/setru"):
@@ -271,17 +242,18 @@ async def handle_update(update: dict) -> JSONResponse:
             return JSONResponse({"ok": True})
         who, new_ru = parts[0], parts[1]
         rec = None
+        from data import find_player_by_name as _find, get_player_by_id as _get
         if who.isdigit():
-            rec = get_player_by_id(int(who))
+            rec = _get(int(who))
         if not rec:
-            rec = find_player_by_name(who)
+            rec = _find(who)
         if not rec:
             tg_send_message(chat_id, "Игрок не найден.")
             return JSONResponse({"ok": True})
         pid = str(rec["id"])
         _RU_OVERRIDES[pid] = new_ru
         _save_overrides()
-        tg_send_message(chat_id, f"Ок. {rec['full_name']} теперь отображается как «{new_ru}».")
+        tg_send_message(chat_id, f"Ок. {rec['full_name']} теперь «{new_ru}».")
         return JSONResponse({"ok": True})
 
     if low.startswith("/delru"):
@@ -292,11 +264,8 @@ async def handle_update(update: dict) -> JSONResponse:
         if not who:
             tg_send_message(chat_id, "Формат: /delru 203999 или /delru Nikola Jokic")
             return JSONResponse({"ok": True})
-        rec = None
-        if who.isdigit():
-            rec = get_player_by_id(int(who))
-        if not rec:
-            rec = find_player_by_name(who)
+        from data import find_player_by_name as _find, get_player_by_id as _get
+        rec = _get(int(who)) if who.isdigit() else _find(who)
         if not rec:
             tg_send_message(chat_id, "Игрок не найден.")
             return JSONResponse({"ok": True})
@@ -314,7 +283,8 @@ async def handle_update(update: dict) -> JSONResponse:
         if not who:
             tg_send_message(chat_id, "Формат: /name Nikola Jokic")
             return JSONResponse({"ok": True})
-        rec = find_player_by_name(who)
+        from data import find_player_by_name as _find
+        rec = _find(who)
         if not rec:
             tg_send_message(chat_id, "Игрок не найден.")
             return JSONResponse({"ok": True})
@@ -322,7 +292,28 @@ async def handle_update(update: dict) -> JSONResponse:
         tg_send_message(chat_id, f"{rec['full_name']}  →  «{ru}» (team: {rec['team_name']})")
         return JSONResponse({"ok": True})
 
-    # 2a) /alias
+    if low.startswith("/resolve"):
+        # принудительно подтянуть имя со sports.ru и сохранить
+        if not is_admin(user_id):
+            tg_send_message(chat_id, "Команда доступна только редакторам.")
+            return JSONResponse({"ok": True})
+        who = text.split(" ",1)[1].strip() if " " in text else ""
+        if not who:
+            tg_send_message(chat_id, "Формат: /resolve Nikola Jokic")
+            return JSONResponse({"ok": True})
+        from data import find_player_by_name as _find
+        rec = _find(who)
+        if not rec:
+            tg_send_message(chat_id, "Игрок не найден.")
+            return JSONResponse({"ok": True})
+        ru = sportsru_force(rec["id"], rec["full_name"])
+        if ru:
+            tg_send_message(chat_id, f"sports.ru: «{ru}». Сохранено как отображаемое имя.")
+        else:
+            tg_send_message(chat_id, "Не удалось получить имя со sports.ru.")
+        return JSONResponse({"ok": True})
+
+    # /alias
     alias_pair = parse_alias(text)
     if alias_pair:
         from data import find_player_by_name as _find
@@ -338,7 +329,7 @@ async def handle_update(update: dict) -> JSONResponse:
             tg_send_message(chat_id, "Не удалось сохранить алиас.")
         return JSONResponse({"ok": True})
 
-    # 2b) /card
+    # /card
     parsed = parse_card(text)
     if not parsed:
         hint = ("Формат:\n"
@@ -349,23 +340,22 @@ async def handle_update(update: dict) -> JSONResponse:
         return JSONResponse({"ok": True})
 
     name, stats, template, note, _raw = parsed
-    player = find_player_by_name(name)
+    from data import find_player_by_name as _find
+    player = _find(name)
     if not player:
+        from data import suggest_players
         suggestions = suggest_players(name, limit=5)
         if not suggestions:
             tg_send_message(chat_id, "Игрок не найден. Уточните имя.\n"
                                      "Можно задать алиас: /alias Вася = Vasilije Micic")
             return JSONResponse({"ok": True})
         kb = {"inline_keyboard": [[{"text": s["display"], "callback_data": f"pick:{s['id']}"}] for s in suggestions]}
-        tg_send_message(
-            chat_id,
-            "Игрок не найден. Возможно, вы имели в виду:",
-            reply_to_message_id=msg.get("message_id"),
-            reply_markup=kb
-        )
+        tg_send_message(chat_id, "Игрок не найден. Возможно, вы имели в виду:",
+                        reply_to_message_id=msg.get("message_id"), reply_markup=kb)
         return JSONResponse({"ok": True})
 
-    # нашли игрока — рендерим
+    # рендер
+    from data import ensure_team_logo_png, ensure_headshot_png
     logo_path, team_colors = ensure_team_logo_png(player["team_id"])
     head_path = ensure_headshot_png(player["id"], player["full_name"])
 
@@ -384,28 +374,16 @@ async def handle_update(update: dict) -> JSONResponse:
         tg_send_message(chat_id, f"Ошибка отправки изображения: {resp}")
     return JSONResponse({"ok": True})
 
-# ---------- health / debug ----------
-
+# --- health / service ---
 @app.get("/")
 @app.get("/api/telegram")
 @app.get("/api/telegram/healthz")
-def health(
-    action: Optional[str] = Query(default=None),
-    secret: str = Query(default=""),
-    drop_cache: int = Query(default=0),
-    debug: int = Query(default=0),
-):
-    """
-    GET /api/telegram
-    - без параметров: здоровье + players_indexed
-    - ?action=refresh&secret=...&drop_cache=1 : удаляет /tmp кэш и перечитывает локальный assets/players.json (или SNAPSHOT_URL)
-    - ?debug=1 : возвращает подробности ошибок в JSON
-    """
+def health(action: Optional[str] = Query(default=None), secret: str = Query(default=""), drop_cache: int = Query(default=0)):
     try:
         from data import players_count
         count_before = players_count()
-    except Exception as e:
-        return _json_exc(e) if debug else {"ok": False, "error": "players_count failed"}
+    except Exception:
+        count_before = -1
 
     if action == "refresh":
         if secret != WEBHOOK_SECRET:
@@ -417,60 +395,35 @@ def health(
                     os.remove(str(data.PLAYERS_CACHE))
                 except Exception:
                     pass
-            importlib.reload(data)  # пересобираем индекс
+            importlib.reload(data)
             cnt = data.players_count()
             return {"ok": True, "refreshed": True, "players_indexed": cnt}
         except Exception as e:
-            return _json_exc(e) if debug else {"ok": False, "refreshed": False, "error": "refresh failed"}
+            return _json_exc(e)
 
     return {
         "ok": True,
         "players_indexed": count_before,
         "endpoints": [
-            "GET  /api/telegram (action=refresh&secret=...&drop_cache=1&debug=1)",
-            "GET  /api/debug/players_snapshot",
+            "GET  /api/telegram (action=refresh&secret=...&drop_cache=1)",
             "GET  /api/telegram/selftest",
             "POST /api/telegram?secret=...  (Telegram webhook)",
             "POST /api/telegram/webhook/<secret>",
         ],
     }
 
-@app.get("/api/debug/players_snapshot")
-def debug_players_snapshot():
-    try:
-        from pathlib import Path
-        p = (Path(__file__).resolve().parent.parent / "assets" / "players.json")
-        if not p.exists():
-            return {"exists": False}
-        return {"exists": True, "size": p.stat().st_size}
-    except Exception as e:
-        return _json_exc(e)
-
 @app.get("/api/telegram/selftest")
 def selftest():
     try:
         import data
-        from pathlib import Path
-
-        res = {}
-        p = (Path(__file__).resolve().parent.parent / "assets" / "players.json")
-        res["assets_players_json_exists"] = p.exists()
-        res["assets_players_json_size"]   = p.stat().st_size if p.exists() else 0
-
-        try:
-            res["players_before"] = data.players_count()
-        except Exception as e:
-            res["players_before_error"] = repr(e)
-
+        res = {"players_before": data.players_count()}
         importlib.reload(data)
         res["players_after"] = data.players_count()
-
         return {"ok": True, **res}
     except Exception as e:
         return _json_exc(e)
 
-# ---------- webhook ----------
-
+# --- webhook ---
 @app.post("/")
 @app.post("/api/telegram")
 async def webhook_query(request: Request, secret: str = Query(default="")):
