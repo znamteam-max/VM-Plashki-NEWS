@@ -1,20 +1,27 @@
-name: Sync NBA players.json
+name: Sync NBA active players → assets/players.json
 
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "17 3 * * *"  # раз в день 03:17 UTC
-
-permissions:
-  contents: write
+    - cron: "17 2 * * *"  # ежедневно 05:17 по Москве / 04:17 по Хельсинки
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    permissions:
+      contents: write
+    env:
+      BL_API_KEY: ${{ secrets.BL_API_KEY }}
+      GIT_AUTHOR_NAME: "bot"
+      GIT_AUTHOR_EMAIL: "bot@users.noreply.github.com"
+      GIT_COMMITTER_NAME: "bot"
+      GIT_COMMITTER_EMAIL: "bot@users.noreply.github.com"
 
-      - name: Setup Python
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -22,140 +29,18 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests Unidecode
 
-      - name: Generate public/players.json (prefer legacy HTTP)
-        shell: bash
+      - name: Build assets/players.json
         run: |
-          python - << 'PY'
-          import json, os, requests
+          python scripts/build_players.py
 
-          def get_json(url, headers=None, timeout=30, verify=True):
-              try:
-                  r = requests.get(url, headers=headers or {}, timeout=timeout, allow_redirects=True, verify=verify)
-                  r.raise_for_status()
-                  return r.json()
-              except Exception as e:
-                  print(f"[sync] GET fail: {url} -> {type(e).__name__}: {e}", flush=True)
-                  return None
-
-          def extract_legacy_active(j):
-              if not j: return []
-              std = j.get("league", {}).get("standard", [])
-              out = []
-              for p in std:
-                  try:
-                      # в legacy JSON у активных isActive = true
-                      if not p.get("isActive"):
-                          continue
-                      pid   = str(p.get("personId") or "").strip()
-                      first = (p.get("firstName") or "").strip()
-                      last  = (p.get("lastName") or "").strip()
-                      team  = str(p.get("teamId") or "0")
-                      if pid and (first or last):
-                          out.append((pid, first, last, team))
-                  except Exception:
-                      continue
-              return out
-
-          YEARS = ["2025","2024","2023"]
-
-          # 1) Сначала пробуем legacy по HTTP (исправляет твой SSL hostname mismatch)
-          rows = []
-          for y in YEARS:
-              j = get_json(f"http://data.nba.net/prod/v1/{y}/players.json", timeout=40, verify=False)
-              cur = extract_legacy_active(j)
-              print(f"[sync] legacy HTTP {y}: active={len(cur)}", flush=True)
-              if len(cur) > len(rows):
-                  rows = cur
-          # 2) Если вдруг HTTP лег — попробуем HTTPS (меньше надежды, но пусть будет)
-          if len(rows) < 400:
-              for y in YEARS:
-                  j = get_json(f"https://data.nba.net/prod/v1/{y}/players.json", timeout=40, verify=True)
-                  cur = extract_legacy_active(j)
-                  print(f"[sync] legacy HTTPS {y}: active={len(cur)}", flush=True)
-                  if len(cur) > len(rows):
-                      rows = cur
-
-          # 3) Последний шанс — stats.nba.com (часто даёт таймауты в CI, но оставим как запасной)
-          if len(rows) < 400:
-              headers = {
-                  "Host": "stats.nba.com",
-                  "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
-                  "Referer": "https://www.nba.com/",
-                  "Origin": "https://www.nba.com",
-                  "Accept": "application/json, text/plain, */*",
-                  "x-nba-stats-origin": "stats",
-                  "x-nba-stats-token": "true",
-              }
-              seasons = ["2025-26","2024-25","2023-24"]
-              seen = set()
-              tmp = []
-              for s in seasons:
-                  j = get_json(f"https://stats.nba.com/stats/commonallplayers?LeagueID=00&Season={s}&IsOnlyCurrentSeason=1",
-                               headers=headers, timeout=40)
-                  if not j: 
-                      continue
-                  rs = None
-                  if isinstance(j.get("resultSets"), list) and j["resultSets"]:
-                      rs = j["resultSets"][0]
-                  elif isinstance(j.get("resultSet"), dict):
-                      rs = j["resultSet"]
-                  if not rs:
-                      continue
-                  hdr = rs.get("headers") or []
-                  data = rs.get("rowSet") or []
-                  idx = {h:i for i,h in enumerate(hdr)}
-                  need = ("PERSON_ID","FIRST_NAME","LAST_NAME","TEAM_ID","ROSTERSTATUS")
-                  if not all(k in idx for k in need):
-                      continue
-                  added = 0
-                  for row in data:
-                      try:
-                          if int(row[idx["ROSTERSTATUS"]] or 0) != 1:
-                              continue
-                          pid = str(row[idx["PERSON_ID"]])
-                          if pid in seen: 
-                              continue
-                          seen.add(pid)
-                          first = (row[idx["FIRST_NAME"]] or "").strip()
-                          last  = (row[idx["LAST_NAME"]]  or "").strip()
-                          team  = str(row[idx["TEAM_ID"]] or "0")
-                          tmp.append((pid, first, last, team))
-                          added += 1
-                      except Exception:
-                          continue
-                  print(f"[sync] stats {s}: added={added}, total={len(tmp)}", flush=True)
-              if len(tmp) > len(rows):
-                  rows = tmp
-
-          # Упаковка + дедуп
-          seen = set()
-          standard = []
-          for pid, first, last, team in rows:
-              if pid in seen: 
-                  continue
-              seen.add(pid)
-              standard.append({"personId": pid, "firstName": first, "lastName": last, "teamId": team})
-
-          print(f"[sync] final active players: {len(standard)}", flush=True)
-          os.makedirs("public", exist_ok=True)
-          with open("public/players.json","w",encoding="utf-8") as f:
-              json.dump({"league":{"standard":standard}}, f, ensure_ascii=False, separators=(",",":"))
-          print("[sync] wrote public/players.json", flush=True)
-          PY
-
-      - name: Commit & push (only if changed)
-        shell: bash
+      - name: Commit changes (if any)
         run: |
-          set -euo pipefail
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No changes in public/players.json"
-          else
-            git commit -m "chore: update players.json ($(date -u +'%Y-%m-%d %H:%M:%S') UTC)"
+          if git status --porcelain | grep -q "assets/players.json"; then
+            git add assets/players.json
+            git commit -m "chore: sync players.json from balldontlie + NBA IDs"
             git push
+          else
+            echo "No changes in assets/players.json"
           fi
