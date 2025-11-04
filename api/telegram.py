@@ -11,6 +11,12 @@
 # Команды в чате:
 #  /card Имя | 25 очков, 12 подборов, 3 блокшота | impact | подпись(опц.)
 #  /alias Неправильно = Правильное Имя
+#  /fixlast Jokic = Йокич
+#  /dellast Jokic
+#  /setru Nikola Jokic | Никола Йокич
+#  /delru Nikola Jokic
+#  /name Nikola Jokic
+#  /listfixes
 
 import os
 import re
@@ -33,7 +39,6 @@ STAT_PAIR_RE = re.compile(
     r"(?P<num>[-+]?\d+(?:[.,]\d+)?)\s*([%]?)\s*(?P<label>[A-Za-zА-Яа-яёЁ+\-/ ]{0,20})"
 )
 
-# ---------- утилита для компактного JSON-трейсбека ----------
 def _json_exc(e: Exception):
     tb = traceback.format_exc().splitlines()[-12:]
     return {"ok": False, "error": f"{type(e).__name__}: {e}", "trace": tb}
@@ -62,12 +67,10 @@ def parse_card(text: str):
         if m:
             num = m.group("num").replace(",", ".")
             label = (m.group("label") or "").strip()
-            # если написали "45%" без ярлыка — оставим как "%":
             if m.group(2) == "%" and not label:
                 label = "%"
             stats.append((num, label))
     return name, stats[:6], template, note, raw_stats
-
 
 def parse_alias(text: str):
     """
@@ -82,6 +85,13 @@ def parse_alias(text: str):
         return None
     return m[0].strip(), m[1].strip()
 
+def is_admin(user_id: int) -> bool:
+    try:
+        from data import ADMIN_IDS
+        return user_id in ADMIN_IDS
+    except Exception:
+        return False
+
 # ---------- Telegram helpers ----------
 
 def tg_send_png(chat_id: int, png_bytes: bytes, caption: Optional[str] = None):
@@ -93,7 +103,6 @@ def tg_send_png(chat_id: int, png_bytes: bytes, caption: Optional[str] = None):
         data["caption"] = caption
     r = requests.post(url, data=data, files=files, timeout=30)
     return r.ok, r.text
-
 
 def tg_send_message(
     chat_id: int,
@@ -113,7 +122,6 @@ def tg_send_message(
         timeout=15,
     )
 
-
 def tg_answer_callback(callback_id: str, text: str = ""):
     requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
@@ -128,7 +136,8 @@ async def handle_update(update: dict) -> JSONResponse:
     from graphics import render_card
     from data import (
         find_player_by_name, ensure_headshot_png, ensure_team_logo_png,
-        get_player_by_id, suggest_players, add_alias
+        get_player_by_id, suggest_players, add_alias,
+        _LASTNAME_RULES, _RU_OVERRIDES, _save_overrides, _load_overrides, _ru_display_for_player
     )
 
     # 1) callback-кнопки (выбор игрока из подсказок)
@@ -188,12 +197,137 @@ async def handle_update(update: dict) -> JSONResponse:
 
     chat_id = msg["chat"]["id"]
     text = msg.get("text") or ""
+    user_id = (msg.get("from") or {}).get("id", 0)
+
+    # --- админ-команды для фиксов фамилий/имён ---
+    low = text.strip().lower()
+
+    if low.startswith("/listfixes"):
+        if not is_admin(user_id):
+            tg_send_message(chat_id, "Команда доступна только редакторам.")
+            return JSONResponse({"ok": True})
+        _load_overrides()
+        lines = ["• Фамилии:"]
+        if _LASTNAME_RULES:
+            for k,v in sorted(_LASTNAME_RULES.items()):
+                lines.append(f"  {k} → {v}")
+        else:
+            lines.append("  (пусто)")
+        lines.append("• Точечные имена:")
+        if _RU_OVERRIDES:
+            limit = 60
+            items = list(_RU_OVERRIDES.items())
+            for pid,ru in items[:limit]:
+                lines.append(f"  {pid} → {ru}")
+            if len(items) > limit:
+                lines.append(f"  ... и ещё {len(items)-limit}")
+        else:
+            lines.append("  (пусто)")
+        tg_send_message(chat_id, "\n".join(lines))
+        return JSONResponse({"ok": True})
+
+    if low.startswith("/fixlast"):
+        if not is_admin(user_id):
+            tg_send_message(chat_id, "Команда доступна только редакторам.")
+            return JSONResponse({"ok": True})
+        body = text.split(" ",1)[1] if " " in text else ""
+        parts = [p.strip() for p in body.split("=",1)]
+        if len(parts)!=2 or not parts[0] or not parts[1]:
+            tg_send_message(chat_id, "Формат: /fixlast Jokic = Йокич")
+            return JSONResponse({"ok": True})
+        latin_last = parts[0].lower()
+        ru_last    = parts[1]
+        _LASTNAME_RULES[latin_last] = ru_last
+        _save_overrides()
+        tg_send_message(chat_id, f"Ок. Правило фамилии: {latin_last} → {ru_last}\n"
+                                 f"Новые карточки будут учитывать это автоматически.")
+        return JSONResponse({"ok": True})
+
+    if low.startswith("/dellast"):
+        if not is_admin(user_id):
+            tg_send_message(chat_id, "Команда доступна только редакторам.")
+            return JSONResponse({"ok": True})
+        body = text.split(" ",1)[1] if " " in text else ""
+        k = body.strip().lower()
+        if not k:
+            tg_send_message(chat_id, "Формат: /dellast Jokic")
+            return JSONResponse({"ok": True})
+        removed = _LASTNAME_RULES.pop(k, None)
+        _save_overrides()
+        if removed is not None:
+            tg_send_message(chat_id, f"Правило {k} удалено.")
+        else:
+            tg_send_message(chat_id, "Такого правила нет.")
+        return JSONResponse({"ok": True})
+
+    if low.startswith("/setru"):
+        if not is_admin(user_id):
+            tg_send_message(chat_id, "Команда доступна только редакторам.")
+            return JSONResponse({"ok": True})
+        body = text.split(" ",1)[1] if " " in text else ""
+        parts = [p.strip() for p in body.split("|",1)]
+        if len(parts)!=2:
+            tg_send_message(chat_id, "Формат: /setru Nikola Jokic | Никола Йокич\nили: /setru 203999 | Никола Йокич")
+            return JSONResponse({"ok": True})
+        who, new_ru = parts[0], parts[1]
+        rec = None
+        if who.isdigit():
+            rec = get_player_by_id(int(who))
+        if not rec:
+            rec = find_player_by_name(who)
+        if not rec:
+            tg_send_message(chat_id, "Игрок не найден.")
+            return JSONResponse({"ok": True})
+        pid = str(rec["id"])
+        _RU_OVERRIDES[pid] = new_ru
+        _save_overrides()
+        tg_send_message(chat_id, f"Ок. {rec['full_name']} теперь отображается как «{new_ru}».")
+        return JSONResponse({"ok": True})
+
+    if low.startswith("/delru"):
+        if not is_admin(user_id):
+            tg_send_message(chat_id, "Команда доступна только редакторам.")
+            return JSONResponse({"ok": True})
+        who = text.split(" ",1)[1].strip() if " " in text else ""
+        if not who:
+            tg_send_message(chat_id, "Формат: /delru 203999 или /delru Nikola Jokic")
+            return JSONResponse({"ok": True})
+        rec = None
+        if who.isdigit():
+            rec = get_player_by_id(int(who))
+        if not rec:
+            rec = find_player_by_name(who)
+        if not rec:
+            tg_send_message(chat_id, "Игрок не найден.")
+            return JSONResponse({"ok": True})
+        pid = str(rec["id"])
+        if pid in _RU_OVERRIDES:
+            _RU_OVERRIDES.pop(pid, None)
+            _save_overrides()
+            tg_send_message(chat_id, f"RU-override для {rec['full_name']} удалён.")
+        else:
+            tg_send_message(chat_id, "Override для этого игрока не найден.")
+        return JSONResponse({"ok": True})
+
+    if low.startswith("/name"):
+        who = text.split(" ",1)[1].strip() if " " in text else ""
+        if not who:
+            tg_send_message(chat_id, "Формат: /name Nikola Jokic")
+            return JSONResponse({"ok": True})
+        rec = find_player_by_name(who)
+        if not rec:
+            tg_send_message(chat_id, "Игрок не найден.")
+            return JSONResponse({"ok": True})
+        ru = _ru_display_for_player(rec["full_name"], rec["id"])
+        tg_send_message(chat_id, f"{rec['full_name']}  →  «{ru}» (team: {rec['team_name']})")
+        return JSONResponse({"ok": True})
 
     # 2a) /alias
     alias_pair = parse_alias(text)
     if alias_pair:
+        from data import find_player_by_name as _find
         alias_text, correct_text = alias_pair
-        target = find_player_by_name(correct_text)
+        target = _find(correct_text)
         if not target:
             tg_send_message(chat_id, "Не нашёл игрока справа от '='. Пример:\n/alias Швед = Alexey Shved")
             return JSONResponse({"ok": True})
@@ -217,7 +351,6 @@ async def handle_update(update: dict) -> JSONResponse:
     name, stats, template, note, _raw = parsed
     player = find_player_by_name(name)
     if not player:
-        # подсказки
         suggestions = suggest_players(name, limit=5)
         if not suggestions:
             tg_send_message(chat_id, "Игрок не найден. Уточните имя.\n"
@@ -265,10 +398,9 @@ def health(
     """
     GET /api/telegram
     - без параметров: здоровье + players_indexed
-    - ?action=refresh&secret=...&drop_cache=1 : удаляет /tmp кэш и перечитывает локальный assets/players.json
+    - ?action=refresh&secret=...&drop_cache=1 : удаляет /tmp кэш и перечитывает локальный assets/players.json (или SNAPSHOT_URL)
     - ?debug=1 : возвращает подробности ошибок в JSON
     """
-    # пробуем посчитать игроков
     try:
         from data import players_count
         count_before = players_count()
@@ -285,7 +417,7 @@ def health(
                     os.remove(str(data.PLAYERS_CACHE))
                 except Exception:
                     pass
-            importlib.reload(data)
+            importlib.reload(data)  # пересобираем индекс
             cnt = data.players_count()
             return {"ok": True, "refreshed": True, "players_indexed": cnt}
         except Exception as e:
@@ -321,18 +453,15 @@ def selftest():
         from pathlib import Path
 
         res = {}
-        # наличие снапшота в билде
         p = (Path(__file__).resolve().parent.parent / "assets" / "players.json")
         res["assets_players_json_exists"] = p.exists()
         res["assets_players_json_size"]   = p.stat().st_size if p.exists() else 0
 
-        # сколько игроков видит сейчас
         try:
             res["players_before"] = data.players_count()
         except Exception as e:
             res["players_before_error"] = repr(e)
 
-        # принудительная перезагрузка модуля data
         importlib.reload(data)
         res["players_after"] = data.players_count()
 
