@@ -1,6 +1,7 @@
 # data.py
 from __future__ import annotations
-import os, json, time, ssl, traceback
+
+import os, json, time, ssl, traceback, random
 from typing import Any, Dict, List, Tuple, Optional
 from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
 from urllib.request import Request, urlopen
@@ -9,33 +10,48 @@ from urllib.error import URLError, HTTPError
 # ============================= ENV =============================
 PLAYERS_SEASON = os.getenv("PLAYERS_SEASON", "2025-26").strip()
 
-# 1) Основной источник (твой воркер / любой прокси). Можно выключить целиком.
+# 1) Основной источник (ваши воркеры / прокси). Можно выключить целиком.
 PLAYERS_USE_CUSTOM = os.getenv("PLAYERS_USE_CUSTOM", "1") == "1"
-PLAYERS_CUSTOM_URL = os.getenv("PLAYERS_CUSTOM_URL", "").strip() or \
-    f"https://nba-players-proxy.znamteam-903.workers.dev/?season={PLAYERS_SEASON}"
+# Один URL (наследие)
+PLAYERS_CUSTOM_URL = os.getenv("PLAYERS_CUSTOM_URL", "").strip()
+# Пул зеркал — через запятую. Будет использован в порядке перечисления.
+PLAYERS_CUSTOM_URLS = [
+    u.strip() for u in os.getenv("PLAYERS_CUSTOM_URLS", "").split(",") if u.strip()
+]
+
+# Если ни один не указан — подставим дефолтный воркер из старой версии
+if not PLAYERS_CUSTOM_URL and not PLAYERS_CUSTOM_URLS:
+    PLAYERS_CUSTOM_URL = f"https://nba-players-proxy.znamteam-903.workers.dev/?season={PLAYERS_SEASON}"
 
 # Таймауты/ретраи для custom
 CUSTOM_ATTEMPTS = int(os.getenv("PLAYERS_CUSTOM_ATTEMPTS", "3"))
-CUSTOM_BASE_TIMEOUT = int(os.getenv("PLAYERS_CUSTOM_TIMEOUT", "30"))  # сек: 30, 40, 50...
+CUSTOM_BASE_TIMEOUT = int(os.getenv("PLAYERS_CUSTOM_TIMEOUT", "30"))  # сек
+# Множитель экспоненциального бэкоффа
+CUSTOM_BACKOFF_MULT = float(os.getenv("PLAYERS_BACKOFF_MULT", "1.7"))
+# Верхняя граница случайного джиттера между ретраями (сек)
+CUSTOM_JITTER_MAX = float(os.getenv("PLAYERS_JITTER_MAX", "0.8"))
 
-# 2) Legacy (data.nba.net) по умолчанию ВЫКЛ — он мёртв/ломает SSL/даёт 400
+# 2) Legacy (data.nba.net) по умолчанию ВЫКЛ
 ALLOW_LEGACY_FALLBACK = os.getenv("PLAYERS_ALLOW_LEGACY", "0") == "1"
 ALLOW_INSECURE_SSL_LEGACY = os.getenv("PLAYERS_INSECURE_SSL", "0") == "1"
 LEGACY_URL = os.getenv("PLAYERS_LEGACY_URL",
     "https://data.nba.net/data/10s/prod/v1/2025/players.json")
 
-# 3) Удалённые снапшоты (список URL через запятую): raw GitHub/Gist/S3 и т.п.
-# Формат: ЛИБО NBA resultSets, ЛИБО {"league":{"standard":[...]}}
+# 3) Удалённые снапшоты (список URL через запятую)
 PLAYERS_SNAPSHOT_URLS = [u.strip() for u in os.getenv("PLAYERS_SNAPSHOT_URLS", "").split(",") if u.strip()]
 
-# 4) Локальный снапшот как «последняя страховка»
+# 4) Локальный снапшот
 DISABLE_LOCAL_SNAPSHOT = os.getenv("PLAYERS_DISABLE_LOCAL", "0") == "1"
 
 # 5) Прочее
-MIN_EXPECTED = int(os.getenv("PLAYERS_MIN_EXPECTED", "350"))  # минимально «адекватная» выборка
-CACHE_TTL_SEC = int(os.getenv("PLAYERS_CACHE_TTL", "43200"))  # 12h
+MIN_EXPECTED = int(os.getenv("PLAYERS_MIN_EXPECTED", "350"))   # минимально «адекватная» выборка
+CACHE_TTL_SEC = int(os.getenv("PLAYERS_CACHE_TTL", "43200"))   # 12h
 PHOTO_FMT = os.getenv("PLAYERS_PHOTO_FMT",
     "https://cdn.nba.com/headshots/nba/latest/1040x760/{personId}.png")
+
+# Строгая проверка типа содержимого (application/json). По умолчанию выключено,
+# т.к. прокси иногда отдают text/plain.
+REQUIRE_JSON_CT = os.getenv("PLAYERS_REQUIRE_JSON_CT", "0") == "1"
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(ROOT_DIR, "assets")
@@ -57,6 +73,13 @@ def _with_query(url: str, **extra: str) -> str:
     q.update({k: v for k, v in extra.items() if v is not None})
     return urlunparse(pr._replace(query=urlencode(q)))
 
+def _ensure_season_qs(u: str) -> str:
+    if not u:
+        return u
+    if "season=" not in u:
+        return _with_query(u, season=PLAYERS_SEASON)
+    return u
+
 def _safe_str(x: Any) -> str:
     return "" if x is None else str(x)
 
@@ -75,32 +98,96 @@ def _http_get_json(url: str, timeout: int = 30, verify_ssl: bool = True) -> Any:
     ctx = None
     if not verify_ssl:
         ctx = ssl._create_unverified_context()
-    # Важные заголовки (некоторые прокси/серверы тупят на gzip/chunked)
+
+    # Правдоподобные заголовки; identity — чтобы избежать проблем с чанками/сервером.
     req = Request(url, headers={
         "User-Agent": "Mozilla/5.0 (players-fetch; like Gecko)",
         "Accept": "application/json,text/plain,*/*",
-        "Accept-Encoding": "identity",   # без gzip/deflate
+        "Accept-Encoding": "identity",
         "Connection": "close",
         "Origin": "https://www.nba.com",
         "Referer": "https://www.nba.com/",
+        "DNT": "1",
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
     })
-    with urlopen(req, timeout=timeout, context=ctx) as resp:
-        raw = resp.read()
+
+    t0 = time.time()
+    try:
+        with urlopen(req, timeout=timeout, context=ctx) as resp:
+            raw = resp.read()
+            elapsed = (time.time() - t0)
+            ct = resp.headers.get("Content-Type", "")
+            clen = len(raw) if raw is not None else 0
+
+            # Иногда приходит HTML (Cloudflare/бан). Отражаем в лог и кидаем исключение.
+            if REQUIRE_JSON_CT and ("json" not in ct.lower()):
+                _log(f"non-JSON CT '{ct}' from {url} ({clen} bytes, {elapsed:.2f}s)")
+                raise ValueError(f"Non-JSON Content-Type: {ct}")
+
+            # Быстрый эвристический чек на HTML
+            if clen > 0 and raw[:1] in (b"<", b"\n") and b"<html" in raw[:512].lower():
+                head = raw[:160].decode("utf-8", errors="ignore")
+                _log(f"html-like response head from {url}: {head!r}")
+                raise ValueError("HTML body received (likely blocked)")
+
+    except HTTPError as e:
+        # Прочитаем немного тела для диагностики
+        body = b""
+        try:
+            body = e.read(256)  # не больше 256 байт
+        except Exception:
+            pass
+        head = body.decode("utf-8", errors="ignore")
+        _log(f"HTTP {e.code} {e.reason} from {url} in {time.time()-t0:.2f}s; head={head!r}")
+        raise
+    except URLError as e:
+        _log(f"URL Error {repr(e)} from {url} in {time.time()-t0:.2f}s")
+        raise
+    except TimeoutError as e:
+        _log(f"Timeout after {timeout}s from {url}")
+        raise
+    except Exception as e:
+        _log(f"_http_get_json error {repr(e)} from {url} in {time.time()-t0:.2f}s")
+        raise
+
+    # Парс JSON
     try:
         return json.loads(raw.decode("utf-8"))
     except Exception:
         return json.loads(raw)
 
+def _sleep_with_backoff(i: int) -> None:
+    # экспоненциальный рост + джиттер
+    base = (CUSTOM_BACKOFF_MULT ** max(0, i)) * 0.6  # мягкая кривая
+    jitter = random.random() * CUSTOM_JITTER_MAX
+    time.sleep(min(5.0, base + jitter))
+
 def _get_json_with_retries(url: str, attempts: int, base_timeout: int, verify_ssl: bool = True) -> Any:
     last_err: Optional[BaseException] = None
     for i in range(attempts):
         try:
-            j = _http_get_json(url, timeout=base_timeout + i * 10, verify_ssl=verify_ssl)
-            return j
+            timeout = int(base_timeout + i * 10)
+            return _http_get_json(url, timeout=timeout, verify_ssl=verify_ssl)
+        except HTTPError as e:
+            last_err = e
+            # 429/5xx — есть смысл ретраить; прочие 4xx — обычно бесполезно (меняем зеркало)
+            if e.code in (429, 500, 502, 503, 504):
+                _log(f"retryable HTTP {e.code} on {url}; retry {i+1}/{attempts}")
+                _sleep_with_backoff(i)
+                continue
+            else:
+                _log(f"non-retryable HTTP {e.code} on {url}; breaking")
+                break
+        except (TimeoutError, URLError, ValueError) as e:
+            last_err = e
+            _log(f"retry after error on {url}: {repr(e)}; retry {i+1}/{attempts}")
+            _sleep_with_backoff(i)
+            continue
         except BaseException as e:
             last_err = e
-            _log(f"fetch try {i+1}/{attempts} failed:", repr(e))
-            time.sleep(1.5 * (i + 1))
+            _log(f"non-expected error on {url}: {repr(e)}; break")
+            break
     if last_err:
         raise last_err
 
@@ -153,7 +240,7 @@ def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
             return []
 
     # Вариант 2: legacy data.nba.net
-    league_std = j.get("league", {}).get("standard")
+    league_std = j.get("league", {}).get("standard") if isinstance(j, dict) else None
     if isinstance(league_std, list):
         out: List[Dict[str, Any]] = []
         for p in league_std:
@@ -179,20 +266,38 @@ def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
 def _fetch_from_custom(url: Optional[str] = None) -> List[Dict[str, Any]]:
     if not PLAYERS_USE_CUSTOM:
         return []
-    u = (url or PLAYERS_CUSTOM_URL or "").strip()
-    if not u:
-        return []
-    if "season=" not in u:
-        u = _with_query(u, season=PLAYERS_SEASON)
-    try:
-        j = _get_json_with_retries(u, attempts=CUSTOM_ATTEMPTS, base_timeout=CUSTOM_BASE_TIMEOUT, verify_ssl=True)
-        players = _extract_players(j)
-        _log(f"custom parsed {len(players)} from {u}")
-        return players
-    except BaseException as e:
-        _log("custom fetch error:", e)
-        _log(traceback.format_exc())
-        return []
+
+    # Соберём пул кандидатов (уникальные, с season=...)
+    candidates: List[str] = []
+    if url:
+        candidates.append(url.strip())
+    if PLAYERS_CUSTOM_URL:
+        candidates.append(PLAYERS_CUSTOM_URL.strip())
+    candidates.extend(PLAYERS_CUSTOM_URLS)
+    # Уникальность и нормализация season
+    seen = set()
+    normalized: List[str] = []
+    for u in candidates:
+        if not u:
+            continue
+        u = _ensure_season_qs(u)
+        if u not in seen:
+            seen.add(u)
+            normalized.append(u)
+
+    for u in normalized:
+        try:
+            j = _get_json_with_retries(u, attempts=CUSTOM_ATTEMPTS, base_timeout=CUSTOM_BASE_TIMEOUT, verify_ssl=True)
+            players = _extract_players(j)
+            _log(f"custom parsed {len(players)} from {u}")
+            if players:
+                return players
+        except BaseException as e:
+            _log(f"custom fetch error ({u}):", repr(e))
+            _log(traceback.format_exc())
+            # переключаемся на следующее зеркало
+            continue
+    return []
 
 def _fetch_from_legacy() -> List[Dict[str, Any]]:
     if not ALLOW_LEGACY_FALLBACK:
@@ -206,13 +311,13 @@ def _fetch_from_legacy() -> List[Dict[str, Any]]:
     except BaseException as e:
         msg = repr(e)
         _log("legacy fetch error:", msg)
-        # попытка http/insecure — только если явно разрешили
+        # Попытка http/insecure — только если явно разрешили
         if "CERTIFICATE_VERIFY_FAILED" in msg or isinstance(e, URLError):
             http_url = "http://" + url[len("https://"):] if url.startswith("https://") else url
             try:
-                j2 = _get_json_with_retries(http_url, attempts=2, base_timeout=15, verify_ssl=ALLOW_INSECURE_SSL_LEGACY is False)
+                j2 = _get_json_with_retries(http_url, attempts=2, base_timeout=15, verify_ssl=not ALLOW_INSECURE_SSL_LEGACY)
                 p2 = _extract_players(j2)
-                _log(f"legacy (http{' insecure' if not ALLOW_INSECURE_SSL_LEGACY else ''}) parsed {len(p2)} from {http_url}")
+                _log(f"legacy (http{' insecure' if ALLOW_INSECURE_SSL_LEGACY else ''}) parsed {len(p2)} from {http_url}")
                 return p2
             except BaseException as e2:
                 _log("legacy http fallback failed:", repr(e2))
@@ -264,7 +369,7 @@ def _load_overrides() -> Dict[str, Dict[str, Any]]:
 
 def _apply_overrides(players: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ov = _load_overrides()
-    by_id = {p["personId"]: dict(p) for p in (players or [])}
+    by_id = {p.get("personId",""): dict(p) for p in (players or []) if p.get("personId")}
     if ov:
         for pid, patch in ov.items():
             if pid in by_id:
@@ -322,7 +427,7 @@ def _valid_cache(ts: float) -> bool:
 
 def _build_from_sources() -> Tuple[List[Dict[str, Any]], str]:
     """
-    Порядок (новый): custom → remote snapshots → (опционально) legacy → local
+    Порядок: custom → remote snapshots → (опционально) legacy → local → лучший partial
     """
     # 1) custom
     custom = _fetch_from_custom()
@@ -339,12 +444,12 @@ def _build_from_sources() -> Tuple[List[Dict[str, Any]], str]:
     if leg and len(leg) >= MIN_EXPECTED:
         return leg, "legacy"
 
-    # 4) локальный снапшот
+    # 4) локальный снапшот (может быть мал/устаревшим, но лучше нуля)
     loc = _fetch_local_snapshot()
     if loc and len(loc) > 0:
         return loc, "local"
 
-    # 5) хоть что-то из того, что удалось частично
+    # 5) хоть что-то частичное
     best = custom if len(custom) >= len(rem) else rem
     if len(leg) > len(best): best = leg
     if len(loc) > len(best): best = loc
@@ -438,7 +543,7 @@ def find_player_by_name(query: str) -> List[Dict[str, Any]]:
             res.append(p)
     return res
 
-# совместимость
+# Совместимость
 def players_count(force_refresh: bool = False) -> int:
     return len(get_players(force_refresh=force_refresh))
 
@@ -452,3 +557,15 @@ __all__ = [
     "get_players", "get_players_index", "refresh_players", "drop_players_cache",
     "find_player_by_name", "players_count", "players", "players_index"
 ]
+
+# ============================= self-test =============================
+if __name__ == "__main__":
+    try:
+        n = players_count(force_refresh=True)
+        src = "unknown"
+        # Попробуем подсмотреть последний лог source из кеша
+        if _CACHED.get("players"):
+            src = "memory"
+        print(f"[players] SELFTEST: count={n}, cache={'hit' if _CACHED.get('players') else 'miss'}")
+    except Exception as e:
+        print("[players] SELFTEST ERROR:", repr(e))
