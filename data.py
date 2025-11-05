@@ -1,11 +1,5 @@
 # data.py
-# Универсальный источник игроков NBA для /api/telegram
-# Поддерживает:
-# - stats.nba.com proxied (CommonAllPlayers через Cloudflare Worker)
-# - legacy data.nba.net (опционально)
-# - локальный снапшот (опционально)
-# - оверрайды (assets/players_overrides.json и/или PLAYERS_OVERRIDES_JSON)
-# - кэш в памяти и на диске (/tmp)
+# Универсальный источник игроков NBA для /api/telegram и др. хэндлеров.
 
 from __future__ import annotations
 import os
@@ -23,16 +17,16 @@ MIN_EXPECTED             = int(os.getenv("PLAYERS_MIN_EXPECTED", "350"))
 DISABLE_LOCAL_SNAPSHOT   = os.getenv("PLAYERS_DISABLE_LOCAL", "1") == "1"
 CACHE_TTL_SEC            = int(os.getenv("PLAYERS_CACHE_TTL", "3600"))
 PHOTO_FMT                = os.getenv("PLAYERS_PHOTO_FMT", "https://cdn.nba.com/headshots/nba/latest/1040x760/{personId}.png")
-LEGACY_URL               = os.getenv("PLAYERS_LEGACY_URL", "https://data.nba.net/data/10s/prod/v1/2025/players.json")  # на всякий
+LEGACY_URL               = os.getenv("PLAYERS_LEGACY_URL", "https://data.nba.net/data/10s/prod/v1/2025/players.json")
 
-# Путь к локальным файлам
+# Пути
 ROOT_DIR        = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR      = os.path.join(ROOT_DIR, "assets")
 LOCAL_SNAPSHOT  = os.path.join(ASSETS_DIR, "players.json")
 OVERRIDES_FILE  = os.path.join(ASSETS_DIR, "players_overrides.json")
 CACHE_PATH      = os.path.join("/tmp", "players_cache.json")
 
-# Модульный кэш
+# Кэш
 _CACHED: Dict[str, Any] = {
     "ts": 0.0,
     "players": None,   # type: Optional[List[Dict[str, Any]]]
@@ -72,19 +66,19 @@ def _write_json_file(path: str, data: Any) -> None:
 def _safe_str(x: Any) -> str:
     return "" if x is None else str(x)
 
-# --------- Парсеры источников ---------
+# --------- Парсеры ---------
 def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Универсальный парсер:
-    - stats.nba.com (proxied CommonAllPlayers): resultSets[0] -> headers/rowSet
-    - legacy data.nba.net: league.standard
-    Возвращает список словарей:
+    Поддерживаем:
+      - stats.nba.com (proxied CommonAllPlayers): resultSets[0] -> headers/rowSet
+      - legacy data.nba.net: league.standard
+    Выход:
       {personId, firstName, lastName, teamId, isActive}
     """
     if not j:
         return []
 
-    # Proxied stats.nba.com (CommonAllPlayers)
+    # Proxied stats.nba.com
     if "resultSets" in j:
         try:
             rs = j["resultSets"][0]
@@ -105,7 +99,7 @@ def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
                 personId = _safe_str(row[pid_i])
                 teamId   = _safe_str(row[tid_i] or "0")
 
-                # ROSTERSTATUS часто "1"/"0"
+                # ROSTERSTATUS ("1"/"0" или булево)
                 isActive = True
                 if act_i is not None:
                     try:
@@ -202,12 +196,12 @@ def _fetch_local_snapshot() -> List[Dict[str, Any]]:
 # --------- Оверрайды ---------
 def _load_overrides() -> Dict[str, Dict[str, Any]]:
     """
-    Источник правок:
-      1) ENV PLAYERS_OVERRIDES_JSON — строка JSON (приоритет)
-      2) assets/players_overrides.json — файл в репозитории
-    Формат на игрока (personId строкой):
-      {"1627783": {"teamId": "1610612754", "photo": "...", "firstName": "...", "lastName": "..."}}
-    Можно добавлять кастомных игроков с новым personId, но лучше опираться на реальные PERSON_ID.
+    Источники:
+      1) ENV PLAYERS_OVERRIDES_JSON (приоритет)
+      2) assets/players_overrides.json
+    Формат:
+      {"1627783": {"teamId":"1610612754","photo":"...","firstName":"...","lastName":"...","isActive":true}}
+    Можно добавлять кастомные personId (строкой).
     """
     env_raw = os.getenv("PLAYERS_OVERRIDES_JSON", "").strip()
     if env_raw:
@@ -226,11 +220,20 @@ def _load_overrides() -> Dict[str, Dict[str, Any]]:
 def _apply_overrides(players: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ov = _load_overrides()
     if not ov:
-        return players
+        # заполним фото и displayName
+        out = []
+        for p in players:
+            q = dict(p)
+            if not q.get("photo"):
+                q["photo"] = PHOTO_FMT.format(personId=q["personId"])
+            fn = q.get("firstName","").strip()
+            ln = q.get("lastName","").strip()
+            q["displayName"] = (fn + " " + ln).strip()
+            out.append(q)
+        return out
 
     by_id: Dict[str, Dict[str, Any]] = {p["personId"]: dict(p) for p in players}
 
-    # применяем правки к существующим игрокам
     for pid, patch in ov.items():
         if pid in by_id:
             base = by_id[pid]
@@ -240,7 +243,6 @@ def _apply_overrides(players: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if "isActive"  in patch: base["isActive"]  = bool(patch["isActive"])
             if "photo"     in patch: base["photo"]     = _safe_str(patch["photo"]).strip()
         else:
-            # кастомный игрок (если вдруг нужен)
             add = {
                 "personId": pid,
                 "firstName": _safe_str(patch.get("firstName", "")),
@@ -252,30 +254,23 @@ def _apply_overrides(players: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 add["photo"] = _safe_str(patch["photo"])
             by_id[pid] = add
 
-    # фото по умолчанию — если нет переопределения
     for p in by_id.values():
         if not p.get("photo"):
             p["photo"] = PHOTO_FMT.format(personId=p["personId"])
-
-        # displayName для удобства
         fn = p.get("firstName", "").strip()
         ln = p.get("lastName", "").strip()
         p["displayName"] = (fn + " " + ln).strip() if (fn or ln) else p.get("displayName", "")
 
     return list(by_id.values())
 
-# --------- Сборка индекса ---------
+# --------- Сборка ---------
 def _build_index() -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
-    batches: List[Dict[str, Any]] = []
-
-    # Принудительный источник?
-    source = PLAYERS_ENFORCE_SOURCE
-    if source == "stats":
+    # Выбор источника
+    if PLAYERS_ENFORCE_SOURCE == "stats":
         batches = _fetch_from_custom()
-    elif source == "legacy":
+    elif PLAYERS_ENFORCE_SOURCE == "legacy":
         batches = _fetch_from_legacy()
     else:
-        # smart order: custom -> (local?) -> legacy
         batches = _fetch_from_custom()
         if not batches and not DISABLE_LOCAL_SNAPSHOT:
             _log("custom empty — try local snapshot")
@@ -288,10 +283,7 @@ def _build_index() -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
         _log("no players parsed from any source")
         return [], {}
 
-    # Применяем оверрайды и фото
     players = _apply_overrides(batches)
-
-    # Индекс по personId
     index = {p["personId"]: p for p in players}
 
     _log(f"custom total parsed (after overrides): {len(players)}")
@@ -324,16 +316,11 @@ def _save_cache_to_disk(players: List[Dict[str, Any]]) -> None:
 def _valid_cache(ts: float) -> bool:
     return (time.time() - ts) < CACHE_TTL_SEC
 
-# --------- Публичные API-функции ---------
+# --------- Публичные API ---------
 def get_players(force_refresh: bool = False) -> List[Dict[str, Any]]:
-    """
-    Возвращает список игроков (с оверрайдами), кэшируемый.
-    """
-    # память
     if not force_refresh and _CACHED["players"] and _valid_cache(_CACHED["ts"]):
         return _CACHED["players"]
 
-    # диск
     if not force_refresh:
         disk = _load_cache_from_disk()
         if disk:
@@ -344,7 +331,6 @@ def get_players(force_refresh: bool = False) -> List[Dict[str, Any]]:
                 _CACHED["ts"] = ts
                 return players
 
-    # билд
     players, index = _build_index()
     _CACHED["players"] = players
     _CACHED["index"] = index
@@ -354,30 +340,20 @@ def get_players(force_refresh: bool = False) -> List[Dict[str, Any]]:
     return players
 
 def get_players_index(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
-    """
-    Возвращает индекс игроков по personId.
-    """
     if not force_refresh and _CACHED["index"] and _valid_cache(_CACHED["ts"]):
         return _CACHED["index"]
-
     players = get_players(force_refresh=force_refresh)
     index = {p["personId"]: p for p in players}
     _CACHED["index"] = index
     return index
 
 def refresh_players(drop_cache: bool = False) -> Tuple[int, Dict[str, Any]]:
-    """
-    Принудительно обновляет кэш списка игроков.
-    """
     if drop_cache:
         drop_players_cache()
     players = get_players(force_refresh=True)
     return len(players), {"ok": True, "players_indexed": len(players)}
 
 def drop_players_cache() -> bool:
-    """
-    Сбрасывает кэш в памяти и на диске. Экспортируется для /api/telegram?action=refresh&drop_cache=1.
-    """
     try:
         _CACHED["ts"] = 0.0
         _CACHED["players"] = None
@@ -393,7 +369,6 @@ def drop_players_cache() -> bool:
         _log("drop cache error:", e)
         return False
 
-# Удобные helper-ы (по желанию)
 def find_player_by_name(query: str) -> List[Dict[str, Any]]:
     q = (query or "").strip().lower()
     if not q:
@@ -404,3 +379,21 @@ def find_player_by_name(query: str) -> List[Dict[str, Any]]:
         if q in (name or "").lower():
             res.append(p)
     return res
+
+# --------- Совместимость (алиасы, чтобы не падали старые импорты) ---------
+def players_count(force_refresh: bool = False) -> int:
+    """Совместимый алиас: вернуть количество игроков."""
+    return len(get_players(force_refresh=force_refresh))
+
+def players(force_refresh: bool = False) -> List[Dict[str, Any]]:
+    """Совместимый алиас get_players()."""
+    return get_players(force_refresh=force_refresh)
+
+def players_index(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+    """Совместимый алиас get_players_index()."""
+    return get_players_index(force_refresh=force_refresh)
+
+__all__ = [
+    "get_players", "get_players_index", "refresh_players", "drop_players_cache",
+    "find_player_by_name", "players_count", "players", "players_index"
+]
