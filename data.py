@@ -4,29 +4,38 @@ import os, json, time, ssl, traceback
 from typing import Any, Dict, List, Tuple, Optional
 from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
 from urllib.request import Request, urlopen
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
 
-# ======== ENV ========
+# ============================= ENV =============================
 PLAYERS_SEASON = os.getenv("PLAYERS_SEASON", "2025-26").strip()
-FALLBACK_CUSTOM_URL = f"https://nba-players-proxy.znamteam-903.workers.dev/?season={PLAYERS_SEASON}"
-PLAYERS_CUSTOM_URL = (os.getenv("PLAYERS_CUSTOM_URL", "").strip() or FALLBACK_CUSTOM_URL)
 
-# Разрешить использовать legacy при недоборе?
-ALLOW_LEGACY_FALLBACK = os.getenv("PLAYERS_ALLOW_LEGACY", "1") == "1"
-# Разрешить (только для legacy) игнорировать SSL-верификацию при ошибке сертификата?
-ALLOW_INSECURE_SSL_LEGACY = os.getenv("PLAYERS_INSECURE_SSL", "1") == "1"
+# 1) Основной источник (твой воркер / любой прокси). Можно выключить целиком.
+PLAYERS_USE_CUSTOM = os.getenv("PLAYERS_USE_CUSTOM", "1") == "1"
+PLAYERS_CUSTOM_URL = os.getenv("PLAYERS_CUSTOM_URL", "").strip() or \
+    f"https://nba-players-proxy.znamteam-903.workers.dev/?season={PLAYERS_SEASON}"
 
-# Минимум адекватного количества игроков для сезона (ниже — считаем источник «плохим»)
-MIN_EXPECTED = int(os.getenv("PLAYERS_MIN_EXPECTED", "350"))
+# Таймауты/ретраи для custom
+CUSTOM_ATTEMPTS = int(os.getenv("PLAYERS_CUSTOM_ATTEMPTS", "3"))
+CUSTOM_BASE_TIMEOUT = int(os.getenv("PLAYERS_CUSTOM_TIMEOUT", "30"))  # сек: 30, 40, 50...
 
-# Локальный снапшот включён по умолчанию как «последняя страховка»
+# 2) Legacy (data.nba.net) по умолчанию ВЫКЛ — он мёртв/ломает SSL/даёт 400
+ALLOW_LEGACY_FALLBACK = os.getenv("PLAYERS_ALLOW_LEGACY", "0") == "1"
+ALLOW_INSECURE_SSL_LEGACY = os.getenv("PLAYERS_INSECURE_SSL", "0") == "1"
+LEGACY_URL = os.getenv("PLAYERS_LEGACY_URL",
+    "https://data.nba.net/data/10s/prod/v1/2025/players.json")
+
+# 3) Удалённые снапшоты (список URL через запятую): raw GitHub/Gist/S3 и т.п.
+# Формат: ЛИБО NBA resultSets, ЛИБО {"league":{"standard":[...]}}
+PLAYERS_SNAPSHOT_URLS = [u.strip() for u in os.getenv("PLAYERS_SNAPSHOT_URLS", "").split(",") if u.strip()]
+
+# 4) Локальный снапшот как «последняя страховка»
 DISABLE_LOCAL_SNAPSHOT = os.getenv("PLAYERS_DISABLE_LOCAL", "0") == "1"
 
+# 5) Прочее
+MIN_EXPECTED = int(os.getenv("PLAYERS_MIN_EXPECTED", "350"))  # минимально «адекватная» выборка
 CACHE_TTL_SEC = int(os.getenv("PLAYERS_CACHE_TTL", "43200"))  # 12h
-PHOTO_FMT = os.getenv("PLAYERS_PHOTO_FMT", "https://cdn.nba.com/headshots/nba/latest/1040x760/{personId}.png")
-
-# Исторический json (устаревший домен, но оставим — мы сделаем http-фоллбек и/или insecure)
-LEGACY_URL = os.getenv("PLAYERS_LEGACY_URL", "https://data.nba.net/data/10s/prod/v1/2025/players.json")
+PHOTO_FMT = os.getenv("PLAYERS_PHOTO_FMT",
+    "https://cdn.nba.com/headshots/nba/latest/1040x760/{personId}.png")
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(ROOT_DIR, "assets")
@@ -35,7 +44,7 @@ CACHE_PATH = os.path.join("/tmp", "players_cache.json")
 
 _CACHED: Dict[str, Any] = {"ts": 0.0, "players": None, "index": None}
 
-# ======== utils ========
+# ============================= utils =============================
 def _log(*args: Any) -> None:
     try:
         print("[players]", *args, flush=True)
@@ -66,9 +75,14 @@ def _http_get_json(url: str, timeout: int = 30, verify_ssl: bool = True) -> Any:
     ctx = None
     if not verify_ssl:
         ctx = ssl._create_unverified_context()
+    # Важные заголовки (некоторые прокси/серверы тупят на gzip/chunked)
     req = Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (players-fetch)",
-        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (players-fetch; like Gecko)",
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Encoding": "identity",   # без gzip/deflate
+        "Connection": "close",
+        "Origin": "https://www.nba.com",
+        "Referer": "https://www.nba.com/",
     })
     with urlopen(req, timeout=timeout, context=ctx) as resp:
         raw = resp.read()
@@ -77,26 +91,25 @@ def _http_get_json(url: str, timeout: int = 30, verify_ssl: bool = True) -> Any:
     except Exception:
         return json.loads(raw)
 
-def _get_json_with_retries(url: str, attempts: int = 3, base_timeout: int = 20, verify_ssl: bool = True) -> Any:
-    last_err = None
+def _get_json_with_retries(url: str, attempts: int, base_timeout: int, verify_ssl: bool = True) -> Any:
+    last_err: Optional[BaseException] = None
     for i in range(attempts):
         try:
-            # увеличиваем timeout на каждом ретрае
-            j = _http_get_json(url, timeout=base_timeout + i*10, verify_ssl=verify_ssl)
+            j = _http_get_json(url, timeout=base_timeout + i * 10, verify_ssl=verify_ssl)
             return j
-        except Exception as e:
+        except BaseException as e:
             last_err = e
             _log(f"fetch try {i+1}/{attempts} failed:", repr(e))
-            time.sleep(1.5 * (i+1))
+            time.sleep(1.5 * (i + 1))
     if last_err:
         raise last_err
 
-# ======== parsing ========
+# ============================= parsing =============================
 def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not j:
         return []
 
-    # stats.nba.com proxied (resultSets)
+    # Вариант 1: NBA stats (resultSets)
     if "resultSets" in j:
         try:
             rs = j["resultSets"][0]
@@ -106,27 +119,19 @@ def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
                     return headers.index(name)
                 except ValueError:
                     return None
-
-            i_pid = idx("PERSON_ID")
-            i_tid = idx("TEAM_ID")
-            i_act = idx("ROSTERSTATUS")
-            i_fn  = idx("FIRST_NAME")
-            i_ln  = idx("LAST_NAME")
-            i_dfl = idx("DISPLAY_FIRST_LAST")
-            i_lcf = idx("DISPLAY_LAST_COMMA_FIRST")
-
+            i_pid = idx("PERSON_ID"); i_tid = idx("TEAM_ID"); i_act = idx("ROSTERSTATUS")
+            i_fn  = idx("FIRST_NAME"); i_ln  = idx("LAST_NAME")
+            i_dfl = idx("DISPLAY_FIRST_LAST"); i_lcf = idx("DISPLAY_LAST_COMMA_FIRST")
             out: List[Dict[str, Any]] = []
             for r in rows:
                 pid = _safe_str(r[i_pid]) if i_pid is not None else ""
                 tid = _safe_str(r[i_tid]) if i_tid is not None else "0"
-                # Активность
                 active = True
                 if i_act is not None:
                     try:
                         active = bool(int(r[i_act]))
                     except Exception:
                         active = bool(r[i_act])
-                # Имя
                 if i_fn is not None and i_ln is not None:
                     fn = _safe_str(r[i_fn]).strip(); ln = _safe_str(r[i_ln]).strip()
                 elif i_dfl is not None:
@@ -137,13 +142,9 @@ def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
                     ln, fn = [s.strip() for s in _safe_str(r[i_lcf]).split(",", 1)]
                 else:
                     fn, ln = "", ""
-
                 out.append({
-                    "personId": pid,
-                    "firstName": fn,
-                    "lastName": ln,
-                    "teamId": tid or "0",
-                    "isActive": active,
+                    "personId": pid, "firstName": fn, "lastName": ln,
+                    "teamId": tid or "0", "isActive": active,
                 })
             return out
         except Exception as e:
@@ -151,7 +152,7 @@ def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
             _log(traceback.format_exc())
             return []
 
-    # legacy data.nba.net (league.standard)
+    # Вариант 2: legacy data.nba.net
     league_std = j.get("league", {}).get("standard")
     if isinstance(league_std, list):
         out: List[Dict[str, Any]] = []
@@ -168,56 +169,69 @@ def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
                 continue
         return out
 
+    # Вариант 3: список уже нормализован
+    if isinstance(j, list) and j and isinstance(j[0], dict) and "personId" in j[0]:
+        return j
+
     return []
 
-# ======== sources ========
+# ============================= sources =============================
 def _fetch_from_custom(url: Optional[str] = None) -> List[Dict[str, Any]]:
+    if not PLAYERS_USE_CUSTOM:
+        return []
     u = (url or PLAYERS_CUSTOM_URL or "").strip()
     if not u:
         return []
     if "season=" not in u:
         u = _with_query(u, season=PLAYERS_SEASON)
     try:
-        j = _get_json_with_retries(u, attempts=3, base_timeout=20, verify_ssl=True)
+        j = _get_json_with_retries(u, attempts=CUSTOM_ATTEMPTS, base_timeout=CUSTOM_BASE_TIMEOUT, verify_ssl=True)
         players = _extract_players(j)
         _log(f"custom parsed {len(players)} from {u}")
         return players
-    except Exception as e:
+    except BaseException as e:
         _log("custom fetch error:", e)
         _log(traceback.format_exc())
         return []
 
 def _fetch_from_legacy() -> List[Dict[str, Any]]:
+    if not ALLOW_LEGACY_FALLBACK:
+        return []
     url = LEGACY_URL
     try:
         j = _get_json_with_retries(url, attempts=2, base_timeout=15, verify_ssl=True)
         p = _extract_players(j)
         _log(f"legacy parsed {len(p)} from {url}")
         return p
-    except Exception as e:
-        # SSL hostname mismatch? пробуем http вместо https
+    except BaseException as e:
         msg = repr(e)
         _log("legacy fetch error:", msg)
-        try_http = (url.startswith("https://data.nba.net") or "CERTIFICATE_VERIFY_FAILED" in msg)
-        if try_http:
-            http_url = "http://" + url[len("https://"):]
+        # попытка http/insecure — только если явно разрешили
+        if "CERTIFICATE_VERIFY_FAILED" in msg or isinstance(e, URLError):
+            http_url = "http://" + url[len("https://"):] if url.startswith("https://") else url
             try:
-                j2 = _get_json_with_retries(http_url, attempts=2, base_timeout=15, verify_ssl=False)
+                j2 = _get_json_with_retries(http_url, attempts=2, base_timeout=15, verify_ssl=ALLOW_INSECURE_SSL_LEGACY is False)
                 p2 = _extract_players(j2)
-                _log(f"legacy (http, insecure) parsed {len(p2)} from {http_url}")
+                _log(f"legacy (http{' insecure' if not ALLOW_INSECURE_SSL_LEGACY else ''}) parsed {len(p2)} from {http_url}")
                 return p2
-            except Exception as e2:
+            except BaseException as e2:
                 _log("legacy http fallback failed:", repr(e2))
-        # Разрешили небезопасный SSL? тогда ещё раз без verify
-        if ALLOW_INSECURE_SSL_LEGACY:
-            try:
-                j3 = _get_json_with_retries(url, attempts=1, base_timeout=15, verify_ssl=False)
-                p3 = _extract_players(j3)
-                _log(f"legacy (insecure SSL) parsed {len(p3)} from {url}")
-                return p3
-            except Exception as e3:
-                _log("legacy insecure fallback failed:", repr(e3))
         return []
+
+def _fetch_remote_snapshots() -> List[Dict[str, Any]]:
+    best: List[Dict[str, Any]] = []
+    for u in PLAYERS_SNAPSHOT_URLS:
+        try:
+            j = _get_json_with_retries(u, attempts=2, base_timeout=20, verify_ssl=True)
+            p = _extract_players(j)
+            _log(f"remote snapshot parsed {len(p)} from {u}")
+            if len(p) > len(best):
+                best = p
+            if len(p) >= MIN_EXPECTED:
+                return p
+        except BaseException as e:
+            _log("remote snapshot error:", u, repr(e))
+    return best
 
 def _fetch_local_snapshot() -> List[Dict[str, Any]]:
     if DISABLE_LOCAL_SNAPSHOT:
@@ -231,7 +245,7 @@ def _fetch_local_snapshot() -> List[Dict[str, Any]]:
         _log("local snapshot error:", e)
         return []
 
-# ======== overrides ========
+# ============================= overrides =============================
 OVERRIDES_FILE = os.path.join(ASSETS_DIR, "players_overrides.json")
 
 def _load_overrides() -> Dict[str, Dict[str, Any]]:
@@ -280,35 +294,7 @@ def _apply_overrides(players: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out.append(p)
     return out
 
-# ======== build & cache ========
-def _build_from_sources() -> Tuple[List[Dict[str, Any]], str]:
-    """
-    Возвращает (players, source_tag)
-    Порядок: custom → (при недоборе и ALLOW_LEGACY_FALLBACK) legacy → local
-    Если custom вернул 0/мало — логируем и пробуем дальше.
-    """
-    # 1) custom
-    custom = _fetch_from_custom()
-    if custom and len(custom) >= MIN_EXPECTED:
-        return custom, "custom"
-    _log(f"custom insufficient ({len(custom) if custom else 0}); allow_legacy={ALLOW_LEGACY_FALLBACK}")
-
-    # 2) legacy (если разрешено или custom = 0)
-    if ALLOW_LEGACY_FALLBACK or not custom:
-        leg = _fetch_from_legacy()
-        if leg and len(leg) >= MIN_EXPECTED:
-            return leg, "legacy"
-
-    # 3) local snapshot
-    loc = _fetch_local_snapshot()
-    if loc and len(loc) > 0:
-        return loc, "local"
-
-    # 4) хоть что-то: если custom/legacy хоть что-то дали — отдадим большее
-    best = custom if len(custom) >= len(_fetch_from_legacy()) else _fetch_from_legacy()
-    tag = "custom_or_legacy_partial"
-    return (best or []), tag
-
+# ============================= cache/build =============================
 def _load_cache_from_disk() -> Optional[Tuple[List[Dict[str, Any]], float]]:
     if not os.path.exists(CACHE_PATH):
         return None
@@ -334,7 +320,38 @@ def _save_cache_to_disk(players: List[Dict[str, Any]]) -> None:
 def _valid_cache(ts: float) -> bool:
     return (time.time() - ts) < CACHE_TTL_SEC
 
-# ======== public API ========
+def _build_from_sources() -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Порядок (новый): custom → remote snapshots → (опционально) legacy → local
+    """
+    # 1) custom
+    custom = _fetch_from_custom()
+    if custom and len(custom) >= MIN_EXPECTED:
+        return custom, "custom"
+
+    # 2) удалённые снапшоты
+    rem = _fetch_remote_snapshots()
+    if rem and len(rem) >= MIN_EXPECTED:
+        return rem, "remote_snapshot"
+
+    # 3) legacy — только если явно включён
+    leg = _fetch_from_legacy()
+    if leg and len(leg) >= MIN_EXPECTED:
+        return leg, "legacy"
+
+    # 4) локальный снапшот
+    loc = _fetch_local_snapshot()
+    if loc and len(loc) > 0:
+        return loc, "local"
+
+    # 5) хоть что-то из того, что удалось частично
+    best = custom if len(custom) >= len(rem) else rem
+    if len(leg) > len(best): best = leg
+    if len(loc) > len(best): best = loc
+    tag = "partial"
+    return (best or []), tag
+
+# ============================= public API =============================
 def get_players(force_refresh: bool = False) -> List[Dict[str, Any]]:
     if not force_refresh and _CACHED["players"] and _valid_cache(_CACHED["ts"]):
         return _CACHED["players"]
@@ -355,7 +372,6 @@ def get_players(force_refresh: bool = False) -> List[Dict[str, Any]]:
         _log(f"final players count: {len(players)} (source={source})")
         return players
 
-    # Если ничего не получилось — пробуем вернуть из дискового кэша даже просроченное
     disk = _load_cache_from_disk()
     if disk:
         players, ts = disk
@@ -375,8 +391,7 @@ def get_players_index(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
 
 def refresh_players(drop_cache: bool = False) -> Tuple[int, Dict[str, Any]]:
     """
-    Важно: мы НЕ чистим кэш заранее. Сначала пробуем собрать новый список.
-    Если успешно — тогда заменяем кэш. Если нет — сохраняем старый, чтобы не получить 0.
+    Не чистим кэш заранее. Если новый фетч удачный — заменяем.
     """
     prev = _CACHED.get("players") or []
     try:
@@ -387,7 +402,6 @@ def refresh_players(drop_cache: bool = False) -> Tuple[int, Dict[str, Any]]:
             _save_cache_to_disk(players)
             return len(players), {"ok": True, "players_indexed": len(players), "source": source}
         else:
-            # если новый фетч плохой — не трогаем существующий кэш
             if prev:
                 return len(prev), {"ok": True, "players_indexed": len(prev), "source": "cache_preserved"}
             return 0, {"ok": False, "error": "no_source_available"}
@@ -398,10 +412,6 @@ def refresh_players(drop_cache: bool = False) -> Tuple[int, Dict[str, Any]]:
         return 0, {"ok": False, "error": repr(e)}
 
 def drop_players_cache() -> bool:
-    """
-    Сбрасываем кэш ТОЛЬКО когда это прямо вызвано этой функцией.
-    В refresh_players() кэш не чистим заранее.
-    """
     try:
         _CACHED["ts"] = 0.0
         _CACHED["players"] = None
@@ -428,7 +438,7 @@ def find_player_by_name(query: str) -> List[Dict[str, Any]]:
             res.append(p)
     return res
 
-# старые алиасы
+# совместимость
 def players_count(force_refresh: bool = False) -> int:
     return len(get_players(force_refresh=force_refresh))
 
