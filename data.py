@@ -1,474 +1,318 @@
-# data.py — индекс игроков (лат/кириллица), русское имя, headshots/логотипы, подсказки, алиасы
-import os, json, unicodedata, re, time, logging
-from pathlib import Path
-from typing import Dict, Any, Tuple, List, Optional
-import requests
-from difflib import SequenceMatcher
+# /api/telegram.py — Telegram webhook + админ-команды правок игроков
+import os, re, json, requests, hashlib
+from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi.responses import JSONResponse
 
-# ===== логирование =====
-DEBUG = os.getenv("DEBUG", "0") == "1"
-logger = logging.getLogger("players")
-logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+app = FastAPI()
 
-# ===== пути и кэш =====
-ROOT = Path(__file__).resolve().parent
-ASSETS = ROOT / "assets"
-ASSETS.mkdir(parents=True, exist_ok=True)
-CACHE = Path("/tmp/nba_cache")
-CACHE.mkdir(parents=True, exist_ok=True)
+BOT_TOKEN       = os.environ.get("BOT_TOKEN")
+WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET", "hook")
+WORKER_ADMIN_URL = os.environ.get("WORKER_ADMIN_URL", "").rstrip("/")  # https://...workers.dev/admin
+WORKER_ADMIN_TOKEN = os.environ.get("WORKER_ADMIN_TOKEN", "")
+ADMIN_CHAT_IDS = set([int(x) for x in (os.environ.get("ADMIN_CHAT_IDS","").split(",")) if x.strip().isdigit()])
 
-PLAYERS_CACHE = CACHE / "players_index.json"
-ALIASES_FILE  = CACHE / "aliases.json"
-HEAD_DIR = CACHE / "headshots"; HEAD_DIR.mkdir(exist_ok=True)
-LOGO_DIR = ASSETS / "cache"  # ожидаются logo_<teamId>.png
-ICON_STAR = str((ASSETS / "icons" / "star.png").resolve())
-
-REFRESH_SECONDS = int(os.getenv("PLAYERS_REFRESH_SECONDS", "86400"))  # 1 день
-CUSTOM_URL = os.getenv("PLAYERS_CUSTOM_URL", "").strip()
-
-# ===== команды: имена и базовый цвет (primary) =====
-TEAM_NAMES: Dict[int, str] = {
-    1610612737:"Atlanta Hawks", 1610612738:"Boston Celtics", 1610612739:"Cleveland Cavaliers",
-    1610612740:"New Orleans Pelicans", 1610612741:"Chicago Bulls", 1610612742:"Dallas Mavericks",
-    1610612743:"Denver Nuggets", 1610612744:"Golden State Warriors", 1610612745:"Houston Rockets",
-    1610612746:"LA Clippers", 1610612747:"Los Angeles Lakers", 1610612748:"Miami Heat",
-    1610612749:"Milwaukee Bucks", 1610612750:"Minnesota Timberwolves", 1610612751:"Brooklyn Nets",
-    1610612752:"New York Knicks", 1610612753:"Orlando Magic", 1610612754:"Indiana Pacers",
-    1610612755:"Philadelphia 76ers", 1610612756:"Phoenix Suns", 1610612757:"Portland Trail Blazers",
-    1610612758:"Sacramento Kings", 1610612759:"San Antonio Spurs", 1610612760:"Oklahoma City Thunder",
-    1610612761:"Toronto Raptors", 1610612762:"Utah Jazz", 1610612763:"Memphis Grizzlies",
-    1610612764:"Washington Wizards", 1610612765:"Detroit Pistons", 1610612766:"Charlotte Hornets",
-}
-TEAM_PRIMARY: Dict[int, str] = {
-    1610612737:"#E03A3E", 1610612738:"#007A33", 1610612739:"#860038",
-    1610612740:"#0C2340", 1610612741:"#CE1141", 1610612742:"#00538C",
-    1610612743:"#0E2240", 1610612744:"#1D428A", 1610612745:"#CE1141",
-    1610612746:"#C8102E", 1610612747:"#552583", 1610612748:"#98002E",
-    1610612749:"#00471B", 1610612750:"#0C2340", 1610612751:"#000000",
-    1610612752:"#006BB6", 1610612753:"#0077C0", 1610612754:"#002D62",
-    1610612755:"#006BB6", 1610612756:"#1D1160", 1610612757:"#E03A3E",
-    1610612758:"#5A2D81", 1610612759:"#000000", 1610612760:"#007AC1",
-    1610612761:"#BA0C2F", 1610612762:"#002B5C", 1610612763:"#5D76A9",
-    1610612764:"#002B5C", 1610612765:"#C8102E", 1610612766:"#00788C",
-}
-def _shade(hex_color: str, k: float) -> str:
-    hex_color = hex_color.strip().lstrip("#")
-    r = int(hex_color[0:2], 16); g = int(hex_color[2:4], 16); b = int(hex_color[4:6], 16)
-    r = max(0, min(255, int(r*k))); g = max(0, min(255, int(g*k))); b = max(0, min(255, int(b*k)))
-    return f"#{r:02X}{g:02X}{b:02X}"
-
-# ===== нормализация / транслит =====
-def _strip_accents(s: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-def _normalize_key(s: str) -> str:
-    s = _strip_accents(s).lower()
-    s = re.sub(r"[^a-zа-яё0-9 ]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-LAT_DIGRAPHS = [
-    ("shch","щ"), ("sch","ш"), ("ch","ч"), ("sh","ш"), ("zh","ж"),
-    ("yo","ё"), ("yu","ю"), ("ya","я"), ("ye","е"), ("yi","и"), ("kh","х"),
-    ("ts","ц"), ("dz","дз")
-]
-LAT_SINGLE = {
-    "a":"а","b":"б","c":"к","d":"д","e":"е","f":"ф","g":"г","h":"х","i":"и",
-    "j":"дж","k":"к","l":"л","m":"м","n":"н","o":"о","p":"п","q":"к","r":"р",
-    "s":"с","t":"т","u":"у","v":"в","w":"в","x":"кс","y":"й","z":"з",
-}
-def lat2cyr(name: str) -> str:
-    s = _strip_accents(name).lower()
-    for a,b in LAT_DIGRAPHS:
-        s = s.replace(a,b)
-    out = []
-    for ch in s:
-        out.append(LAT_SINGLE.get(ch, ch))
-    txt = "".join(out)
-    return " ".join(w.capitalize() for w in txt.split())
-
-CYR_SINGLE = {
-    "а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"e","ж":"zh","з":"z","и":"i","й":"y",
-    "к":"k","л":"l","м":"m","н":"n","о":"o","п":"p","р":"r","с":"s","т":"t","у":"u","ф":"f",
-    "х":"h","ц":"ts","ч":"ch","ш":"sh","щ":"shch","ы":"y","ь":"","ъ":"","э":"e","ю":"yu","я":"ya",
-}
-def cyr2lat(s: str) -> str:
-    t = []
-    for ch in s.lower():
-        t.append(CYR_SINGLE.get(ch, ch))
-    return " ".join(w.capitalize() for w in "".join(t).split())
-
-# ===== ручные русские имена =====
-RU_NAME_OVERRIDES: Dict[str,str] = {
-    "victor wembanyama":"Виктор Вембаньяма",
-    "zion williamson":"Зайон Уильямсон",
-    "luka doncic":"Лука Дончич",
-    "nikola jokic":"Никола Йокич",
-    "lebron james":"Леброн Джеймс",
-    "stephen curry":"Стефен Карри",
-    "kevin durant":"Кевин Дюрант",
-    "giannis antetokounmpo":"Яннис Адетокумбо",
-    "joel embiid":"Джоэл Эмбиид",
-    "anthony davis":"Энтони Дэвис",
-    "kyrie irving":"Кайри Ирвинг",
-    "shai gilgeous alexander":"Шай Гилджес-Александр",
-    "domantas sabonis":"Домантас Сабонис",
-    "alperen sengun":"Алперен Шенгюн",
+# Аббревиатуры → teamId
+TEAM_ABBR = {
+    "ATL":1610612737,"BOS":1610612738,"CLE":1610612739,"NOP":1610612740,"CHI":1610612741,"DAL":1610612742,
+    "DEN":1610612743,"GSW":1610612744,"HOU":1610612745,"LAC":1610612746,"LAL":1610612747,"MIA":1610612748,
+    "MIL":1610612749,"MIN":1610612750,"BKN":1610612751,"NYK":1610612752,"ORL":1610612753,"IND":1610612754,
+    "PHI":1610612755,"PHX":1610612756,"POR":1610612757,"SAC":1610612758,"SAS":1610612759,"OKC":1610612760,
+    "TOR":1610612761,"UTA":1610612762,"MEM":1610612763,"WAS":1610612764,"DET":1610612765,"CHA":1610612766,
 }
 
-# --- Минимальный фоллбек на случай проблем с сетью/эндпоинтами ---
-FALLBACK_PLAYERS = [
-    {"personId":"203999","firstName":"Nikola","lastName":"Jokic","teamId":"1610612743"},
-    {"personId":"201939","firstName":"Stephen","lastName":"Curry","teamId":"1610612744"},
-    {"personId":"2544","firstName":"LeBron","lastName":"James","teamId":"1610612747"},
-    {"personId":"1641707","firstName":"Victor","lastName":"Wembanyama","teamId":"1610612759"},
-    {"personId":"1629627","firstName":"Zion","lastName":"Williamson","teamId":"1610612740"},
-    {"personId":"203507","firstName":"Giannis","lastName":"Antetokounmpo","teamId":"1610612749"},
-    {"personId":"203954","firstName":"Joel","lastName":"Embiid","teamId":"1610612755"},
-    {"personId":"201142","firstName":"Kevin","lastName":"Durant","teamId":"1610612756"},
-    {"personId":"1629029","firstName":"Luka","lastName":"Doncic","teamId":"1610612742"},
-]
+STAT_PAIR_RE = re.compile(r"(?P<num>[-+]?\d+(?:[.,]\d+)?)\s*([%]?)\s*(?P<label>[A-Za-zА-Яа-яёЁ+\-/ ]{0,20})")
 
-# ===== алиасы, задаваемые из бота =====
-_ALIASES: Dict[str, str] = {}  # key(normalized alias) -> normalized base ascii-key
+def tg_send_png(chat_id: int, png_bytes: bytes, caption: str | None = None):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+    files = {"document": ("card.png", png_bytes, "image/png")}
+    data = {"chat_id": chat_id}
+    if caption: data["caption"] = caption
+    r = requests.post(url, data=data, files=files, timeout=30)
+    return r.ok, r.text
 
-def _load_aliases():
-    global _ALIASES
-    if ALIASES_FILE.exists():
-        try:
-            _ALIASES = json.loads(ALIASES_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            _ALIASES = {}
-    else:
-        _ALIASES = {}
-def add_alias(alias_text: str, base_full_ascii: str) -> bool:
-    """Добавляет алиас: alias_text -> base_full_ascii (оба нормализуются)."""
+def tg_send_message(chat_id: int, text: str, reply_to_message_id: int | None = None, reply_markup: dict | None = None):
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_to_message_id:
+        payload["reply_to_message_id"] = reply_to_message_id
+        payload["allow_sending_without_reply"] = True
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload, timeout=15)
+
+def tg_answer_callback(callback_id: str, text: str = ""):
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
+                  json={"callback_query_id": callback_id, "text": text}, timeout=10)
+
+def parse_card(text: str):
+    if not text or not text.lower().startswith("/card"): return None
+    body = text.split(" ", 1)[1] if " " in text else ""
+    parts = [p.strip() for p in body.split("|")]
+    if len(parts) < 2: return None
+    name = parts[0]; raw_stats = parts[1]
+    template = (parts[2].strip().lower() if len(parts) >= 3 and parts[2] else "single")
+    note = (parts[3].strip() if len(parts) >= 4 and parts[3] else None)
+    stats = []
+    for token in re.split(r"[,;/\n]", raw_stats):
+        m = STAT_PAIR_RE.search(token.strip())
+        if m:
+            num = m.group("num").replace(",", ".")
+            label = (m.group("label") or "").strip()
+            if m.group(2) == "%" and not label: label = "%"
+            stats.append((num, label))
+    return name, stats[:6], template, note, raw_stats
+
+def parse_alias(text: str):
+    if not text or not text.lower().startswith("/alias"): return None
+    body = text.split(" ", 1)[1] if " " in text else ""
+    m = re.split(r"\s*=\s*", body, maxsplit=1)
+    if len(m) != 2: return None
+    return m[0].strip(), m[1].strip()
+
+def parse_setru(text: str):
+    if not text.lower().startswith("/setru"): return None
+    body = text.split(" ",1)[1] if " " in text else ""
+    parts = [p.strip() for p in body.split("|")]
+    if len(parts) != 2: return None
+    return parts[0], parts[1]  # original_name, ru_name
+
+def parse_setteam(text: str):
+    if not text.lower().startswith("/setteam"): return None
+    body = text.split(" ",1)[1] if " " in text else ""
+    parts = [p.strip() for p in body.split("|")]
+    if len(parts) != 2: return None
+    return parts[0], parts[1]  # name, team token
+
+def parse_addplayer(text: str):
+    # /addplayer Имя Фамилия | TEAM | Русское Имя(опц.) | personId(опц.)
+    if not text.lower().startswith("/addplayer"): return None
+    body = text.split(" ",1)[1] if " " in text else ""
+    parts = [p.strip() for p in body.split("|")]
+    if len(parts) < 2: return None
+    name = parts[0]
+    team_token = parts[1]
+    ru_name = parts[2] if len(parts) >= 3 and parts[2] else None
+    pid = parts[3] if len(parts) >= 4 and parts[3] else None
+    return name, team_token, ru_name, pid
+
+def require_admin(chat_id: int) -> bool:
+    return (not ADMIN_CHAT_IDS) or (chat_id in ADMIN_CHAT_IDS)
+
+def team_token_to_id(token: str) -> int | None:
+    t = token.strip().upper()
+    if t.isdigit(): return int(t)
+    if t in TEAM_ABBR: return TEAM_ABBR[t]
+    # попробовать полное англ. имя
     try:
-        k = _normalize_key(alias_text)
-        base_k = _normalize_key(base_full_ascii)
-        _ALIASES[k] = base_k
-        ALIASES_FILE.write_text(json.dumps(_ALIASES, ensure_ascii=False), encoding="utf-8")
-        return True
-    except Exception:
-        return False
-_load_aliases()
-
-# ===== нормализация разных источников к единому виду {"league":{"standard":[...]}} =====
-def _normalize_to_league_standard(j: Any) -> Dict[str, Any]:
-    """
-    Возвращает {"league":{"standard":[{personId, firstName, lastName, teamId, isActive?}]}}
-    Поддерживает три формы входа:
-      1) уже league.standard;
-      2) stats.nba.com resultSets PlayerList;
-      3) массив объектов (игроков).
-    """
-    # 1) Уже в нужном формате
-    if isinstance(j, dict) and isinstance(j.get("league", {}).get("standard"), list):
-        std = j["league"]["standard"]
-        return {"league": {"standard": std}}
-
-    # 2) stats.nba.com resultSets
-    if isinstance(j, dict) and isinstance(j.get("resultSets"), list):
-        std: List[Dict[str, Any]] = []
-        for rs in j["resultSets"]:
-            name = rs.get("name") or rs.get("Name") or ""
-            headers = rs.get("headers") or []
-            rows = rs.get("rowSet") or []
-            if str(name).lower() != "playerlist":
-                continue
-            # ожидаем заголовки PERSON_ID, FIRST_NAME, LAST_NAME, TEAM_ID, ROSTERSTATUS
-            idx = {h: i for i, h in enumerate(headers)}
-            for row in rows:
-                try:
-                    pid = str(row[idx.get("PERSON_ID")])
-                    first = str(row[idx.get("FIRST_NAME")] or "")
-                    last  = str(row[idx.get("LAST_NAME")] or "")
-                    team  = str(row[idx.get("TEAM_ID")] or "0")
-                    # ROSTERSTATUS: 1/0
-                    is_active = bool(int(row[idx.get("ROSTERSTATUS")])) if idx.get("ROSTERSTATUS") is not None else True
-                    std.append({
-                        "personId": pid, "firstName": first, "lastName": last,
-                        "teamId": team, "isActive": is_active
-                    })
-                except Exception:
-                    continue
-        return {"league": {"standard": std}}
-
-    # 3) Плоский массив
-    if isinstance(j, list):
-        std = []
-        for obj in j:
-            if not isinstance(obj, dict): continue
-            pid = str(obj.get("personId") or obj.get("PlayerID") or obj.get("id") or "")
-            first = obj.get("firstName") or obj.get("first_name") or ""
-            last  = obj.get("lastName") or obj.get("last_name") or ""
-            team  = str(obj.get("teamId") or obj.get("TeamID") or obj.get("team_id") or "0")
-            if not pid or not (first or last): continue
-            std.append({
-                "personId": pid, "firstName": str(first), "lastName": str(last),
-                "teamId": team, "isActive": (team != "0")
-            })
-        return {"league": {"standard": std}}
-
-    # неизвестный формат -> пусто
-    return {"league": {"standard": []}}
-
-# ===== загрузка игроков =====
-def _fetch_players_payload() -> Dict[str, Any]:
-    """
-    1) Если задан PLAYERS_CUSTOM_URL — используем его.
-    2) Иначе пробуем несколько legacy URL (часто ломаются).
-    3) Если ничего не вышло — фоллбек на мини-список.
-    """
-    # 1) Кастомный воркер (рекомендуется)
-    if CUSTOM_URL:
-        try:
-            url = CUSTOM_URL
-            # если в урле нет query, добавим active=1 по умолчанию
-            if "?" not in url:
-                url = url + "?active=1"
-            logger.info("[players] custom URL GET: %s", url)
-            r = requests.get(url, timeout=20, headers={"User-Agent":"Mozilla/5.0 bot"})
-            logger.info("[players] custom URL status=%s", r.status_code)
-            if r.ok:
-                j = r.json()
-                norm = _normalize_to_league_standard(j)
-                players = norm.get("league", {}).get("standard") or []
-                logger.info("[players] custom URL parsed: players=%d", len(players))
-                if players:
-                    return norm
-        except Exception as e:
-            logger.info("[players] custom URL error: %s: %r", type(e).__name__, e)
-
-    # 2) Legacy источники (часто 403/SSL/таймаут)
-    legacy_urls = [
-        "https://data.nba.com/data/10s/prod/v1/2025/players.json",
-        "https://data.nba.com/data/10s/prod/v1/2024/players.json",
-        "https://data.nba.net/prod/v1/2025/players.json",
-        "https://data.nba.net/prod/v1/2024/players.json",
-    ]
-    for u in legacy_urls:
-        try:
-            r = requests.get(u, timeout=12, headers={"User-Agent":"Mozilla/5.0 bot"})
-            if r.ok:
-                j = r.json()
-                norm = _normalize_to_league_standard(j)
-                players = norm.get("league", {}).get("standard") or []
-                logger.info("[players] legacy OK %s -> %d", u, len(players))
-                if players:
-                    return norm
-            else:
-                logger.info("[players] legacy GET %s: status=%s", u, r.status_code)
-        except Exception as e:
-            logger.info("[players] legacy error %s: %s", u, repr(e))
-            continue
-
-    # 3) Фоллбек
-    logger.info("[players] FALLBACK used (%d)", len(FALLBACK_PLAYERS))
-    return {"league": {"standard": FALLBACK_PLAYERS}}
-
-def _build_index() -> Dict[str, Any]:
-    payload = _fetch_players_payload()
-    players = payload.get("league", {}).get("standard", []) or []
-    index: Dict[str, Any] = {"_bykey": {}, "_byid": {}}
-
-    for p in players:
-        try:
-            pid = int(str(p.get("personId")).strip())
-        except Exception:
-            continue
-        if not pid:
-            continue
-        first = str(p.get("firstName","")).strip()
-        last  = str(p.get("lastName","")).strip()
-        team_id = int(str(p.get("teamId") or "0"))
-        team_name = TEAM_NAMES.get(team_id, "Free Agent")
-        full_ascii = f"{first} {last}".strip()
-        if not full_ascii:
-            continue
-        ascii_key = _normalize_key(full_ascii)
-        ru_display = RU_NAME_OVERRIDES.get(ascii_key, lat2cyr(full_ascii))
-
-        rec = {
-            "id": pid,
-            "full_name": full_ascii,
-            "display": ru_display,
-            "team_id": team_id,
-            "team_name": team_name,
-        }
-        index["_byid"][pid] = rec
-
-        # ключи для поиска
-        cyr_key = _normalize_key(ru_display)
-        index["_bykey"][ascii_key] = rec
-        index["_bykey"][cyr_key] = rec
-        index["_bykey"][_normalize_key(full_ascii.replace("-", " "))] = rec
-        index["_bykey"][_normalize_key(ru_display.replace("-", " "))] = rec
-
-    # прозвища (короткие алиасы)
-    aliases = {
-        "wemby":"victor wembanyama", "вемба":"victor wembanyama",
-        "зайон":"zion williamson", "лука":"luka doncic", "йокич":"nikola jokic", "ёкич":"nikola jokic",
-        "яннис":"giannis antetokounmpo", "эмбиид":"joel embiid", "эмбид":"joel embiid",
-        "стеф":"stephen curry", "стефан":"stephen curry", "кайри":"kyrie irving",
-        "шай":"shai gilgeous alexander",
-    }
-    for a, base in aliases.items():
-        k = _normalize_key(a)
-        basek = _normalize_key(base)
-        if basek in index["_bykey"]:
-            index["_bykey"][k] = index["_bykey"][basek]
-
-    return index
-
-_PLAYERS: Dict[str, Any] | None = None
-_LAST_LOAD = 0
-
-def _ensure_index(force: bool=False):
-    global _PLAYERS, _LAST_LOAD
-    now = time.time()
-    if not force and _PLAYERS and (now - _LAST_LOAD) < REFRESH_SECONDS:
-        return
-    # читать из кэша
-    if not force and PLAYERS_CACHE.exists():
-        try:
-            _PLAYERS = json.loads(PLAYERS_CACHE.read_text(encoding="utf-8"))
-            _LAST_LOAD = now
-            return
-        except Exception:
-            _PLAYERS = None
-    # заново собрать
-    _PLAYERS = _build_index()
-    try:
-        PLAYERS_CACHE.write_text(json.dumps(_PLAYERS, ensure_ascii=False), encoding="utf-8")
-        logger.info("[players] cache save ok")
+        from data import TEAM_NAMES
+        for tid, nm in TEAM_NAMES.items():
+            if nm.strip().upper() == t: return tid
     except Exception:
         pass
-    _LAST_LOAD = now
-
-def drop_players_cache():
-    """Полностью сбрасывает индекс и кэш, чтобы перезалить."""
-    global _PLAYERS, _LAST_LOAD
-    _PLAYERS, _LAST_LOAD = None, 0
-    try:
-        if PLAYERS_CACHE.exists():
-            PLAYERS_CACHE.unlink()
-    except Exception:
-        pass
-
-def get_player_by_id(pid: int) -> Optional[Dict[str, Any]]:
-    _ensure_index()
-    return _PLAYERS["_byid"].get(int(pid)) if _PLAYERS else None
-
-def players_count() -> int:
-    _ensure_index()
-    return len(_PLAYERS["_byid"]) if _PLAYERS else 0
-
-def _apply_alias(q_norm: str) -> Optional[str]:
-    """Если q_norm — алиас, вернуть базовый ascii-key."""
-    return _ALIASES.get(q_norm)
-
-def find_player_by_name(query: str) -> Optional[Dict[str, Any]]:
-    """Возвращает {id, full_name (лат), display (РУС), team_id, team_name}."""
-    if not query:
-        return None
-    _ensure_index()
-    if not _PLAYERS:
-        return None
-
-    q = _normalize_key(query)
-
-    # 1) Алиасы, заданные из бота
-    base = _apply_alias(q)
-    if base and base in _PLAYERS["_bykey"]:
-        return _PLAYERS["_bykey"][base]
-
-    # 2) Прямые совпадения
-    rec = _PLAYERS["_bykey"].get(q)
-    if rec:
-        return rec
-
-    # 3) Кири -> лат
-    if re.search("[а-яё]", q):
-        lat_guess = _normalize_key(cyr2lat(query))
-        rec = _PLAYERS["_bykey"].get(lat_guess)
-        if rec:
-            return rec
-
-    # 4) Лат -> лат без акцентов
-    lat_guess2 = _normalize_key(_strip_accents(query))
-    if lat_guess2 != q:
-        rec = _PLAYERS["_bykey"].get(lat_guess2)
-        if rec:
-            return rec
-
-    # 5) Лат -> кир транслит (иногда помогает)
-    cyr_guess = _normalize_key(lat2cyr(query))
-    rec = _PLAYERS["_bykey"].get(cyr_guess)
-    if rec:
-        return rec
-
-    # 6) Фамилия
-    last = q.split(" ")[-1]
-    if len(last) >= 3:
-        for k, r in _PLAYERS["_bykey"].items():
-            if k.endswith(" " + last) or k == last:
-                return r
-
     return None
 
-def suggest_players(query: str, limit: int = 5) -> List[Dict[str, Any]]:
-    """Топ-совпадения по похожести (для «Игрок не найден»)."""
-    _ensure_index()
-    if not _PLAYERS or not query:
-        return []
-    q = _normalize_key(query)
-    seen, scored = set(), []
-    for rec in _PLAYERS["_byid"].values():
-        keys = [rec["full_name"], rec["display"]]
-        s = 0.0
-        for key in keys:
-            k = _normalize_key(key)
-            r = SequenceMatcher(None, q, k).ratio()
-            if k.startswith(q) or any(w.startswith(q) for w in k.split()):
-                r += 0.1
-            s = max(s, r)
-        scored.append((s, rec))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    out: List[Dict[str, Any]] = []
-    for s, rec in scored:
-        if rec["id"] in seen:
-            continue
-        seen.add(rec["id"])
-        out.append(rec)
-        if len(out) >= limit:
-            break
-    return out
+def synthetic_person_id(full_name: str) -> int:
+    # стабильный отрицательный ID
+    h = int(hashlib.sha1(full_name.encode("utf-8")).hexdigest()[:8], 16)
+    return - (10_000_000 + (h % 9_000_000))
 
-# ===== headshots & logos =====
-def ensure_headshot_png(player_id: int, full_name: str) -> str:
-    path = HEAD_DIR / f"{player_id}.png"
-    if path.exists() and path.stat().st_size > 0:
-        return str(path)
-    urls = [
-        f"https://cdn.nba.com/headshots/nba/latest/1040x760/{player_id}.png",
-        f"https://cdn.nba.com/headshots/nba/latest/260x190/{player_id}.png",
-    ]
-    for u in urls:
+def worker_admin_call(path: str, payload: dict) -> tuple[bool, str]:
+    if not WORKER_ADMIN_URL or not WORKER_ADMIN_TOKEN:
+        return False, "Worker admin URL/TOKEN not configured"
+    url = WORKER_ADMIN_URL + path
+    headers = {"Content-Type":"application/json","X-Admin-Token":WORKER_ADMIN_TOKEN}
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        return r.ok, (r.text or "")
+    except Exception as e:
+        return False, repr(e)
+
+def local_refresh_index():
+    # моментально обновим индекс внутри текущего воркера (без HTTP)
+    try:
+        from data import drop_players_cache, _ensure_index, players_count
+        drop_players_cache()
+        _ensure_index(force=True)
+        return players_count()
+    except Exception:
+        return -1
+
+async def handle_update(update: dict) -> JSONResponse:
+    from graphics import render_card
+    from data import find_player_by_name, ensure_headshot_png, ensure_team_logo_png, get_player_by_id, suggest_players, add_alias
+
+    # callbacks
+    if "callback_query" in update:
+        cq = update["callback_query"]; data = cq.get("data") or ""; chat_id = cq["message"]["chat"]["id"]
+        if data.startswith("pick:"):
+            try: pid = int(data.split(":",1)[1])
+            except Exception:
+                tg_answer_callback(cq["id"], "Ошибка выбора"); return JSONResponse({"ok": True})
+            origin = cq["message"].get("reply_to_message")
+            if not origin or not origin.get("text"):
+                tg_answer_callback(cq["id"], "Не нашёл исходную команду — отправьте /card заново."); return JSONResponse({"ok": True})
+            parsed = parse_card(origin["text"])
+            if not parsed:
+                tg_answer_callback(cq["id"], "Не смог разобрать исходную команду."); return JSONResponse({"ok": True})
+            _name, stats, template, note, _raw = parsed
+            player = get_player_by_id(pid)
+            if not player:
+                tg_answer_callback(cq["id"], "Игрок не найден по ID."); return JSONResponse({"ok": True})
+            logo_path, team_colors = ensure_team_logo_png(player["team_id"])
+            head_path = ensure_headshot_png(player["id"], player["full_name"])
+            png_bytes = render_card(template=template, player_name=player["display"] or player["full_name"],
+                                    team_name=player["team_name"], team_logo_path=logo_path, team_colors=team_colors,
+                                    headshot_path=head_path, stats=stats, note=note)
+            tg_answer_callback(cq["id"], f"Выбрано: {player['display']}"); tg_send_png(chat_id, png_bytes)
+            return JSONResponse({"ok": True})
+        tg_answer_callback(cq["id"]); return JSONResponse({"ok": True})
+
+    msg = update.get("message") or update.get("edited_message") or update.get("channel_post")
+    if not msg: return JSONResponse({"ok": True})
+    chat_id = msg["chat"]["id"]; text = msg.get("text") or ""
+
+    # --- админ-команды ---
+    if text.startswith("/addplayer") or text.startswith("/setteam") or text.startswith("/setru"):
+        if not require_admin(chat_id):
+            tg_send_message(chat_id, "Недостаточно прав."); return JSONResponse({"ok": True})
+
+        # /addplayer
+        p = parse_addplayer(text)
+        if p:
+            name, team_tok, ru_name, pid = p
+            tid = team_token_to_id(team_tok)
+            if not tid:
+                tg_send_message(chat_id, "Неверная команда. Укажи команду числом или аббревиатурой (например, IND, GSW).")
+                return JSONResponse({"ok": True})
+            parts = [w for w in name.split(" ") if w]
+            first, last = (parts[0], " ".join(parts[1:])) if len(parts) > 1 else (name, "")
+            if not pid or not str(pid).strip().lstrip("-").isdigit():
+                pid = synthetic_person_id(name)
+            else:
+                pid = int(str(pid))
+            ok, resp = worker_admin_call("/add", {"personId": pid, "firstName": first, "lastName": last, "teamId": tid, "ruName": ru_name})
+            if ok:
+                cnt = local_refresh_index()
+                tg_send_message(chat_id, f"✅ Игрок добавлен: {name} (id {pid}), teamId={tid}. Индекс: {cnt}.")
+            else:
+                tg_send_message(chat_id, f"❌ Не удалось добавить: {resp}")
+            return JSONResponse({"ok": True})
+
+        # /setteam
+        p = parse_setteam(text)
+        if p:
+            name, team_tok = p
+            player = find_player_by_name(name)
+            if not player:
+                tg_send_message(chat_id, "Игрок не найден по имени. Можно сначала добавить через /addplayer")
+                return JSONResponse({"ok": True})
+            tid = team_token_to_id(team_tok)
+            if not tid:
+                tg_send_message(chat_id, "Неверная команда. Укажи команду числом или аббревиатурой (например, IND, GSW).")
+                return JSONResponse({"ok": True})
+            ok, resp = worker_admin_call("/setteam", {"personId": player["id"], "teamId": tid})
+            if ok:
+                cnt = local_refresh_index()
+                tg_send_message(chat_id, f"✅ Обновил команду: {player['display']} → teamId {tid}. Индекс: {cnt}.")
+            else:
+                tg_send_message(chat_id, f"❌ Не удалось обновить: {resp}")
+            return JSONResponse({"ok": True})
+
+        # /setru
+        p = parse_setru(text)
+        if p:
+            name, ru = p
+            player = find_player_by_name(name)
+            payload = {"ruName": ru}
+            if player: payload["personId"] = player["id"]
+            else: payload["fullName"] = name
+            ok, resp = worker_admin_call("/setru", payload)
+            if ok:
+                cnt = local_refresh_index()
+                who = player["display"] if player else name
+                tg_send_message(chat_id, f"✅ Обновил русское имя: {who} → «{ru}». Индекс: {cnt}.")
+            else:
+                tg_send_message(chat_id, f"❌ Не удалось обновить: {resp}")
+            return JSONResponse({"ok": True})
+
+    # --- /alias ---
+    alias_pair = parse_alias(text)
+    if alias_pair:
+        from data import find_player_by_name, add_alias
+        alias_text, correct_text = alias_pair
+        target = find_player_by_name(correct_text)
+        if not target:
+            tg_send_message(chat_id, "Не нашёл игрока справа от '='. Пример:\n/alias Швед = Alexey Shved")
+            return JSONResponse({"ok": True})
+        ok = add_alias(alias_text, target["full_name"])
+        tg_send_message(chat_id, f"{'Готово' if ok else 'Ошибка'}. Теперь «{alias_text}» = {target['display']}.")
+        return JSONResponse({"ok": True})
+
+    # --- /card ---
+    parsed = parse_card(text)
+    if not parsed:
+        hint = ("Формат:\n"
+                "/card Имя | 25 очков, 12 подборов, 3 блокшота | impact | подпись\n"
+                "/addplayer Имя Фамилия | IND | Егор Дёмин | -90000001\n"
+                "/setteam Pascal Siakam | IND\n"
+                "/setru John Tonje | Джон Тонджей\n"
+                "Шаблоны: single, pair, single_note, impact, bad")
+        tg_send_message(chat_id, hint); return JSONResponse({"ok": True})
+
+    name, stats, template, note, _raw = parsed
+    from data import find_player_by_name, ensure_headshot_png, ensure_team_logo_png, suggest_players
+    player = find_player_by_name(name)
+    if not player:
+        suggestions = suggest_players(name, limit=4)
+        kb_rows = [[{"text": s["display"], "callback_data": f"pick:{s['id']}"}] for s in suggestions]
+        kb_rows.append([{"text": "➕ Добавить вручную (/addplayer)", "callback_data": "noop"}])
+        kb = {"inline_keyboard": kb_rows}
+        tg_send_message(chat_id, "Игрок не найден. Возможно, вы имели в виду:", reply_to_message_id=msg.get("message_id"), reply_markup=kb)
+        return JSONResponse({"ok": True})
+
+    logo_path, team_colors = ensure_team_logo_png(player["team_id"])
+    head_path = ensure_headshot_png(player["id"], player["full_name"])
+    png_bytes = render_card(template=template, player_name=player["display"] or player["full_name"],
+                            team_name=player["team_name"], team_logo_path=logo_path, team_colors=team_colors,
+                            headshot_path=head_path, stats=stats, note=note)
+    ok, resp = tg_send_png(chat_id, png_bytes)
+    if not ok: tg_send_message(chat_id, f"Ошибка отправки изображения: {resp}")
+    return JSONResponse({"ok": True})
+
+@app.get("/")
+@app.get("/api/telegram")
+async def health(action: str = Query(default=""), secret: str = Query(default=""), drop_cache: int = Query(default=0), debug: int = Query(default=0)):
+    if action == "refresh":
+        if secret != WEBHOOK_SECRET: raise HTTPException(status_code=404, detail="Not found")
         try:
-            r = requests.get(u, timeout=8)
-            if r.ok and r.content and r.content[:4] == b"\x89PNG":
-                path.write_bytes(r.content)
-                return str(path)
-        except Exception:
-            continue
-    return ICON_STAR
-
-def ensure_team_logo_png(team_id: int) -> Tuple[str, Tuple[str,str,str]]:
-    if team_id and (LOGO_DIR / f"logo_{team_id}.png").exists():
-        logo_path = str((LOGO_DIR / f"logo_{team_id}.png").resolve())
+            from data import drop_players_cache, _ensure_index, players_count
+            if drop_cache: drop_players_cache()
+            _ensure_index(force=True); cnt = players_count()
+            return {"ok": True, "refreshed": True, "players_indexed": cnt}
+        except Exception as e:
+            return {"ok": False, "error": repr(e)}
     else:
-        logo_path = ICON_STAR
-    primary = TEAM_PRIMARY.get(team_id, "#0EA5FF")
-    dark = _shade(primary, 0.90)
-    light = "#FFFFFF"
-    return logo_path, (primary, dark, light)
+        try:
+            from data import players_count; cnt = players_count()
+        except Exception: cnt = -1
+        return {"ok": True, "players_indexed": cnt, "endpoints": [
+            "GET  /api/telegram (action=refresh&secret=...)",
+            "POST /api/telegram?secret=...  (Telegram webhook)"
+        ]}
+
+@app.post("/")
+@app.post("/api/telegram")
+async def webhook_query(request: Request, secret: str = Query(default="")):
+    if not BOT_TOKEN: raise HTTPException(status_code=500, detail="BOT_TOKEN not set")
+    if secret != WEBHOOK_SECRET: raise HTTPException(status_code=404, detail="Not found")
+    try: update = await request.json()
+    except Exception: return JSONResponse({"ok": True})
+    return await handle_update(update)
+
+@app.post("/webhook/{secret}")
+@app.post("/api/telegram/webhook/{secret}")
+async def webhook_path(request: Request, secret: str):
+    if not BOT_TOKEN: raise HTTPException(status_code=500, detail="BOT_TOKEN not set")
+    if secret != WEBHOOK_SECRET: raise HTTPException(status_code=404, detail="Not found")
+    try: update = await request.json()
+    except Exception: return JSONResponse({"ok": True})
+    return await handle_update(update)
