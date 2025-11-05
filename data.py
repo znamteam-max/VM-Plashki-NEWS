@@ -1,31 +1,45 @@
 # data.py — индекс игроков (лат/кириллица), русское имя, headshots/логотипы, подсказки, алиасы
+# Спроектирован для Vercel/Serverless: устойчив к тайм-аутам, сетевым сбоям и "пустым" ответам
 import os, json, unicodedata, re, time
 from pathlib import Path
 from typing import Dict, Any, Tuple, List, Optional
 import requests
 from difflib import SequenceMatcher
-from urllib.parse import urlparse, urlunparse
+from datetime import datetime
 
-# ===== пути и кэш =====
+# ============ базовая файловая структура/кэш ============
 ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "assets"
 ASSETS.mkdir(parents=True, exist_ok=True)
+
 CACHE = Path("/tmp/nba_cache")
 CACHE.mkdir(parents=True, exist_ok=True)
 
 PLAYERS_CACHE = CACHE / "players_index.json"
 ALIASES_FILE  = CACHE / "aliases.json"
-EXTRA_PLAYERS_FILE = CACHE / "manual_players.json"   # для ручных добавлений (переживает инстанс до перезагрузки)
-RU_OVERRIDES_FILE  = CACHE / "ru_overrides.json"     # для /setru
-
 HEAD_DIR = CACHE / "headshots"; HEAD_DIR.mkdir(exist_ok=True)
 LOGO_DIR = ASSETS / "cache"  # ожидаются logo_<teamId>.png
 ICON_STAR = str((ASSETS / "icons" / "star.png").resolve())
 
-REFRESH_SECONDS = int(os.getenv("PLAYERS_REFRESH_SECONDS", "86400"))  # 1 день
-PLAYERS_CUSTOM_URL = (os.getenv("PLAYERS_CUSTOM_URL") or "").strip()
+# персист-переопределения (для /setru, /setteam, /sethead, /addplayer)
+OVERRIDES_RU_FILE    = CACHE / "overrides_ru.json"      # { "<player_id>": "Рус Имя" }
+OVERRIDES_TEAM_FILE  = CACHE / "overrides_team.json"    # { "<player_id>": 16106127xxx }
+OVERRIDES_PHOTO_FILE = CACHE / "overrides_photo.json"   # { "<player_id>": "https://..." | "local:/path" }
+CUSTOM_PLAYERS_FILE  = CACHE / "custom_players.json"    # [ {personId, firstName, lastName, teamId, isActive} ]
 
-# ===== команды: имена и базовый цвет (primary) =====
+# ============ окружение/флаги ============
+REFRESH_SECONDS = int(os.getenv("PLAYERS_REFRESH_SECONDS", "86400"))  # 1 день
+PLAYERS_CUSTOM_URL = os.getenv("PLAYERS_CUSTOM_URL", "").strip()
+ENFORCE_SOURCE = os.getenv("PLAYERS_ENFORCE_SOURCE", "stats").lower()    # stats|any (мы используем stats)
+ALLOW_LEGACY_FALLBACK = os.getenv("PLAYERS_ALLOW_LEGACY", "0") == "1"    # по умолчанию запрещено
+MIN_EXPECTED = int(os.getenv("PLAYERS_MIN_EXPECTED", "350"))             # если меньше — считаем невалидным
+REQUEST_TIMEOUT = int(os.getenv("PLAYERS_REQUEST_TIMEOUT", "20"))
+
+def _log(msg: str):
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    print(f"{ts} [info] [data] {msg}")
+
+# ============ команды НБА ============
 TEAM_NAMES: Dict[int, str] = {
     1610612737:"Atlanta Hawks", 1610612738:"Boston Celtics", 1610612739:"Cleveland Cavaliers",
     1610612740:"New Orleans Pelicans", 1610612741:"Chicago Bulls", 1610612742:"Dallas Mavericks",
@@ -56,7 +70,7 @@ def _shade(hex_color: str, k: float) -> str:
     r = max(0, min(255, int(r*k))); g = max(0, min(255, int(g*k))); b = max(0, min(255, int(b*k)))
     return f"#{r:02X}{g:02X}{b:02X}"
 
-# ===== нормализация / транслит =====
+# ============ нормализация/транслит ============
 def _strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 def _normalize_key(s: str) -> str:
@@ -96,8 +110,8 @@ def cyr2lat(s: str) -> str:
         t.append(CYR_SINGLE.get(ch, ch))
     return " ".join(w.capitalize() for w in "".join(t).split())
 
-# ===== ручные русские имена (базовые) =====
-RU_NAME_OVERRIDES_BASE: Dict[str,str] = {
+# ============ ручные русские имена (базовый словарь) ============
+RU_NAME_OVERRIDES: Dict[str,str] = {
     "victor wembanyama":"Виктор Вембаньяма",
     "zion williamson":"Зайон Уильямсон",
     "luka doncic":"Лука Дончич",
@@ -114,49 +128,36 @@ RU_NAME_OVERRIDES_BASE: Dict[str,str] = {
     "alperen sengun":"Алперен Шенгюн",
 }
 
-def _load_json_file(p: Path, default):
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            return default
-    return default
-
-RU_NAME_OVERRIDES_EXTRA: Dict[str, str] = _load_json_file(RU_OVERRIDES_FILE, {})
-def set_ru_name(full_ascii: str, ru_name: str) -> bool:
-    """Сохранить RU-имя в персистентный оверрайд (/setru использует)."""
-    try:
-        full_ascii = " ".join(full_ascii.split())
-        k = _normalize_key(full_ascii)
-        RU_NAME_OVERRIDES_EXTRA[k] = ru_name
-        RU_OVERRIDES_FILE.write_text(json.dumps(RU_NAME_OVERRIDES_EXTRA, ensure_ascii=False), encoding="utf-8")
-        return True
-    except Exception:
-        return False
-
-def _ru_display_for(full_ascii: str) -> str:
-    k = _normalize_key(full_ascii)
-    return RU_NAME_OVERRIDES_EXTRA.get(k) or RU_NAME_OVERRIDES_BASE.get(k) or lat2cyr(full_ascii)
-
-# --- Минимальный фоллбек ---
+# --- Фоллбек на случай полного провала источников (минимальный список) ---
 FALLBACK_PLAYERS = [
-    {"personId":"203999","firstName":"Nikola","lastName":"Jokic","teamId":"1610612743"},
-    {"personId":"201939","firstName":"Stephen","lastName":"Curry","teamId":"1610612744"},
-    {"personId":"2544","firstName":"LeBron","lastName":"James","teamId":"1610612747"},
-    {"personId":"1641707","firstName":"Victor","lastName":"Wembanyama","teamId":"1610612759"},
-    {"personId":"1629627","firstName":"Zion","lastName":"Williamson","teamId":"1610612740"},
-    {"personId":"203507","firstName":"Giannis","lastName":"Antetokounmpo","teamId":"1610612749"},
-    {"personId":"203954","firstName":"Joel","lastName":"Embiid","teamId":"1610612755"},
-    {"personId":"201142","firstName":"Kevin","lastName":"Durant","teamId":"1610612756"},
-    {"personId":"1629029","firstName":"Luka","lastName":"Doncic","teamId":"1610612742"},
+    {"personId":"203999","firstName":"Nikola","lastName":"Jokic","teamId":"1610612743","isActive":True},
+    {"personId":"201939","firstName":"Stephen","lastName":"Curry","teamId":"1610612744","isActive":True},
+    {"personId":"2544","firstName":"LeBron","lastName":"James","teamId":"1610612747","isActive":True},
+    {"personId":"1641707","firstName":"Victor","lastName":"Wembanyama","teamId":"1610612759","isActive":True},
+    {"personId":"1629627","firstName":"Zion","lastName":"Williamson","teamId":"1610612740","isActive":True},
+    {"personId":"203507","firstName":"Giannis","lastName":"Antetokounmpo","teamId":"1610612749","isActive":True},
+    {"personId":"203954","firstName":"Joel","lastName":"Embiid","teamId":"1610612755","isActive":True},
+    {"personId":"201142","firstName":"Kevin","lastName":"Durant","teamId":"1610612756","isActive":True},
+    {"personId":"1629029","firstName":"Luka","lastName":"Doncic","teamId":"1610612742","isActive":True},
 ]
 
-# ===== алиасы, задаваемые из бота =====
+# ============ алиасы ============
 _ALIASES: Dict[str, str] = {}  # key(normalized alias) -> normalized base ascii-key
+
 def _load_aliases():
     global _ALIASES
-    _ALIASES.update(_load_json_file(ALIASES_FILE, {}))
+    if ALIASES_FILE.exists():
+        try:
+            _ALIASES = json.loads(ALIASES_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            _ALIASES = {}
+    else:
+        _ALIASES = {}
+
 def add_alias(alias_text: str, base_full_ascii: str) -> bool:
+    """
+    Добавляет алиас: alias_text -> base_full_ascii (оба нормализуются).
+    """
     try:
         k = _normalize_key(alias_text)
         base_k = _normalize_key(base_full_ascii)
@@ -165,152 +166,149 @@ def add_alias(alias_text: str, base_full_ascii: str) -> bool:
         return True
     except Exception:
         return False
+
+def _apply_alias(q_norm: str) -> Optional[str]:
+    return _ALIASES.get(q_norm)
+
 _load_aliases()
 
-# ===== ручные игроки (добавления из бота) =====
-_MANUAL_PLAYERS: List[Dict[str, Any]] = _load_json_file(EXTRA_PLAYERS_FILE, [])
-def add_manual_player(person_id: int, first: str, last: str, team_id: int) -> bool:
-    """Добавить игрока вручную (например, дебютант G-League/Евролиги)."""
+# ============ персист-переопределения (load/save) ============
+def _load_json_file(path: Path, default):
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return default
+    return default
+
+def _save_json_file(path: Path, data) -> bool:
     try:
-        person_id = int(person_id)
-        team_id = int(team_id)
-        _MANUAL_PLAYERS[:] = [p for p in _MANUAL_PLAYERS if str(p.get("personId")) != str(person_id)]
-        _MANUAL_PLAYERS.append({
-            "personId": str(person_id),
-            "firstName": first.strip(),
-            "lastName": last.strip(),
-            "teamId": str(team_id),
-            "isActive": True,
-        })
-        EXTRA_PLAYERS_FILE.write_text(json.dumps(_MANUAL_PLAYERS, ensure_ascii=False), encoding="utf-8")
-        # сбросим индекс, чтобы подхватился сразу
-        drop_players_cache()
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         return True
     except Exception:
         return False
 
-def set_player_team_by_id(person_id: int, team_id: int) -> bool:
-    """Сменить команду игрока по ID (например, Сиакам TOR -> IND)."""
-    person_id, team_id = int(person_id), int(team_id)
-    # правим manual-слой
-    changed = False
-    for p in _MANUAL_PLAYERS:
-        if str(p.get("personId")) == str(person_id):
-            p["teamId"] = str(team_id); changed = True
-    if changed:
-        EXTRA_PLAYERS_FILE.write_text(json.dumps(_MANUAL_PLAYERS, ensure_ascii=False), encoding="utf-8")
-        drop_players_cache()
-        return True
-    # если в manual ещё нет — создадим патч-запись (с пустыми именами, подтянем из индекса при сборке)
-    _MANUAL_PLAYERS.append({
-        "personId": str(person_id), "firstName":"", "lastName":"", "teamId": str(team_id), "isActive": True
-    })
-    EXTRA_PLAYERS_FILE.write_text(json.dumps(_MANUAL_PLAYERS, ensure_ascii=False), encoding="utf-8")
-    drop_players_cache()
-    return True
+_OVR_RU    = _load_json_file(OVERRIDES_RU_FILE, {})
+_OVR_TEAM  = _load_json_file(OVERRIDES_TEAM_FILE, {})
+_OVR_PHOTO = _load_json_file(OVERRIDES_PHOTO_FILE, {})
+_CUSTOM    = _load_json_file(CUSTOM_PLAYERS_FILE, [])
 
-# ===== утилиты загрузки =====
-_UA = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
-}
-def _log(msg: str):  # компактный лог в Vercel
-    print(f"[players] {msg}")
+def set_ru_display(player_id: int, ru_name: str) -> bool:
+    _OVR_RU[str(int(player_id))] = ru_name.strip()
+    ok = _save_json_file(OVERRIDES_RU_FILE, _OVR_RU)
+    if ok:
+        _bust_players_cache_memory()
+    return ok
 
-def _fetch_json(url: str, timeout: int = 15):
+def set_player_team(player_id: int, team_id: int) -> bool:
+    _OVR_TEAM[str(int(player_id))] = int(team_id)
+    ok = _save_json_file(OVERRIDES_TEAM_FILE, _OVR_TEAM)
+    if ok:
+        _bust_players_cache_memory()
+    return ok
+
+def set_player_photo(player_id: int, url_or_local: str) -> bool:
+    _OVR_PHOTO[str(int(player_id))] = url_or_local.strip()
+    ok = _save_json_file(OVERRIDES_PHOTO_FILE, _OVR_PHOTO)
+    return ok
+
+def add_custom_player(personId: int, firstName: str, lastName: str, teamId: int = 0, isActive: bool = True) -> bool:
+    rec = {
+        "personId": str(int(personId)),
+        "firstName": firstName.strip(),
+        "lastName": lastName.strip(),
+        "teamId": str(int(teamId)) if teamId else "0",
+        "isActive": bool(isActive),
+    }
+    # обновим, если уже существует
+    exists = False
+    for i, r in enumerate(_CUSTOM):
+        if str(r.get("personId")) == rec["personId"]:
+            _CUSTOM[i] = rec
+            exists = True
+            break
+    if not exists:
+        _CUSTOM.append(rec)
+    ok = _save_json_file(CUSTOM_PLAYERS_FILE, _CUSTOM)
+    if ok:
+        _bust_players_cache_memory()
+    return ok
+
+# ============ сетевые утилиты ============
+def _fetch_json(url: str, timeout: int = REQUEST_TIMEOUT) -> Optional[Dict[str, Any]]:
     try:
-        r = requests.get(url, headers=_UA, timeout=timeout)
-        if not r.ok:
-            _log(f"GET {url} -> status={r.status_code}")
-            return None
-        return r.json()
+        r = requests.get(url, timeout=timeout)
+        if r.ok:
+            return r.json()
+        return None
     except Exception as e:
-        _log(f"GET fail: {url} -> {e.__class__.__name__}: {e}")
+        _log(f"GET fail: {url} -> {type(e).__name__}: {e}")
         return None
 
-def _parse_resultsets_style(j: Dict[str, Any]) -> List[Dict[str, Any]]:
-    sets = j.get("resultSets") or j.get("ResultSets") or []
-    if not sets:
-        return []
-    rs = sets[0]
-    headers = [h.lower() for h in rs.get("headers", [])]
-    rows = rs.get("rowSet", [])
-    out = []
-    for row in rows:
-        d = dict(zip(headers, row))
-        out.append({
-            "personId": str(d.get("person_id") or d.get("personid") or ""),
-            "firstName": str(d.get("first_name") or d.get("firstname") or ""),
-            "lastName":  str(d.get("last_name") or d.get("lastname") or ""),
-            "teamId":    str(d.get("team_id") or d.get("teamid") or "0"),
-            "isActive":  bool(int(d.get("rosterstatus") or d.get("is_active") or 1)),
-        })
-    return out
+def _url_with_params(base: str, qs: str) -> str:
+    if "?" in base:
+        return f"{base}&{qs}"
+    return f"{base}?{qs}"
 
-def _extract_players(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    if not payload:
+# ============ парсеры источников ============
+def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Универсальный парсер:
+    - stats.nba.com формат (через Cloudflare worker): resultSets -> PlayerList
+    - legacy data.nba.net: league.standard
+    Возвращает список записей вида {personId, firstName, lastName, teamId, isActive}
+    """
+    if not j:
         return []
-    std = (payload.get("league") or {}).get("standard")
-    if isinstance(std, list) and std:
-        return std
-    rs = _parse_resultsets_style(payload)
-    if rs:
-        return rs
+
+    # stats.nba.com proxied
+    if "resultSets" in j:
+        try:
+            rs = j["resultSets"][0]
+            headers = rs["headers"]
+            rowset = rs["rowSet"]
+            # ожидаемые столбцы
+            pid_i = headers.index("PERSON_ID")
+            fn_i  = headers.index("FIRST_NAME")
+            ln_i  = headers.index("LAST_NAME")
+            tid_i = headers.index("TEAM_ID")
+            act_i = headers.index("ROSTERSTATUS") if "ROSTERSTATUS" in headers else None
+            out = []
+            for row in rowset:
+                personId = str(row[pid_i])
+                firstName = str(row[fn_i] or "").strip()
+                lastName  = str(row[ln_i] or "").strip()
+                teamId    = str(row[tid_i] or "0")
+                isActive  = bool(row[act_i]) if act_i is not None else True
+                out.append({
+                    "personId": personId,
+                    "firstName": firstName,
+                    "lastName": lastName,
+                    "teamId": teamId,
+                    "isActive": isActive,
+                })
+            return out
+        except Exception as e:
+            _log(f"stats extract error: {e}")
+            return []
+
+    # legacy data.nba.net
+    if j.get("league", {}).get("standard"):
+        out = []
+        for p in j["league"]["standard"]:
+            try:
+                out.append({
+                    "personId": str(p.get("personId") or ""),
+                    "firstName": str(p.get("firstName") or "").strip(),
+                    "lastName": str(p.get("lastName") or "").strip(),
+                    "teamId": str(p.get("teamId") or "0"),
+                    "isActive": bool(p.get("isActive", True)),
+                })
+            except Exception:
+                continue
+        return out
+
     return []
-
-def _url_with_params(base: str, add_query: str) -> str:
-    # аккуратно добавляем параметры к существующим
-    parsed = urlparse(base)
-    q = parsed.query
-    q = f"{q}&{add_query}" if q else add_query
-    return urlunparse(parsed._replace(query=q))
-
-def _fetch_from_custom() -> List[List[Dict[str, Any]]]:
-    """Собирает ответы с воркера во всех комбинациях параметров и возвращает списки игроков."""
-    if not PLAYERS_CUSTOM_URL:
-        return []
-    candidates = []
-    base = PLAYERS_CUSTOM_URL.rstrip("/")
-    # пробуем без параметров
-    candidates.append(base)
-    # сезон 2025-26
-    candidates.append(_url_with_params(base, "season=2025-26"))
-    # явные источники
-    candidates.append(_url_with_params(base, "source=stats"))
-    candidates.append(_url_with_params(base, "source=legacy"))
-    candidates.append(_url_with_params(base, "season=2025-26&source=stats"))
-    candidates.append(_url_with_params(base, "season=2025-26&source=legacy"))
-
-    seen_urls = set()
-    results: List[List[Dict[str, Any]]] = []
-    for u in candidates:
-        if u in seen_urls:
-            continue
-        seen_urls.add(u)
-        j = _fetch_json(u, timeout=18)
-        if not j:
-            continue
-        arr = _extract_players(j)
-        _log(f"custom parsed: {len(arr)} from {u}")
-        if arr:
-            results.append(arr)
-    return results
-
-def _fetch_from_legacy() -> List[List[Dict[str, Any]]]:
-    urls = [
-        "https://data.nba.com/data/10s/prod/v1/2025/players.json",
-        "https://data.nba.com/data/10s/prod/v1/2024/players.json",
-        "https://data.nba.net/prod/v1/2025/players.json",
-        "https://data.nba.net/prod/v1/2024/players.json",
-    ]
-    out = []
-    for u in urls:
-        j = _fetch_json(u, timeout=12)
-        arr = _extract_players(j) if j else []
-        _log(f"legacy parsed: {len(arr)} from {u}")
-        if arr:
-            out.append(arr)
-    return out
 
 def _fetch_local_snapshot() -> List[List[Dict[str, Any]]]:
     local = ASSETS / "players.json"
@@ -318,96 +316,181 @@ def _fetch_local_snapshot() -> List[List[Dict[str, Any]]]:
         try:
             j = json.loads(local.read_text(encoding="utf-8"))
             arr = _extract_players(j)
-            _log(f"local snapshot: {len(arr)}")
             if arr:
+                _log(f"local snapshot parsed: {len(arr)}")
                 return [arr]
         except Exception:
             pass
     return []
 
-def _merge_players(list_of_lists: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    """Дедуп по personId, приоритет: первые массивы приоритнее."""
-    merged: Dict[str, Dict[str, Any]] = {}
-    for arr in list_of_lists:
-        for p in arr:
-            pid = str(p.get("personId") or "").strip()
-            if not pid:
-                continue
-            if pid in merged:
-                # если новый источник знает команду лучше — обновим
-                old = merged[pid]
-                old_team = int(str(old.get("teamId") or "0"))
-                new_team = int(str(p.get("teamId") or "0"))
-                if new_team and (not old_team or old_team == 0):
-                    merged[pid] = p
-            else:
-                merged[pid] = p
-    # подмешиваем ручных
-    for p in _MANUAL_PLAYERS:
-        pid = str(p.get("personId") or "").strip()
-        if not pid:
+def _fetch_from_custom() -> List[List[Dict[str, Any]]]:
+    if not PLAYERS_CUSTOM_URL:
+        _log("custom URL is empty")
+        return []
+    base = PLAYERS_CUSTOM_URL.rstrip("/")
+    # Жёстко тянем stats-варианты (worker)
+    candidates = [
+        base,
+        _url_with_params(base, "season=2025-26"),
+        _url_with_params(base, "season=2025-26&source=stats"),
+    ]
+    seen, results = set(), []
+    for u in candidates:
+        if u in seen:
             continue
-        merged[pid] = p
-    return list(merged.values())
+        seen.add(u)
+        j = _fetch_json(u, timeout=REQUEST_TIMEOUT)
+        arr = _extract_players(j) if j else []
+        _log(f"custom parsed {len(arr)} from {u}")
+        if arr:
+            results.append(arr)
+    return results
+
+def _fetch_from_legacy() -> List[List[Dict[str, Any]]]:
+    # Должно быть отключено по умолчанию — включайте только если очень нужно
+    urls = [
+        "https://data.nba.net/prod/v1/2025/players.json",
+        "https://data.nba.net/prod/v1/2024/players.json",
+        "https://data.nba.com/data/10s/prod/v1/2025/players.json",
+        "https://data.nba.com/data/10s/prod/v1/2024/players.json",
+    ]
+    results = []
+    for u in urls:
+        j = _fetch_json(u, timeout=REQUEST_TIMEOUT)
+        arr = _extract_players(j) if j else []
+        _log(f"legacy parsed {len(arr)} from {u}")
+        if arr:
+            results.append(arr)
+    return results
+
+# ============ мердж игроков ============
+def _merge_players(batches: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """
+    Сливает списки игроков. Схема приоритетов:
+      1) custom (ваш воркер stats) — самые приоритетные и первые
+      2) local snapshot
+      3) legacy (если разрешён)
+      4) FALLBACK + CUSTOM_PLAYERS
+    Последующие батчи не затирают teamId, если он уже есть от более приоритетного источника.
+    """
+    by_id: Dict[int, Dict[str, Any]] = {}
+
+    # 0) сначала кастомно добавленные игроки (чтобы им можно было потом проставить teamId/имена)
+    for cp in (_CUSTOM or []):
+        try:
+            pid = int(cp.get("personId"))
+            by_id[pid] = {
+                "id": pid,
+                "first": cp.get("firstName","").strip(),
+                "last": cp.get("lastName","").strip(),
+                "team_id": int(cp.get("teamId") or 0),
+                "active": bool(cp.get("isActive", True)),
+            }
+        except Exception:
+            continue
+
+    def _upsert_batch(batch: List[Dict[str, Any]]):
+        for p in batch:
+            try:
+                pid = int(p.get("personId"))
+                first = p.get("firstName","").strip()
+                last  = p.get("lastName","").strip()
+                team  = int(p.get("teamId") or 0)
+                active = bool(p.get("isActive", True))
+            except Exception:
+                continue
+
+            if pid not in by_id:
+                by_id[pid] = {"id": pid, "first": first, "last": last, "team_id": team, "active": active}
+            else:
+                # обновим имя/фамилию если пусто
+                if not by_id[pid].get("first") and first:
+                    by_id[pid]["first"] = first
+                if not by_id[pid].get("last") and last:
+                    by_id[pid]["last"] = last
+                # команду — только если в текущей записи >0, а у нас 0
+                if team and not by_id[pid].get("team_id"):
+                    by_id[pid]["team_id"] = team
+                # активность — если не была задана
+                if "active" not in by_id[pid]:
+                    by_id[pid]["active"] = active
+
+    for batch in batches:
+        _upsert_batch(batch)
+
+    # если пусто — добавим FALLBACK
+    if not by_id:
+        for p in FALLBACK_PLAYERS:
+            try:
+                pid = int(p["personId"])
+                by_id[pid] = {
+                    "id": pid,
+                    "first": p["firstName"], "last": p["lastName"],
+                    "team_id": int(p.get("teamId") or 0),
+                    "active": bool(p.get("isActive", True)),
+                }
+            except Exception:
+                continue
+
+    # применим ручные overrides команд
+    for k, v in list(_OVR_TEAM.items()):
+        try:
+            pid = int(k); tid = int(v)
+            if pid in by_id:
+                by_id[pid]["team_id"] = tid
+        except Exception:
+            continue
+
+    # финальный список
+    out = list(by_id.values())
+    out.sort(key=lambda r: (0 if r.get("active") else 1, r.get("last",""), r.get("first","")))
+    return out
+
+# ============ построение индекса ============
+def _extract_display(first: str, last: str, pid: int) -> str:
+    full_ascii = f"{first} {last}".strip()
+    ascii_key = _normalize_key(full_ascii)
+    # Сначала явные русские оверрайды по ASCII-ключу (базовый словарь)
+    ru = RU_NAME_OVERRIDES.get(ascii_key)
+    if not ru:
+        # затем персональные overrides по ID
+        ru = _OVR_RU.get(str(pid))
+    if not ru:
+        ru = lat2cyr(full_ascii)
+    return ru
 
 def _build_index() -> Dict[str, Any]:
     batches: List[List[Dict[str, Any]]] = []
 
-    # 0) custom worker (всевозможные параметры)
-    batches.extend(_fetch_from_custom())
-
-    # 1) локальный снапшот
-    if not batches:
+    # 1) custom (ваш Cloudflare worker, stats 2025-26)
+    custom_batches = _fetch_from_custom()
+    if custom_batches:
+        batches.extend(custom_batches)
+        total = sum(len(b) for b in custom_batches)
+        _log(f"custom total parsed: {total}")
+        if total < MIN_EXPECTED and ALLOW_LEGACY_FALLBACK:
+            _log(f"custom too small ({total}) — legacy fallback allowed -> try legacy")
+            batches.extend(_fetch_from_legacy())
+    else:
+        _log("custom empty — try local snapshot")
         batches.extend(_fetch_local_snapshot())
+        if not batches and ALLOW_LEGACY_FALLBACK:
+            _log("no local — using legacy (allowed)")
+            batches.extend(_fetch_from_legacy())
 
-    # 2) legacy NBA (на случай блокировок stats)
-    if sum(len(b) for b in batches) < 400:
-        batches.extend(_fetch_from_legacy())
+    players_list = _merge_players(batches)
+    _log(f"merged players total: {len(players_list)}")
 
-    # если вообще пусто — фоллбек
-    if not batches:
-        batches = [[p for p in FALLBACK_PLAYERS]]
-
-    players = _merge_players(batches)
-    _log(f"merged players total: {len(players)}")
-
+    # формируем индекс
     index: Dict[str, Any] = {"_bykey": {}, "_byid": {}}
-
-    # Для патчей set_player_team_by_id, где first/last могли быть пустыми
-    # попробуем подставить имена из лучших источников
-    by_id_best_names: Dict[str, Tuple[str,str]] = {}
-    for arr in batches:
-        for p in arr:
-            pid = str(p.get("personId") or "").strip()
-            if not pid:
-                continue
-            fn = (p.get("firstName") or "").strip()
-            ln = (p.get("lastName") or "").strip()
-            if pid not in by_id_best_names and (fn or ln):
-                by_id_best_names[pid] = (fn, ln)
-
-    for p in players:
-        if not p.get("personId"):
-            continue
-        try:
-            pid = int(str(p["personId"]).strip())
-        except Exception:
-            continue
-        first = str(p.get("firstName","")).strip()
-        last  = str(p.get("lastName","")).strip()
-        if not first and not last:
-            # заполним именами из других источников, если есть
-            tpl = by_id_best_names.get(str(pid))
-            if tpl:
-                first, last = tpl
-        try:
-            team_id = int(str(p.get("teamId") or 0))
-        except Exception:
-            team_id = 0
+    for r in players_list:
+        pid = int(r["id"])
+        first = r.get("first","").strip()
+        last  = r.get("last","").strip()
+        team_id = int(r.get("team_id") or 0)
         team_name = TEAM_NAMES.get(team_id, "Free Agent")
         full_ascii = f"{first} {last}".strip()
-        ascii_key = _normalize_key(full_ascii) if full_ascii else str(pid)
-        ru_display = _ru_display_for(full_ascii) if full_ascii else f"ID {pid}"
+        ru_display = _extract_display(first, last, pid)
 
         rec = {
             "id": pid,
@@ -418,15 +501,15 @@ def _build_index() -> Dict[str, Any]:
         }
         index["_byid"][pid] = rec
 
-        # ключи для поиска
-        if full_ascii:
-            cyr_key = _normalize_key(ru_display)
-            index["_bykey"][ascii_key] = rec
-            index["_bykey"][cyr_key] = rec
-            index["_bykey"][_normalize_key(full_ascii.replace("-", " "))] = rec
-            index["_bykey"][_normalize_key(ru_display.replace("-", " "))] = rec
+        ascii_key = _normalize_key(full_ascii)
+        cyr_key   = _normalize_key(ru_display)
 
-    # короткие прозвища
+        index["_bykey"][ascii_key] = rec
+        index["_bykey"][cyr_key] = rec
+        index["_bykey"][_normalize_key(full_ascii.replace("-", " "))] = rec
+        index["_bykey"][_normalize_key(ru_display.replace("-", " "))] = rec
+
+    # короткие прозвища (можно расширять)
     aliases = {
         "wemby":"victor wembanyama", "вемба":"victor wembanyama",
         "зайон":"zion williamson", "лука":"luka doncic", "йокич":"nikola jokic", "ёкич":"nikola jokic",
@@ -442,44 +525,47 @@ def _build_index() -> Dict[str, Any]:
 
     return index
 
-# ===== кэш индекса =====
-_PLAYERS: Optional[Dict[str, Any]] = None
-_LAST_LOAD: float = 0.0
+# ============ кэш и API ============
+_PLAYERS: Dict[str, Any] | None = None
+_LAST_LOAD = 0
+
+def _bust_players_cache_memory():
+    global _PLAYERS, _LAST_LOAD
+    _PLAYERS = None
+    _LAST_LOAD = 0
+
+def drop_players_cache() -> bool:
+    """
+    Полностью сбрасывает JSON-кэш на /tmp и память. Используйте при refresh.
+    """
+    try:
+        if PLAYERS_CACHE.exists():
+            PLAYERS_CACHE.unlink(missing_ok=True)
+    except Exception:
+        pass
+    _bust_players_cache_memory()
+    return True
 
 def _ensure_index():
     global _PLAYERS, _LAST_LOAD
     now = time.time()
     if _PLAYERS and (now - _LAST_LOAD) < REFRESH_SECONDS:
         return
+    # пробуем читать кэш
     if PLAYERS_CACHE.exists():
         try:
             _PLAYERS = json.loads(PLAYERS_CACHE.read_text(encoding="utf-8"))
             _LAST_LOAD = now
+            return
         except Exception:
             _PLAYERS = None
-    if not _PLAYERS:
-        _PLAYERS = _build_index()
-        try:
-            PLAYERS_CACHE.write_text(json.dumps(_PLAYERS, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
-        _LAST_LOAD = now
-
-def drop_players_cache() -> bool:
-    global _PLAYERS, _LAST_LOAD
-    _PLAYERS = None
-    _LAST_LOAD = 0.0
+    # иначе строим с нуля
+    _PLAYERS = _build_index()
     try:
-        if PLAYERS_CACHE.exists():
-            PLAYERS_CACHE.unlink()
+        PLAYERS_CACHE.write_text(json.dumps(_PLAYERS, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
-    return True
-
-def refresh_players_index() -> int:
-    drop_players_cache()
-    _ensure_index()
-    return len(_PLAYERS["_byid"]) if _PLAYERS else 0
+    _LAST_LOAD = now
 
 def players_count() -> int:
     _ensure_index()
@@ -489,10 +575,9 @@ def get_player_by_id(pid: int) -> Optional[Dict[str, Any]]:
     _ensure_index()
     return _PLAYERS["_byid"].get(int(pid)) if _PLAYERS else None
 
-def _apply_alias(q_norm: str) -> Optional[str]:
-    return _ALIASES.get(q_norm)
-
+# ============ поиск ============
 def find_player_by_name(query: str) -> Optional[Dict[str, Any]]:
+    """Возвращает {id, full_name, display, team_id, team_name}."""
     if not query:
         return None
     _ensure_index()
@@ -501,31 +586,37 @@ def find_player_by_name(query: str) -> Optional[Dict[str, Any]]:
 
     q = _normalize_key(query)
 
+    # 1) Алиасы, заданные из бота
     base = _apply_alias(q)
     if base and base in _PLAYERS["_bykey"]:
         return _PLAYERS["_bykey"][base]
 
+    # 2) Прямые совпадения
     rec = _PLAYERS["_bykey"].get(q)
     if rec:
         return rec
 
+    # 3) Кири -> лат
     if re.search("[а-яё]", q):
         lat_guess = _normalize_key(cyr2lat(query))
         rec = _PLAYERS["_bykey"].get(lat_guess)
         if rec:
             return rec
 
+    # 4) Лат -> лат без акцентов
     lat_guess2 = _normalize_key(_strip_accents(query))
     if lat_guess2 != q:
         rec = _PLAYERS["_bykey"].get(lat_guess2)
         if rec:
             return rec
 
+    # 5) Лат -> кир транслит
     cyr_guess = _normalize_key(lat2cyr(query))
     rec = _PLAYERS["_bykey"].get(cyr_guess)
     if rec:
         return rec
 
+    # 6) По фамилии
     last = q.split(" ")[-1]
     if len(last) >= 3:
         for k, r in _PLAYERS["_bykey"].items():
@@ -535,6 +626,7 @@ def find_player_by_name(query: str) -> Optional[Dict[str, Any]]:
     return None
 
 def suggest_players(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Топ-совпадения по похожести (для «Игрок не найден»)."""
     _ensure_index()
     if not _PLAYERS or not query:
         return []
@@ -561,8 +653,35 @@ def suggest_players(query: str, limit: int = 5) -> List[Dict[str, Any]]:
             break
     return out
 
-# ===== headshots & logos =====
+# ============ headshots & logos ============
 def ensure_headshot_png(player_id: int, full_name: str) -> str:
+    """
+    Пытается скачать PNG головы.
+    - Сначала проверяет overrides_photo (URL или local:/abs/path).
+    - Потом cdn.nba.com 1040x760 -> 260x190.
+    - Иначе иконка-стаб.
+    """
+    # override фото
+    ovr = _OVR_PHOTO.get(str(int(player_id)))
+    if ovr:
+        if ovr.startswith("local:"):
+            p = ovr[len("local:") : ].strip()
+            if Path(p).exists():
+                return p
+        elif ovr.startswith("http"):
+            path = HEAD_DIR / f"{player_id}.png"
+            if not (path.exists() and path.stat().st_size > 0):
+                try:
+                    r = requests.get(ovr, timeout=12)
+                    if r.ok and r.content and r.content[:4] == b"\x89PNG":
+                        path.write_bytes(r.content)
+                        return str(path)
+                except Exception:
+                    pass
+            else:
+                return str(path)
+
+    # стандартные источники
     path = HEAD_DIR / f"{player_id}.png"
     if path.exists() and path.stat().st_size > 0:
         return str(path)
