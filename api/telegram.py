@@ -3,10 +3,7 @@
 #  /card Имя | 25 очков, 12 подборов | impact | подпись(опц.)
 #  /alias Неправильно = Правильное Имя
 
-import os
-import re
-import json
-import requests
+import os, re, json, requests
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import JSONResponse
 
@@ -23,10 +20,6 @@ STAT_PAIR_RE = re.compile(
 # ---------- парсинг команд ----------
 
 def parse_card(text: str):
-    """
-    /card Имя | 25 очков, 12 подборов, 3 блокшота | impact | подпись(опц.)
-    -> (name, stats[:6], template, note, raw_stats_text)
-    """
     if not text or not text.lower().startswith("/card"):
         return None
     body = text.split(" ", 1)[1] if " " in text else ""
@@ -50,10 +43,6 @@ def parse_card(text: str):
     return name, stats[:6], template, note, raw_stats
 
 def parse_alias(text: str):
-    """
-    /alias Неправильно = Правильное Имя
-    -> (alias_text, correct_text)
-    """
     if not text or not text.lower().startswith("/alias"):
         return None
     body = text.split(" ", 1)[1] if " " in text else ""
@@ -65,7 +54,6 @@ def parse_alias(text: str):
 # ---------- Telegram helpers ----------
 
 def tg_send_png(chat_id: int, png_bytes: bytes, caption: str | None = None):
-    """Отправляем как документ — сохранит прозрачность PNG и не пережмёт JPG."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
     files = {"document": ("card.png", png_bytes, "image/png")}
     data = {"chat_id": chat_id}
@@ -156,23 +144,23 @@ async def handle_update(update: dict) -> JSONResponse:
     chat_id = msg["chat"]["id"]
     text = msg.get("text") or ""
 
-    # 2a) /alias
+    # /alias
     alias_pair = parse_alias(text)
     if alias_pair:
-        from data import find_player_by_name, add_alias
+        from data import find_player_by_name as _find, add_alias as _add
         alias_text, correct_text = alias_pair
-        target = find_player_by_name(correct_text)
+        target = _find(correct_text)
         if not target:
             tg_send_message(chat_id, "Не нашёл игрока справа от '='. Пример:\n/alias Швед = Alexey Shved")
             return JSONResponse({"ok": True})
-        ok = add_alias(alias_text, target["full_name"])
+        ok = _add(alias_text, target["full_name"])
         if ok:
             tg_send_message(chat_id, f"Готово. Теперь «{alias_text}» = {target['display']}.")
         else:
             tg_send_message(chat_id, "Не удалось сохранить алиас.")
         return JSONResponse({"ok": True})
 
-    # 2b) /card
+    # /card
     parsed = parse_card(text)
     if not parsed:
         hint = ("Формат:\n"
@@ -183,14 +171,23 @@ async def handle_update(update: dict) -> JSONResponse:
         return JSONResponse({"ok": True})
 
     name, stats, template, note, _raw = parsed
-    from data import find_player_by_name, ensure_headshot_png, ensure_team_logo_png
+    from data import find_player_by_name, suggest_players
     player = find_player_by_name(name)
     if not player:
-        from data import suggest_players
-        suggestions = suggest_players(name, limit=4)
-        # 5-й вариант — ручной ввод «Оригинал -> Русский»
-        kb_rows = [[{"text": s["display"], "callback_data": f"pick:{s['id']}"}] for s in suggestions]
-        kb_rows.append([{"text": "➕ Добавить перевод вручную", "callback_data": "noop"}])
+        suggestions = suggest_players(name, limit=5)
+        if not suggestions:
+            tg_send_message(chat_id, "Игрок не найден. Уточните имя.\n"
+                                     "Можно задать алиас: /alias Вася = Vasilije Micic")
+            return JSONResponse({"ok": True})
+        # пятый вариант — «Добавить свой перевод»
+        suggestions = suggestions[:4]
+        suggestions.append({"id": -1, "display": "➕ Добавить оригинал и правильный перевод"})
+        kb_rows = []
+        for s in suggestions:
+            if s["id"] == -1:
+                kb_rows.append([{"text": s["display"], "callback_data": "pick:-1"}])
+            else:
+                kb_rows.append([{"text": s["display"], "callback_data": f"pick:{s['id']}"}])
         kb = {"inline_keyboard": kb_rows}
         tg_send_message(
             chat_id,
@@ -201,10 +198,10 @@ async def handle_update(update: dict) -> JSONResponse:
         return JSONResponse({"ok": True})
 
     # нашли игрока — рендерим
+    from data import ensure_headshot_png, ensure_team_logo_png
     logo_path, team_colors = ensure_team_logo_png(player["team_id"])
     head_path = ensure_headshot_png(player["id"], player["full_name"])
 
-    from graphics import render_card
     png_bytes = render_card(
         template=template,
         player_name=player["display"] or player["full_name"],
@@ -220,35 +217,44 @@ async def handle_update(update: dict) -> JSONResponse:
         tg_send_message(chat_id, f"Ошибка отправки изображения: {resp}")
     return JSONResponse({"ok": True})
 
-# ---------- health / refresh ----------
+# ---------- health/refresh ----------
 
 @app.get("/")
 @app.get("/api/telegram")
-async def health(action: str = Query(default=""), secret: str = Query(default=""), drop_cache: int = Query(default=0), debug: int = Query(default=0)):
+@app.get("/api/telegram/healthz")
+def health(
+    action: str | None = Query(default=None),
+    secret: str | None = Query(default=None),
+    drop_cache: int | None = Query(default=None),
+    debug: int | None = Query(default=None),
+):
     if action == "refresh":
         if secret != WEBHOOK_SECRET:
             raise HTTPException(status_code=404, detail="Not found")
         try:
-            from data import drop_players_cache, _ensure_index, players_count
+            from data import drop_players_cache, players_count
             if drop_cache:
                 drop_players_cache()
-            # форс-пересборка
-            _ensure_index(force=True)
-            cnt = players_count()
-            return {"ok": True, "refreshed": True, "players_indexed": cnt}
+            count = players_count()  # прогреваем индекс
+            return JSONResponse({"ok": True, "refreshed": True, "players_indexed": count})
         except Exception as e:
-            return {"ok": False, "error": repr(e)}
-    else:
-        try:
-            from data import players_count
-            cnt = players_count()
-        except Exception:
-            cnt = -1
-        endpoints = [
-            "GET  /api/telegram?action=refresh&secret=...&drop_cache=1&debug=1",
-            "POST /api/telegram?secret=...  (Telegram webhook)"
-        ]
-        return {"ok": True, "players_indexed": cnt, "endpoints": endpoints}
+            return JSONResponse({"ok": False, "error": repr(e)})
+
+    # обычный health
+    try:
+        from data import players_count
+        count = players_count()
+    except Exception:
+        count = -1
+    return JSONResponse({
+        "ok": True,
+        "players_indexed": count,
+        "endpoints": [
+            "GET  /api/telegram (action=refresh&secret=...&drop_cache=1)",
+            "GET  /api/telegram/healthz",
+            "POST /api/telegram?secret=...  (Telegram webhook)",
+        ],
+    })
 
 # ---------- webhook ----------
 
