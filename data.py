@@ -1,5 +1,5 @@
 # data.py
-# Универсальный источник игроков NBA для /api/telegram и др. хэндлеров.
+# Надёжный источник списка игроков NBA с жёсткими фоллбэками и понятным логгингом.
 
 from __future__ import annotations
 import os
@@ -7,17 +7,22 @@ import json
 import time
 import traceback
 from typing import Any, Dict, List, Tuple, Optional
+from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
 from urllib.request import Request, urlopen
 
-# --------- Конфиг через env ---------
-PLAYERS_CUSTOM_URL       = os.getenv("PLAYERS_CUSTOM_URL", "").strip()
-PLAYERS_ENFORCE_SOURCE   = os.getenv("PLAYERS_ENFORCE_SOURCE", "").strip().lower()  # "stats" | "legacy" | ""
-ALLOW_LEGACY_FALLBACK    = os.getenv("PLAYERS_ALLOW_LEGACY", "0") == "1"
-MIN_EXPECTED             = int(os.getenv("PLAYERS_MIN_EXPECTED", "350"))
-DISABLE_LOCAL_SNAPSHOT   = os.getenv("PLAYERS_DISABLE_LOCAL", "1") == "1"
-CACHE_TTL_SEC            = int(os.getenv("PLAYERS_CACHE_TTL", "3600"))
-PHOTO_FMT                = os.getenv("PLAYERS_PHOTO_FMT", "https://cdn.nba.com/headshots/nba/latest/1040x760/{personId}.png")
-LEGACY_URL               = os.getenv("PLAYERS_LEGACY_URL", "https://data.nba.net/data/10s/prod/v1/2025/players.json")
+# ========== Конфиги через ENV ==========
+PLAYERS_SEASON            = os.getenv("PLAYERS_SEASON", "2025-26").strip()
+# Если PLAYERS_CUSTOM_URL не задан — используем твой Cloudflare Worker с сезоном 2025-26
+FALLBACK_CUSTOM_URL       = f"https://nba-players-proxy.znamteam-903.workers.dev/?season={PLAYERS_SEASON}"
+PLAYERS_CUSTOM_URL        = (os.getenv("PLAYERS_CUSTOM_URL", "").strip() or FALLBACK_CUSTOM_URL)
+
+PLAYERS_ENFORCE_SOURCE    = os.getenv("PLAYERS_ENFORCE_SOURCE", "").strip().lower()  # "stats" | "legacy" | ""
+ALLOW_LEGACY_FALLBACK_ENV = os.getenv("PLAYERS_ALLOW_LEGACY", "0") == "1"
+MIN_EXPECTED              = int(os.getenv("PLAYERS_MIN_EXPECTED", "350"))
+DISABLE_LOCAL_SNAPSHOT    = os.getenv("PLAYERS_DISABLE_LOCAL", "1") == "1"
+CACHE_TTL_SEC             = int(os.getenv("PLAYERS_CACHE_TTL", "3600"))
+PHOTO_FMT                 = os.getenv("PLAYERS_PHOTO_FMT", "https://cdn.nba.com/headshots/nba/latest/1040x760/{personId}.png")
+LEGACY_URL                = os.getenv("PLAYERS_LEGACY_URL", "https://data.nba.net/data/10s/prod/v1/2025/players.json")
 
 # Пути
 ROOT_DIR        = os.path.dirname(os.path.abspath(__file__))
@@ -26,14 +31,10 @@ LOCAL_SNAPSHOT  = os.path.join(ASSETS_DIR, "players.json")
 OVERRIDES_FILE  = os.path.join(ASSETS_DIR, "players_overrides.json")
 CACHE_PATH      = os.path.join("/tmp", "players_cache.json")
 
-# Кэш
-_CACHED: Dict[str, Any] = {
-    "ts": 0.0,
-    "players": None,   # type: Optional[List[Dict[str, Any]]]
-    "index": None,     # type: Optional[Dict[str, Dict[str, Any]]]
-}
+# Память кэша
+_CACHED: Dict[str, Any] = {"ts": 0.0, "players": None, "index": None}
 
-# --------- Утилиты ---------
+# ========== Утилиты ==========
 def _log(*args: Any) -> None:
     try:
         print("[players]", *args, flush=True)
@@ -66,19 +67,26 @@ def _write_json_file(path: str, data: Any) -> None:
 def _safe_str(x: Any) -> str:
     return "" if x is None else str(x)
 
-# --------- Парсеры ---------
+def _with_query(url: str, **extra: str) -> str:
+    """Добавить/заменить query-параметры в URL."""
+    pr = urlparse(url)
+    q = dict(parse_qsl(pr.query))
+    q.update({k: v for k, v in extra.items() if v is not None})
+    return urlunparse(pr._replace(query=urlencode(q)))
+
+# ========== Парсинг разных форматов ==========
 def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Поддерживаем:
-      - stats.nba.com (proxied CommonAllPlayers): resultSets[0] -> headers/rowSet
-      - legacy data.nba.net: league.standard
-    Выход:
+    Поддержка двух форматов:
+      1) stats.nba.com (proxied CommonAllPlayers): resultSets[0].headers/rowSet
+      2) legacy data.nba.net: league.standard
+    Приводим к:
       {personId, firstName, lastName, teamId, isActive}
     """
     if not j:
         return []
 
-    # Proxied stats.nba.com
+    # Формат stats.nba.com proxied
     if "resultSets" in j:
         try:
             rs = j["resultSets"][0]
@@ -98,8 +106,7 @@ def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
             for row in rowset:
                 personId = _safe_str(row[pid_i])
                 teamId   = _safe_str(row[tid_i] or "0")
-
-                # ROSTERSTATUS ("1"/"0" или булево)
+                # Активность
                 isActive = True
                 if act_i is not None:
                     try:
@@ -138,10 +145,11 @@ def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
             _log(traceback.format_exc())
             return []
 
-    # Legacy data.nba.net
-    if j.get("league", {}).get("standard"):
+    # Формат data.nba.net
+    league_std = j.get("league", {}).get("standard")
+    if isinstance(league_std, list):
         out: List[Dict[str, Any]] = []
-        for p in j["league"]["standard"]:
+        for p in league_std:
             try:
                 out.append({
                     "personId": _safe_str(p.get("personId") or ""),
@@ -156,14 +164,19 @@ def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     return []
 
-# --------- Источники ---------
-def _fetch_from_custom() -> List[Dict[str, Any]]:
-    if not PLAYERS_CUSTOM_URL:
+# ========== Источники ==========
+def _fetch_from_custom(url: Optional[str] = None) -> List[Dict[str, Any]]:
+    u = (url or PLAYERS_CUSTOM_URL or "").strip()
+    if not u:
+        _log("custom url is empty")
         return []
+    # гарантируем наличие season в query
+    if "season=" not in u:
+        u = _with_query(u, season=PLAYERS_SEASON)
     try:
-        j = _http_get_json(PLAYERS_CUSTOM_URL)
+        j = _http_get_json(u)
         players = _extract_players(j)
-        _log(f"custom parsed {len(players)} from {PLAYERS_CUSTOM_URL}")
+        _log(f"custom parsed {len(players)} from {u}")
         return players
     except Exception as e:
         _log("custom fetch error:", e)
@@ -193,15 +206,11 @@ def _fetch_local_snapshot() -> List[Dict[str, Any]]:
         _log("local snapshot error:", e)
         return []
 
-# --------- Оверрайды ---------
+# ========== Оверрайды ==========
 def _load_overrides() -> Dict[str, Dict[str, Any]]:
     """
-    Источники:
-      1) ENV PLAYERS_OVERRIDES_JSON (приоритет)
-      2) assets/players_overrides.json
-    Формат:
+    Формат overrides:
       {"1627783": {"teamId":"1610612754","photo":"...","firstName":"...","lastName":"...","isActive":true}}
-    Можно добавлять кастомные personId (строкой).
     """
     env_raw = os.getenv("PLAYERS_OVERRIDES_JSON", "").strip()
     if env_raw:
@@ -219,77 +228,97 @@ def _load_overrides() -> Dict[str, Dict[str, Any]]:
 
 def _apply_overrides(players: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ov = _load_overrides()
-    if not ov:
-        # заполним фото и displayName
-        out = []
-        for p in players:
-            q = dict(p)
-            if not q.get("photo"):
-                q["photo"] = PHOTO_FMT.format(personId=q["personId"])
-            fn = q.get("firstName","").strip()
-            ln = q.get("lastName","").strip()
-            q["displayName"] = (fn + " " + ln).strip()
-            out.append(q)
-        return out
+    by_id: Dict[str, Dict[str, Any]] = {p["personId"]: dict(p) for p in (players or [])}
 
-    by_id: Dict[str, Dict[str, Any]] = {p["personId"]: dict(p) for p in players}
+    if ov:
+        for pid, patch in ov.items():
+            if pid in by_id:
+                base = by_id[pid]
+                if "firstName" in patch: base["firstName"] = _safe_str(patch["firstName"]).strip()
+                if "lastName"  in patch: base["lastName"]  = _safe_str(patch["lastName"]).strip()
+                if "teamId"    in patch: base["teamId"]    = _safe_str(patch["teamId"]).strip() or "0"
+                if "isActive"  in patch: base["isActive"]  = bool(patch["isActive"])
+                if "photo"     in patch: base["photo"]     = _safe_str(patch["photo"]).strip()
+            else:
+                add = {
+                    "personId": pid,
+                    "firstName": _safe_str(patch.get("firstName", "")),
+                    "lastName":  _safe_str(patch.get("lastName", "")),
+                    "teamId":    _safe_str(patch.get("teamId", "0")),
+                    "isActive":  bool(patch.get("isActive", True)),
+                }
+                if "photo" in patch:
+                    add["photo"] = _safe_str(patch["photo"])
+                by_id[pid] = add
 
-    for pid, patch in ov.items():
-        if pid in by_id:
-            base = by_id[pid]
-            if "firstName" in patch: base["firstName"] = _safe_str(patch["firstName"]).strip()
-            if "lastName"  in patch: base["lastName"]  = _safe_str(patch["lastName"]).strip()
-            if "teamId"    in patch: base["teamId"]    = _safe_str(patch["teamId"]).strip() or "0"
-            if "isActive"  in patch: base["isActive"]  = bool(patch["isActive"])
-            if "photo"     in patch: base["photo"]     = _safe_str(patch["photo"]).strip()
-        else:
-            add = {
-                "personId": pid,
-                "firstName": _safe_str(patch.get("firstName", "")),
-                "lastName":  _safe_str(patch.get("lastName", "")),
-                "teamId":    _safe_str(patch.get("teamId", "0")),
-                "isActive":  bool(patch.get("isActive", True)),
-            }
-            if "photo" in patch:
-                add["photo"] = _safe_str(patch["photo"])
-            by_id[pid] = add
-
+    out: List[Dict[str, Any]] = []
     for p in by_id.values():
         if not p.get("photo"):
             p["photo"] = PHOTO_FMT.format(personId=p["personId"])
         fn = p.get("firstName", "").strip()
         ln = p.get("lastName", "").strip()
         p["displayName"] = (fn + " " + ln).strip() if (fn or ln) else p.get("displayName", "")
+        out.append(p)
+    return out
 
-    return list(by_id.values())
+# ========== Сборка со «строгими» фоллбэками ==========
+def _build_from_sources() -> List[Dict[str, Any]]:
+    """
+    Стратегия:
+      1) Если явно ENFORCE=stats — сначала custom.
+      2) Если ENFORCE=legacy — сразу legacy.
+      3) Иначе: custom → (если 0 или <MIN_EXPECTED и ALLOW_LEGACY_FALLBACK_ENV) legacy → local.
+      4) Если всё равно 0 — принудительно legacy → local (игнорируя флаги), чтобы не вернуть ноль.
+    """
+    # Первичный выбор
+    if PLAYERS_ENFORCE_SOURCE == "legacy":
+        primary = _fetch_from_legacy()
+        if primary:
+            return primary
+        # аварийно добираем
+        secondary = _fetch_from_custom()
+        if secondary:
+            return secondary
 
-# --------- Сборка ---------
+    # По умолчанию/ENFORCE=stats
+    players = _fetch_from_custom()
+
+    # Доп. фоллбеки по env
+    if (not players) or (len(players) < MIN_EXPECTED and ALLOW_LEGACY_FALLBACK_ENV):
+        _log(f"custom insufficient ({len(players) if players else 0}), trying legacy (env-allowed={ALLOW_LEGACY_FALLBACK_ENV})")
+        leg = _fetch_from_legacy()
+        if leg:
+            players = leg
+        elif not DISABLE_LOCAL_SNAPSHOT:
+            loc = _fetch_local_snapshot()
+            if loc:
+                players = loc
+
+    # Жёсткий аварийный фоллбэк: никогда не отдаём 0
+    if not players:
+        _log("hard fallback engaged: legacy → local regardless of env toggles")
+        leg2 = _fetch_from_legacy()
+        if leg2:
+            players = leg2
+        elif not DISABLE_LOCAL_SNAPSHOT:
+            loc2 = _fetch_local_snapshot()
+            if loc2:
+                players = loc2
+
+    return players or []
+
 def _build_index() -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
-    # Выбор источника
-    if PLAYERS_ENFORCE_SOURCE == "stats":
-        batches = _fetch_from_custom()
-    elif PLAYERS_ENFORCE_SOURCE == "legacy":
-        batches = _fetch_from_legacy()
-    else:
-        batches = _fetch_from_custom()
-        if not batches and not DISABLE_LOCAL_SNAPSHOT:
-            _log("custom empty — try local snapshot")
-            batches = _fetch_local_snapshot()
-        if (not batches or len(batches) < MIN_EXPECTED) and ALLOW_LEGACY_FALLBACK:
-            _log("fallback to legacy allowed")
-            batches = _fetch_from_legacy()
-
-    if not batches:
-        _log("no players parsed from any source")
+    base = _build_from_sources()
+    if not base:
+        _log("no players parsed from any source (after all fallbacks)")
         return [], {}
 
-    players = _apply_overrides(batches)
+    players = _apply_overrides(base)
     index = {p["personId"]: p for p in players}
-
-    _log(f"custom total parsed (after overrides): {len(players)}")
+    _log(f"final players count (after overrides): {len(players)}")
     return players, index
 
-# --------- Кэш ---------
+# ========== Кэш ==========
 def _load_cache_from_disk() -> Optional[Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]], float]]:
     if not os.path.exists(CACHE_PATH):
         return None
@@ -316,7 +345,7 @@ def _save_cache_to_disk(players: List[Dict[str, Any]]) -> None:
 def _valid_cache(ts: float) -> bool:
     return (time.time() - ts) < CACHE_TTL_SEC
 
-# --------- Публичные API ---------
+# ========== Публичные API ==========
 def get_players(force_refresh: bool = False) -> List[Dict[str, Any]]:
     if not force_refresh and _CACHED["players"] and _valid_cache(_CACHED["ts"]):
         return _CACHED["players"]
@@ -325,16 +354,12 @@ def get_players(force_refresh: bool = False) -> List[Dict[str, Any]]:
         disk = _load_cache_from_disk()
         if disk:
             players, index, ts = disk
-            if _valid_cache(ts) and len(players) >= MIN_EXPECTED:
-                _CACHED["players"] = players
-                _CACHED["index"] = index
-                _CACHED["ts"] = ts
+            if _valid_cache(ts) and len(players) > 0:
+                _CACHED.update({"players": players, "index": index, "ts": ts})
                 return players
 
     players, index = _build_index()
-    _CACHED["players"] = players
-    _CACHED["index"] = index
-    _CACHED["ts"] = time.time()
+    _CACHED.update({"players": players, "index": index, "ts": time.time()})
     if players:
         _save_cache_to_disk(players)
     return players
@@ -380,17 +405,14 @@ def find_player_by_name(query: str) -> List[Dict[str, Any]]:
             res.append(p)
     return res
 
-# --------- Совместимость (алиасы, чтобы не падали старые импорты) ---------
+# Совместимость со старыми импортами
 def players_count(force_refresh: bool = False) -> int:
-    """Совместимый алиас: вернуть количество игроков."""
     return len(get_players(force_refresh=force_refresh))
 
 def players(force_refresh: bool = False) -> List[Dict[str, Any]]:
-    """Совместимый алиас get_players()."""
     return get_players(force_refresh=force_refresh)
 
 def players_index(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
-    """Совместимый алиас get_players_index()."""
     return get_players_index(force_refresh=force_refresh)
 
 __all__ = [
