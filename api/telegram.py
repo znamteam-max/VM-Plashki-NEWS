@@ -23,11 +23,31 @@ try:
 except Exception:
     team_brand = None  # переживём
 
-# graphics: рендер PNG плашек
-from graphics import (
-    render_card, render_card2, render_card_bad, render_card_special,
-    render_card_drN, render_card_dr,  # алиас на месте
-)
+# graphics: рендер PNG плашек (безопасный импорт)
+try:
+    from graphics import (
+        render_card,
+        render_card2,
+        render_card_bad,
+        render_card_special,
+        render_card_drN,
+    )
+    # render_card_dr (старые пути) — опциональный алиас
+    try:
+        from graphics import render_card_dr  # может отсутствовать
+    except Exception:
+        # мягкий алиас на drN
+        def render_card_dr(n, player_name, head_img, logo_img, stats):
+            return render_card_drN(n, player_name, head_img, logo_img, stats)
+    GFX_IMPORT_OK = True
+    GFX_IMPORT_ERR = None
+except Exception as e:
+    GFX_IMPORT_OK = False
+    GFX_IMPORT_ERR = e
+    # заглушки, чтобы маршрут /api/telegram не падал на импорте
+    def _gfx_fail(*a, **k):
+        raise RuntimeError(f"graphics import failed: {GFX_IMPORT_ERR}")
+    render_card = render_card2 = render_card_bad = render_card_special = render_card_drN = render_card_dr = _gfx_fail
 
 # ------------------------------ CONFIG ------------------------------
 APP = FastAPI()
