@@ -1,8 +1,8 @@
-# graphics.py — универсальные рендеры плашек
+# graphics.py — универсальные рендеры плашек + DR-шаблоны (JSON/автодетект)
 from __future__ import annotations
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 from PIL import Image, ImageDraw, ImageFont
-import io, textwrap
+import io, os, json, re
 
 # Холст
 W, H = 1920, 1080
@@ -35,6 +35,8 @@ LOGO_OFFSET_Y = 210
 F_BOLD_PATH = "assets/fonts/Montserrat-Bold.ttf"
 F_SB_PATH   = "assets/fonts/Montserrat-SemiBold.ttf"
 F_EXO_PATH  = "assets/fonts/Exo2-Bold.ttf"
+
+TEMPLATES_DIR = os.getenv("DR_TEMPLATES_DIR", "assets/templates")
 
 def _load_font(path: str, size: int):
     try: return ImageFont.truetype(path, size)
@@ -255,11 +257,8 @@ def render_card2(
             canvas.alpha_composite(shadow, (logo_x-3, logo_y-3))
             canvas.alpha_composite(logo_circle, (logo_x, logo_y))
 
-        # адаптивный размер имени и метрик — под ширину половины
         name_area_x = head_x + DUO_HEAD + 28
         max_w = x0 + w_half - name_area_x - 28
-        # сначала найдём общий минимальный размер имени и для левой, и для правой сторон
-        # (реализуем простым пересчётом внутри цикла, но одинаковая логика — ок)
         name_img, f_name = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, max_w, BASE_NAME, 24)
         f_val = _load_font(F_EXO_PATH, BASE_VAL)
         f_lbl = _load_font(F_SB_PATH,  BASE_LBL)
@@ -270,13 +269,10 @@ def render_card2(
             k = avail_h / stats_line.height
             stats_line = stats_line.resize((max(1,int(stats_line.width*k)), max(1,int(stats_line.height*k))), Image.LANCZOS)
 
-        name_y = bar_y + TOP_IN
+        name_y = H - BAR_H + TOP_IN
         canvas.alpha_composite(name_img, (name_area_x, name_y))
         stats_y = name_y + name_img.height + NAME_STATS_GAP
         canvas.alpha_composite(stats_line, (name_area_x, stats_y))
-
-    # выравнивание размеров имени для обеих половин:
-    # упрощённо: мы уже обрезали по ширине каждой половины бинарным поиском, этого хватает визуально.
 
     bio = io.BytesIO()
     canvas.save(bio, format="PNG")
@@ -284,8 +280,7 @@ def render_card2(
 
 # ---------- BAD ----------
 def render_card_bad(player_name: str, head_img: Image.Image, stats: List[Tuple[str,str]]) -> bytes:
-    # фиксированный «неприятный» градиент
-    primary = "#6D4C41"
+    primary = "#6D4C41"  # «неприятный» коричневый
     rgb = _hex_to_rgb(primary)
     left_rgb, right_rgb = _shade(rgb, 0.7), rgb
 
@@ -299,7 +294,6 @@ def render_card_bad(player_name: str, head_img: Image.Image, stats: List[Tuple[s
     head_y = bar_y - head.height//3
     canvas.alpha_composite(head, (head_x, head_y))
 
-    # 💩 после имени
     name_area_x = PAD_L + HEAD_SIZE + 36
     max_w = W - name_area_x - PAD_R
     name_text = f"{player_name.upper()}  💩"
@@ -320,40 +314,275 @@ def render_card_bad(player_name: str, head_img: Image.Image, stats: List[Tuple[s
     canvas.save(bio, format="PNG")
     return bio.getvalue()
 
-# ---------- DR (шаблон) ----------
+# ---------- DR: Чтение layout (JSON/Guides) ----------
+_GUIDE_COLORS = {
+    "name": (255,255,0,255),   # yellow
+    "head": (255,0,255,255),   # magenta (круг/прямоугольник)
+    "logo": (0,255,255,255),   # cyan
+    "stat": (0,255,0,255),     # green
+}
+
+def _bbox_for_color(img: Image.Image, target: Tuple[int,int,int,int]) -> Optional[Tuple[int,int,int,int]]:
+    px = img.convert("RGBA").load()
+    w,h = img.size
+    x0,y0,x1,y1 = w, h, -1, -1
+    tr, tg, tb, ta = target
+    for y in range(h):
+        for x in range(w):
+            r,g,b,a = px[x,y]
+            if r==tr and g==tg and b==tb and a>=200:
+                if x < x0: x0 = x
+                if y < y0: y0 = y
+                if x > x1: x1 = x
+                if y > y1: y1 = y
+    if x1 >= x0 and y1 >= y0:
+        return (x0,y0,x1,y1)
+    return None
+
+def _all_bboxes_for_color(img: Image.Image, target: Tuple[int,int,int,int]) -> List[Tuple[int,int,int,int]]:
+    # разбиваем на отдельные компоненты — простой flood-fill по цвету
+    im = img.convert("RGBA")
+    w,h = im.size
+    px = im.load()
+    tr,tg,tb,ta = target
+    vis = [[False]*w for _ in range(h)]
+    boxes: List[Tuple[int,int,int,int]] = []
+    for y in range(h):
+        for x in range(w):
+            if vis[y][x]: continue
+            r,g,b,a = px[x,y]
+            if r==tr and g==tg and b==tb and a>=200:
+                # BFS
+                q=[(x,y)]
+                vis[y][x]=True
+                minx,miny,maxx,maxy = x,y,x,y
+                while q:
+                    cx,cy = q.pop()
+                    if cx<minx: minx=cx
+                    if cy<miny: miny=cy
+                    if cx>maxx: maxx=cx
+                    if cy>maxy: maxy=cy
+                    for nx,ny in ((cx-1,cy),(cx+1,cy),(cx,cy-1),(cx,cy+1)):
+                        if 0<=nx<w and 0<=ny<h and not vis[ny][nx]:
+                            rr,gg,bb,aa = px[nx,ny]
+                            if rr==tr and gg==tg and bb==tb and aa>=200:
+                                vis[ny][nx]=True
+                                q.append((nx,ny))
+                boxes.append((minx,miny,maxx,maxy))
+    return boxes
+
+def _load_json_layout(path: str) -> Optional[Dict[str,Any]]:
+    if not os.path.exists(path): return None
+    try:
+        with open(path,"r",encoding="utf-8") as f:
+            j = json.load(f)
+        return j if isinstance(j, dict) else None
+    except Exception:
+        return None
+
+def _detect_layout_from_guides(guides_path: str) -> Optional[Dict[str,Any]]:
+    try:
+        im = Image.open(guides_path).convert("RGBA")
+    except Exception:
+        return None
+    layout: Dict[str,Any] = {}
+    # name
+    bb_name = _bbox_for_color(im, _GUIDE_COLORS["name"])
+    if bb_name:
+        x0,y0,x1,y1 = bb_name
+        layout["name"] = {"x": x0, "y": y0, "max_w": x1-x0+1, "align": "left"}
+    # head
+    bb_head = _bbox_for_color(im, _GUIDE_COLORS["head"])
+    if bb_head:
+        x0,y0,x1,y1 = bb_head
+        cx = (x0+x1)//2; cy=(y0+y1)//2
+        d = min(x1-x0+1, y1-y0+1)
+        layout["head"] = {"cx": cx, "cy": cy, "d": d}
+    # logo
+    bb_logo = _bbox_for_color(im, _GUIDE_COLORS["logo"])
+    if bb_logo:
+        x0,y0,x1,y1=bb_logo
+        size = min(x1-x0+1, y1-y0+1)
+        layout["logo"] = {"x": x0, "y": y0, "size": size}
+    # stats
+    stats_boxes = _all_bboxes_for_color(im, _GUIDE_COLORS["stat"])
+    if stats_boxes:
+        stats_boxes.sort(key=lambda b: ( (b[1]//50), b[0] ))  # грубо: по строкам затем по x
+        layout["stats"] = [{"x":b[0], "y":b[1], "max_w": b[2]-b[0]+1, "align":"center"} for b in stats_boxes]
+    return layout if layout else None
+
+def _load_dr_layout(n: int) -> Tuple[Optional[Image.Image], Optional[Dict[str,Any]]]:
+    """
+    Ищем:
+      - dr{n}.json (layout)
+      - dr{n}.png  (base)
+      - если нет json, пытаемся dr{n}_guides.png для автодетекта
+    """
+    base_png = os.path.join(TEMPLATES_DIR, f"dr{n}.png")
+    guides_png = os.path.join(TEMPLATES_DIR, f"dr{n}_guides.png")
+    layout_json = os.path.join(TEMPLATES_DIR, f"dr{n}.json")
+
+    base_img = None
+    if os.path.exists(base_png):
+        try: base_img = Image.open(base_png).convert("RGBA").resize((W,H), Image.LANCZOS)
+        except Exception: base_img = None
+
+    layout = _load_json_layout(layout_json)
+    if layout: return base_img, layout
+
+    # если JSON нет — пробуем guides
+    if os.path.exists(guides_png):
+        layout = _detect_layout_from_guides(guides_png)
+        if layout: return base_img, layout
+
+    # крайний случай: пробуем autodetect из самого base_png (если дизайнер положил маркеры прямо на него)
+    if base_img:
+        tmp = os.path.join(TEMPLATES_DIR, f"dr{n}_autodetect.png")
+        try:
+            base_img.save(tmp)  # просто для совместимости путей; реально можно использовать base_img напрямую
+            layout = _detect_layout_from_guides(tmp)
+        except Exception:
+            layout = None
+        try:
+            if os.path.exists(tmp): os.remove(tmp)
+        except Exception:
+            pass
+        return base_img, layout
+
+    return None, None
+
+def _draw_name(canvas: Image.Image, text: str, slot: Dict[str,Any]):
+    x = int(slot.get("x", 0)); y = int(slot.get("y", 0))
+    max_w = int(slot.get("max_w", 600))
+    align = slot.get("align","left")
+    name_img, _ = _fit_text_to_width(text, F_BOLD_PATH, max_w, 84, 28)
+    if align == "center":
+        x = x + (max_w - name_img.width)//2
+    elif align == "right":
+        x = x + (max_w - name_img.width)
+    canvas.alpha_composite(name_img, (x, y))
+
+def _draw_head(canvas: Image.Image, head_img: Image.Image, slot: Dict[str,Any]):
+    d = int(slot.get("d", HEAD_SIZE))
+    cx = int(slot.get("cx", PAD_L + d//2))
+    cy = int(slot.get("cy", H - BAR_H - d//3))
+    head = _circle_crop_img(head_img, d)
+    canvas.alpha_composite(head, (cx - d//2, cy - d//2))
+
+def _draw_logo(canvas: Image.Image, logo_img: Optional[Image.Image], slot: Dict[str,Any]):
+    if not logo_img: return
+    size = int(slot.get("size", LOGO_SIZE))
+    x = int(slot.get("x", PAD_L + LOGO_OFFSET_X))
+    y = int(slot.get("y", H - BAR_H - LOGO_OFFSET_Y))
+    logo_raw = logo_img.resize((size, size), Image.LANCZOS)
+    # белый круг со тенью, как в single
+    d = size + 16
+    shadow = Image.new("RGBA", (d+6, d+6), (0,0,0,0))
+    sh_mask = Image.new("L", (d+6, d+6), 0)
+    ImageDraw.Draw(sh_mask).ellipse((3,3,d+3,d+3), fill=90)
+    shadow.putalpha(sh_mask)
+    circle = Image.new("RGBA", (d, d), (255,255,255,255))
+    mask = Image.new("L", (d, d), 0)
+    ImageDraw.Draw(mask).ellipse((0,0,d,d), fill=255)
+    circle.putalpha(mask)
+    circle.alpha_composite(logo_raw, ((d - size)//2, (d - size)//2))
+    canvas.alpha_composite(shadow, (x-3, y-3))
+    canvas.alpha_composite(circle, (x, y))
+
+def _draw_stat_cell(canvas: Image.Image, v: str, lab: str, slot: Dict[str,Any]):
+    max_w = int(slot.get("max_w", 320))
+    align = slot.get("align","center")
+    val_sz = int(slot.get("val_size", 56))
+    lbl_sz = int(slot.get("lbl_size", 28))
+    f_val = _load_font(F_EXO_PATH, val_sz)
+    f_lbl = _load_font(F_SB_PATH,  lbl_sz)
+
+    val_img = _text_img(str(v), f_val, (255,255,255,255))
+    lbl_img = _text_img((lab or "").upper(), f_lbl, (255,255,255,220)) if lab else None
+    w = max(val_img.width, lbl_img.width if lbl_img else 0)
+    if w > max_w:
+        # ужимаем только значение (и подпись, если надо) бинарным поиском
+        # (для простоты используем _fit_text_to_width)
+        val_img, _ = _fit_text_to_width(str(v), F_EXO_PATH, max_w, val_sz, 20)
+        if lbl_img:
+            lbl_img, _ = _fit_text_to_width((lab or "").upper(), F_SB_PATH, max_w, lbl_sz, 16)
+        w = max(val_img.width, lbl_img.width if lbl_img else 0)
+    total_h = val_img.height + (INNER_VGAP//2) + (lbl_img.height if lbl_img else 0)
+    img = Image.new("RGBA", (w, total_h), (0,0,0,0))
+    img.alpha_composite(val_img, ((w - val_img.width)//2, 0))
+    if lbl_img:
+        img.alpha_composite(lbl_img, ((w - lbl_img.width)//2, val_img.height + (INNER_VGAP//2)))
+
+    x = int(slot.get("x", 0)); y = int(slot.get("y", 0))
+    if align == "center": x = x + (max_w - img.width)//2
+    elif align == "right": x = x + (max_w - img.width)
+    canvas.alpha_composite(img, (x, y))
+
+def render_card_drN(
+    n: int,
+    player_name: str,
+    head_img: Image.Image,
+    logo_img: Optional[Image.Image],
+    stats: List[Tuple[str,str]]
+) -> bytes:
+    base_img, layout = _load_dr_layout(n)
+    canvas = Image.new("RGBA", (W,H), (0,0,0,0))
+    if base_img:
+        canvas.alpha_composite(base_img, (0,0))
+
+    if not layout:
+        # без layout — ничего не рисуем; чтобы не падать, просто вернём пустышку с именем
+        name_img, _ = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, 1200, 84, 28)
+        canvas.alpha_composite(name_img, ((W-name_img.width)//2, (H-name_img.height)//2))
+        bio = io.BytesIO(); canvas.save(bio, format="PNG"); return bio.getvalue()
+
+    # имя
+    if "name" in layout:
+        _draw_name(canvas, player_name.upper(), layout["name"])
+    # голова
+    if "head" in layout:
+        _draw_head(canvas, head_img, layout["head"])
+    # логотип
+    if "logo" in layout:
+        _draw_logo(canvas, logo_img, layout["logo"])
+    # стат ячейки
+    stat_slots = layout.get("stats") or []
+    for i, slot in enumerate(stat_slots):
+        v, lab = ("","")
+        if i < len(stats):
+            v, lab = stats[i]
+        _draw_stat_cell(canvas, v, lab, slot)
+
+    bio = io.BytesIO()
+    canvas.save(bio, format="PNG")
+    return bio.getvalue()
+
+# ---------- DR (простой, для совместимости) ----------
 def render_card_dr(player_name: str,
                    head_img: Image.Image,
                    stats: List[Tuple[str,str]],
                    template_path: Optional[str] = "assets/templates/card_dr_base.png") -> bytes:
     canvas = Image.new("RGBA", (W,H), (0,0,0,0))
-    # фон-шаблон, если есть
     try:
-        if template_path and isinstance(template_path, str) and len(template_path)>0 and \
-           (template_path.endswith(".png") or template_path.endswith(".PNG")) and \
-           (template_path and template_path != "none") and \
-           (template_path and os.path.exists(template_path)):
+        if template_path and os.path.exists(template_path):
             base = Image.open(template_path).convert("RGBA").resize((W,H), Image.LANCZOS)
             canvas.alpha_composite(base, (0,0))
     except Exception:
         pass
-
-    # стандартная нижняя панель, чтобы текст был читаем
+    # просто как раньше: нижняя панель + имя/метрики
     primary = "#1E1E1E"
     left_rgb, right_rgb = (20,20,20), (34,34,34)
     bar_y = H - BAR_H
     panel = _rounded_horizontal_gradient(W, BAR_H, 24, left_rgb, right_rgb)
     canvas.alpha_composite(panel, (0, bar_y))
-
     head = _circle_crop_img(head_img, HEAD_SIZE)
     head_x = PAD_L
     head_y = bar_y - head.height//3
     canvas.alpha_composite(head, (head_x, head_y))
-
     name_area_x = PAD_L + HEAD_SIZE + 36
     name_img, _ = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, W - name_area_x - PAD_R, BASE_NAME, 28)
     name_img = _pad_v(name_img, NAME_PAD_TOP, NAME_PAD_BOTTOM)
     canvas.alpha_composite(name_img, (name_area_x, bar_y + TOP_IN))
-
     f_val = _load_font(F_EXO_PATH, BASE_VAL)
     f_lbl = _load_font(F_SB_PATH,  BASE_LBL)
     stats_line = _metric_line(stats, f_val, f_lbl)
@@ -362,14 +591,10 @@ def render_card_dr(player_name: str,
         k = avail_h / stats_line.height
         stats_line = stats_line.resize((max(1,int(stats_line.width*k)), max(1,int(stats_line.height*k))), Image.LANCZOS)
     canvas.alpha_composite(stats_line, (name_area_x, bar_y + TOP_IN + name_img.height + NAME_STATS_GAP))
+    bio = io.BytesIO(); canvas.save(bio, format="PNG"); return bio.getvalue()
 
-    bio = io.BytesIO()
-    canvas.save(bio, format="PNG")
-    return bio.getvalue()
-
-# ---------- SPECIAL (боковая вставка) ----------
+# ---------- SPECIAL ----------
 def _wrap_text_to_width(text: str, font: ImageFont.FreeTypeFont, max_w: int) -> Image.Image:
-    # простой перенос по словам
     words = text.split()
     lines: List[str] = []
     cur = ""
@@ -443,7 +668,6 @@ def render_card_special(
     stats_y = name_y + name_img.height + NAME_STATS_GAP
     canvas.alpha_composite(stats_line, (name_area_x, stats_y))
 
-    # правая вставка: такая же высота, отступ 10px, скругления
     info_w = 520
     info_x = W - PAD_R - info_w
     info_y = bar_y
