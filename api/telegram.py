@@ -22,12 +22,13 @@ TELEGRAM_SECRET = (
 TG_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
 # ==== FASTAPI APP =============================================================
-app = FastAPI(title="Telegram Bot Webhook", version="1.2.0")
+app = FastAPI(title="Telegram Bot Webhook", version="1.2.1")
 
 def _ok(payload: Dict[str, Any], code: int = 200) -> JSONResponse:
     return JSONResponse(payload, status_code=code, headers={"Cache-Control": "no-store"})
 
 def _extract_secret(request: Request) -> str:
+    # Telegram может прислать секрет в заголовке (официально) или у вас в query (?secret=)
     hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
     if hdr:
         return hdr
@@ -45,6 +46,7 @@ async def tg_call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     import urllib.request, urllib.parse
     url = f"{TG_API_BASE}/{method}"
     data = urllib.parse.urlencode(params).encode("utf-8")
+
     def _do() -> Dict[str, Any]:
         req = urllib.request.Request(
             url, data=data, method="POST",
@@ -60,6 +62,7 @@ async def tg_call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
             return json.loads(raw.decode("utf-8"))
         except Exception:
             return json.loads(raw)
+
     try:
         return await asyncio.to_thread(_do)
     except Exception as e:
@@ -115,6 +118,7 @@ async def tg_send_photo_bytes(chat_id: int, png_bytes: bytes, caption: Optional[
     body, boundary = _multipart_body(fields, files=[
         ("photo", png_bytes, "card.png", "image/png")
     ])
+
     def _do() -> Dict[str, Any]:
         req = urllib.request.Request(
             url, data=body, method="POST",
@@ -130,6 +134,7 @@ async def tg_send_photo_bytes(chat_id: int, png_bytes: bytes, caption: Optional[
             return json.loads(raw.decode("utf-8"))
         except Exception:
             return json.loads(raw)
+
     try:
         return await asyncio.to_thread(_do)
     except Exception as e:
@@ -139,7 +144,15 @@ async def tg_send_photo_bytes(chat_id: int, png_bytes: bytes, caption: Optional[
 from data import (
     refresh_players, find_player_by_name, ensure_headshot_png
 )
-from graphics import render_card
+
+# ленивый импорт графики, чтобы refresh не падал, если Pillow не установлен
+try:
+    from graphics import render_card  # Pillow внутри graphics
+    HAVE_GRAPHICS = True
+except Exception as e:
+    print("graphics import failed:", repr(e), flush=True)
+    render_card = None  # type: ignore
+    HAVE_GRAPHICS = False
 
 HELP_TEXT = (
     "Привет! Я онлайн 🤖\n\n"
@@ -169,7 +182,8 @@ def _parse_card(text: str) -> Optional[Dict[str, str]]:
 
 def _stats_from_text(s: str) -> List[Tuple[str, str]]:
     """
-    '10 очков, 12 передач, 5 перехватов' -> [("10","очков"),("12","передач"),("5","перехватов")]
+    '10 очков, 12 передач, 5 перехватов'
+      -> [("10","очков"),("12","передач"),("5","перехватов")]
     """
     out: List[Tuple[str, str]] = []
     for chunk in [c.strip() for c in s.split(",") if c.strip()]:
@@ -178,28 +192,36 @@ def _stats_from_text(s: str) -> List[Tuple[str, str]]:
         val = parts[0]
         lab = " ".join(parts[1:]) if len(parts) > 1 else ""
         out.append((val, lab))
-    # ограничим 6 блоками, чтобы влезало
+    # максимум 6 блоков, чтобы влезало
     return out[:6] if out else [("—", "")]
 
 async def _build_and_send_card(chat_id: int, message_id: int, query: str, stats_text: str, tpl: str) -> None:
+    if not HAVE_GRAPHICS or render_card is None:
+        await tg_send_message(
+            chat_id,
+            "Графический модуль недоступен. Установите Pillow (requirements.txt: Pillow==10.4.0) и задеплойте заново.",
+            reply_to=message_id
+        )
+        return
+
     res = find_player_by_name(query)
     if not res:
         await tg_send_message(chat_id, f"Не нашёл игрока: {query}", reply_to=message_id)
         return
 
-    # лучший матч
-    p = sorted(res, key=lambda x: (0 if x.get("isActive", True) else 1, len((x.get("displayName") or '').lower())))[0]
+    # простой выбор «лучшего» совпадения: активные выше, короче имя — выше
+    p = sorted(res, key=lambda x: (0 if x.get("isActive", True) else 1,
+                                   len((x.get("displayName") or '').lower())))[0]
     dn = p.get("displayName") or (p.get("firstName","") + " " + p.get("lastName","")).strip()
-    pid = p.get("personId") or ""
     team_id = str(p.get("teamId") or "0")
 
     # корректный headshot PNG
     headshot_url = ensure_headshot_png(p, size="520x380")
 
-    # логотип команды с cdn.nba.com (если team_id неизвестен — без логотипа, цвета подберутся дефолтные)
+    # логотип команды (если известен)
     team_logo_url = None
     if team_id and team_id != "0":
-        # пример: https://cdn.nba.com/logos/nba/1610612742/global/L/logo.png (DAL)
+        # пример: DAL -> 1610612742; глобальный логотип L
         team_logo_url = f"https://cdn.nba.com/logos/nba/{team_id}/global/L/logo.png"
 
     # метрики
@@ -210,7 +232,7 @@ async def _build_and_send_card(chat_id: int, message_id: int, query: str, stats_
         png = render_card(
             template=tpl,
             player_name=dn,
-            team_name="",                       # не выводим, но можно добавить отдельным элементом
+            team_name="",                       # можно вывести отдельно, пока не используется
             team_logo_path_or_url=team_logo_url,
             team_colors=None,                   # пусть подберутся из логотипа
             headshot_path_or_url=headshot_url,
@@ -284,12 +306,12 @@ async def handle_update(update: Dict[str, Any]) -> None:
         print("handle_update error:", repr(e), flush=True)
 
 # ==== ROUTES =================================================================
-@app.get("/api/telegram/health")
-async def health() -> JSONResponse:
-    return _ok({"ok": True})
-
 @app.get("/api/telegram")
 async def get_router(request: Request) -> JSONResponse:
+    """
+    Совместимость: /api/telegram?action=refresh&secret=...
+    (доп. health не нужен)
+    """
     _check_secret(request)
     action = request.query_params.get("action") or ""
     if action == "refresh":
@@ -302,6 +324,9 @@ async def get_router(request: Request) -> JSONResponse:
 
 @app.post("/api/telegram")
 async def webhook_query(request: Request, background: BackgroundTasks) -> JSONResponse:
+    """
+    Основной вебхук: быстро возвращаем 200, обработку пускаем в фон.
+    """
     _check_secret(request)
     try:
         update = await request.json()
