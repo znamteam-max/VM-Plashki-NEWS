@@ -1,6 +1,6 @@
-# api/telegram.py
+# api/telegram.py — статусы "Уточнения…", "Готовлю плашку…", "Ошибка"
 from __future__ import annotations
-import json, os, re, time, uuid
+import json, os, re, time, uuid, traceback
 from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -8,6 +8,7 @@ from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import HTTPError, URLError
 from PIL import Image
 
+# --- внешние модули проекта (как были у вас) ---
 from data import (
     refresh_players, get_players, get_players_index, find_player_by_name,
     ensure_headshot_png, open_headshot_variants, display_name_for,
@@ -18,19 +19,24 @@ from team_brand import (
     color_name_ru
 )
 from graphics import (
-    render_card, render_card2, render_card_bad, render_card_dr, render_card_special
+    render_card, render_card2, render_card_bad, render_card_dr, render_card_special,
+    render_card_drN
 )
 
+# ------------------- конфиг -------------------
 app = FastAPI()
 
-BOT_TOKEN      = os.getenv("BOT_TOKEN", "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-ADMIN_IDS      = [s.strip() for s in os.getenv("ADMIN_IDS", "").split(",") if s.strip()]
-ASK_COLOR_ALWAYS = os.getenv("ASK_COLOR_ALWAYS", "1") == "1"
-DR_TEMPLATE_PATH = os.getenv("DR_TEMPLATE_PATH", "assets/templates/card_dr_base.png")
+BOT_TOKEN         = os.getenv("BOT_TOKEN", "").strip()
+WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET", "").strip()
+ADMIN_IDS         = [s.strip() for s in os.getenv("ADMIN_IDS", "").split(",") if s.strip()]
+ASK_COLOR_ALWAYS  = os.getenv("ASK_COLOR_ALWAYS", "1") == "1"
+DR_TEMPLATES_DIR  = os.getenv("DR_TEMPLATES_DIR", "assets/templates")
+TEAM_LOGO_DIR     = os.getenv("TEAM_LOGO_DIR", "assets/cache")
+PLACEHOLDER_HEAD  = os.getenv("PLACEHOLDER_HEAD", "assets/placeholders/head.png")
 
 STATE_PATH = "/tmp/tg_state.json"
 
+# ------------------- утилиты -------------------
 def _log(*args: Any) -> None:
     try: print("[tg]", *args, flush=True)
     except: pass
@@ -61,6 +67,8 @@ def _clear_dialog(chat_id: int):
         _save_state(st)
 
 def _tg_base() -> str:
+    if not BOT_TOKEN:
+        return "https://api.telegram.org/bot"  # пусто — чтобы не падать при локальных тестах
     return f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 def _safe_http_json(url: str, body: Optional[bytes], headers: Dict[str, str], method: str, timeout: int = 25) -> Dict[str, Any]:
@@ -91,10 +99,15 @@ def _tg_post_json(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     return _safe_http_json(url, body, {"Content-Type":"application/json"}, "POST")
 
-def _tg_send_chat_action(chat_id: int, action: str = "typing"):
-    return _tg_post_json("sendChatAction", {"chat_id": chat_id, "action": action})
+def _tg_send_action(chat_id: int, action: str) -> None:
+    # typing / upload_document / upload_photo etc.
+    try:
+        _tg_post_json("sendChatAction", {"chat_id": chat_id, "action": action})
+    except Exception as e:
+        _log("sendChatAction err", e)
 
-def _tg_send_message_safe(chat_id: int, text: str, reply_to_message_id: Optional[int]=None, reply_markup: Optional[Dict[str,Any]]=None, parse_mode: Optional[str]="HTML") -> Dict[str, Any]:
+def _tg_send_message_safe(chat_id: int, text: str, reply_to_message_id: Optional[int]=None,
+                          reply_markup: Optional[Dict[str,Any]]=None, parse_mode: Optional[str]="HTML") -> Dict[str, Any]:
     payload = {"chat_id": chat_id, "text": text}
     if reply_to_message_id: payload["reply_to_message_id"] = reply_to_message_id
     if reply_markup: payload["reply_markup"] = reply_markup
@@ -112,8 +125,16 @@ def _tg_send_message_safe(chat_id: int, text: str, reply_to_message_id: Optional
             return res3
     return res
 
-def _tg_send_document_png_safe(chat_id: int, png_bytes: bytes, filename: str = "card.png", caption: Optional[str]=None) -> Dict[str, Any]:
-    boundary = "----WebKitFormBoundary" + uuid.uuid4().hex
+def _tg_edit_message_text_safe(chat_id: int, message_id: int, text: str, parse_mode: Optional[str]="HTML"):
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if parse_mode: payload["parse_mode"] = parse_mode
+    res = _tg_post_json("editMessageText", payload)
+    if not res.get("ok"):
+        # если не редактируется — отправим новое
+        _tg_send_message_safe(chat_id, text, parse_mode=parse_mode)
+    return res
+
+def _build_multipart(boundary: str, fields: Dict[str, str], files: List[Tuple[str, str, str, bytes]]) -> bytes:
     parts: List[bytes] = []
     def add_field(name: str, value: str):
         parts.append(f"--{boundary}\r\n".encode())
@@ -122,526 +143,379 @@ def _tg_send_document_png_safe(chat_id: int, png_bytes: bytes, filename: str = "
     def add_file(name: str, filename: str, mime: str, data: bytes):
         parts.append(f"--{boundary}\r\n".encode())
         parts.append(f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode())
-        parts.append(f"Content-Type: {mime}\n\n".encode())
+        parts.append(f"Content-Type: {mime}\r\n\r\n".encode())
         parts.append(data); parts.append(b"\r\n")
-    add_field("chat_id", str(chat_id))
-    if caption: add_field("caption", caption)
-    add_file("document", filename, "image/png", png_bytes)
+    for k,v in fields.items(): add_field(k,v)
+    for (name, filename, mime, data) in files: add_file(name, filename, mime, data)
     parts.append(f"--{boundary}--\r\n".encode())
-    body = b"".join(parts)
+    return b"".join(parts)
+
+def _tg_send_document_png_safe(chat_id: int, png_bytes: bytes, filename: str = "card.png", caption: Optional[str]=None) -> Dict[str, Any]:
     url = f"{_tg_base()}/sendDocument"
-    return _safe_http_json(url, body, {"Content-Type": f"multipart/form-data; boundary={boundary}"}, "POST", timeout=30)
+    boundary = "----WebKitFormBoundary" + uuid.uuid4().hex
+    fields = {"chat_id": str(chat_id)}
+    if caption: fields["caption"] = caption
+    body = _build_multipart(boundary, fields, [("document", filename, "image/png", png_bytes)])
+    try:
+        req = UrlRequest(url, data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}, method="POST")
+        with urlopen(req, timeout=30) as r:
+            raw = r.read().decode("utf-8")
+            try: return json.loads(raw)
+            except: return {"ok": True}
+    except Exception as e:
+        _log("sendDocument err", repr(e))
+        return {"ok": False, "error": repr(e)}
+
+# --------------- вспомогательное ---------------
+def _parse_stats_chunk(chunk: str) -> List[Tuple[str,str]]:
+    # "10 очков, 12 передач, 8 подборов" -> [("10","ОЧКОВ"), ...]
+    items = [s.strip() for s in chunk.split(",") if s.strip()]
+    out: List[Tuple[str,str]] = []
+    for it in items:
+        m = re.match(r"^\s*([+\-]?\d+(?:[.,]\d+)?)\s+(.+?)\s*$", it)
+        if m:
+            val = m.group(1).replace(",", ".")
+            lab = m.group(2)
+            out.append((val, lab))
+        else:
+            out.append((it, ""))  # если не распознали — просто текстом
+    return out
+
+def _load_logo_img(team_id: str) -> Optional[Image.Image]:
+    # 1) путь из team_brand
+    p = get_team_logo_path(team_id)
+    if p and os.path.exists(p):
+        try: return Image.open(p).convert("RGBA")
+        except: pass
+    # 2) файлы в assets/cache/{team_id}.png
+    guess = os.path.join(TEAM_LOGO_DIR, f"{team_id}.png")
+    if os.path.exists(guess):
+        try: return Image.open(guess).convert("RGBA")
+        except: pass
+    return None
+
+def _load_head_img(person_id: str) -> Image.Image:
+    # сначала пробуем нормальные варианты через ваш data.py
+    try:
+        pth = ensure_headshot_png(person_id, timeout=12)  # ужимаем таймаут
+        if pth and os.path.exists(pth):
+            return Image.open(pth).convert("RGBA")
+    except Exception as e:
+        _log("headshot ensure err", person_id, e)
+    # запасной вариант — любой найденный файл
+    try:
+        pths = open_headshot_variants(person_id)
+        for p in pths:
+            if os.path.exists(p):
+                return Image.open(p).convert("RGBA")
+    except Exception as e:
+        _log("headshot variants err", person_id, e)
+    # плейсхолдер
+    try:
+        return Image.open(PLACEHOLDER_HEAD).convert("RGBA")
+    except:
+        # минимальный прозрачный
+        return Image.new("RGBA", (512,512), (0,0,0,0))
+
+def _status(chat_id: int, text_html: str, reply_to: Optional[int]=None) -> Optional[int]:
+    # посылаем "курсивом" как просили
+    _tg_send_action(chat_id, "typing")
+    r = _tg_send_message_safe(chat_id, f"<i>{text_html}</i>", reply_to_message_id=reply_to, parse_mode="HTML")
+    try:
+        return r["result"]["message_id"] if r.get("ok") else None
+    except: return None
+
+def _status_edit(chat_id: int, msg_id: Optional[int], text_html: str):
+    if not msg_id: 
+        _tg_send_message_safe(chat_id, f"<i>{text_html}</i>", parse_mode="HTML")
+    else:
+        _tg_edit_message_text_safe(chat_id, msg_id, f"<i>{text_html}</i>", parse_mode="HTML")
 
 HELP_TEXT = (
     "Привет! Я онлайн 🤖\n\n"
     "Команды:\n"
     "• /start — проверка связи\n"
-    "• /find <имя/фамилия> — найти игрока (англ/рус/алиас)\n"
-    "• /card <игрок> | <метрики> — обычная плашка\n"
-    "• /card2 <игрок1> | <метрики1> | <игрок2> | <метрики2> — парная плашка\n"
-    "• /cardBAD <игрок> | <метрики> — плохо сыграл (коричневый, 💩)\n"
-    "• /cardDR <игрок> | <метрики> — Делает Разницу (по шаблону)\n"
-    "• /cardS <игрок> | <метрики> | <информация> — особая с боковой вставкой\n"
-    "• /name <имя> — задать русское имя игроку\n"
-    "• /team <имя> — задать/переопределить teamId\n"
-    "• /alias <pid> <алиас> — добавить алиас\n"
-    "• /color <teamId|имя> — сохранить дефолтный цвет команды (#HEX или AUTO)\n"
+    "• /find <имя/фамилия> — найти игрока (например: /find Doncic)\n"
+    "• /card <имя> | <метрики> — обычная плашка\n"
+    "• /card2 <имя1> | <метрики1> | <имя2> | <метрики2> — парная\n"
+    "• /cardBAD <имя> | <метрики> — сыграл плохо 💩\n"
+    "• /cardS <имя> | <метрики> | <инфо> — спец-плашка с доп. блоком\n"
+    "• /cardDR3|/cardDR4|/cardDR5 <имя> | <метрики...> — шаблоны DR\n"
+    "• /name <имя> — задать русское имя интерактивно (ответьте на сообщение)\n"
+    "• /team <имя> — задать/переопределить teamId (ответьте числом)\n"
 )
 
-def _parse_pipe_args(text: str, cmd: str, parts: int) -> Optional[List[str]]:
-    # парсер: /cmd a | b | c ...
-    body = text[len(cmd):].strip()
-    if "|" not in body: return None
-    chunks = [c.strip() for c in body.split("|")]
-    if len(chunks) < parts: return None
-    return chunks[:parts]
+# ------------------- парсинг телеграма -------------------
+def _extract_text(update: Dict[str, Any]) -> Tuple[Optional[int], Optional[int], str]:
+    msg = update.get("message") or update.get("edited_message") or update.get("channel_post")
+    if not msg: return None, None, ""
+    chat_id = int(msg["chat"]["id"])
+    msg_id  = int(msg["message_id"])
+    text = msg.get("text") or ""
+    return chat_id, msg_id, text
 
-def _parse_stats(s: str) -> List[Tuple[str,str]]:
-    out: List[Tuple[str,str]] = []
-    for chunk in [c.strip() for c in s.split(",") if c.strip()]:
-        m = re.match(r"^(\d+)\s*(.+)$", chunk)
-        if m: out.append((m.group(1), m.group(2).strip()))
-        else:  out.append((chunk, ""))
-    return out
+def _find_best_player(query: str) -> Optional[Dict[str, Any]]:
+    cands = find_player_by_name(query)
+    if not cands:
+        # попробуем без диакритики и т.п.
+        q = query.lower().replace("ё","е").replace("’","'").strip()
+        cands = [p for p in get_players() if q in (p.get("displayName","") or f"{p.get('firstName','')} {p.get('lastName','')}").lower()]
+    if not cands: return None
+    # берём активных в приоритете
+    cands.sort(key=lambda p: (not p.get("isActive", True), p.get("lastName",""), p.get("firstName","")))
+    return cands[0]
 
-def _best_candidates(query: str, limit: int = 4) -> List[Dict[str, Any]]:
-    q = (query or "").strip().lower()
-    if not q: return []
-    found = find_player_by_name(q)
-    if found: return found[:limit]
-    allp = get_players()
-    scored: List[Tuple[int, Dict[str,Any]]] = []
-    toks = [t for t in re.split(r"\s+", q) if t]
-    for p in allp:
-        dn = (p.get("displayName") or f"{p.get('firstName','')} {p.get('lastName','')}").strip().lower()
-        sc = 0
-        if dn:
-            if any(dn.startswith(t) for t in toks): sc += 3
-            if any(t in dn for t in toks): sc += 2
-        scored.append((sc, p))
-    scored.sort(key=lambda x: (-x[0], x[1].get("lastName",""), x[1].get("firstName","")))
-    return [p for sc,p in scored if sc>0][:limit]
+def _ensure_colors(team_id: str) -> Tuple[str,str,str]:
+    brand = get_team_brand(team_id)
+    if not brand:
+        return ("#007ACC", "#005A99", "#78C3FF")  # синий дефолт
+    # brand: {"primary":"#...", "dark":"#...", "light":"#..."}
+    primary = brand.get("primary") or "#007ACC"
+    dark    = brand.get("dark")    or primary
+    light   = brand.get("light")   or primary
+    return (primary, dark, light)
 
-def _force_reply() -> Dict[str,Any]:
-    return {"force_reply": True, "selective": True}
-
-# ---- Цвет: только 2 варианта (Авто/Свой HEX) ----
-def _ask_color_minimal(chat_id: int, team_id: str, ask_text: str):
-    kb = [
-        [{"text":"Авто (из лого/пресета)", "callback_data": f"pickcol:{team_id}:AUTO"}],
-        [{"text":"Ввести свой #HEX",       "callback_data": f"askhex:{team_id}:ASK"}],
-    ]
-    _tg_send_message_safe(chat_id, ask_text, reply_markup={"inline_keyboard": kb})
-
-def _render_single_flow(chat_id:int, player:Dict[str,Any], ru_name:str,
-                        stats:List[Tuple[str,str]], primary_override: Optional[str]=None):
-    # лого
-    team_id = str(player.get("teamId") or "0")
-    (primary, dark, light), logo_path, _palette, _has_saved = get_team_brand(team_id)
-    if primary_override and primary_override != "AUTO":
-        from team_brand import _hex_to_rgb, _shade, _hex as _tohex
-        primary = primary_override
-        rgb = _hex_to_rgb(primary)
-        dark = _tohex(_shade(rgb, 0.65)); light = primary
-
-    logo_img = None
-    if logo_path and os.path.exists(logo_path):
-        try: logo_img = Image.open(logo_path).convert("RGBA")
-        except Exception: logo_img = None
-
-    head_url = ensure_headshot_png(player)
-    head_img = open_headshot_variants(head_url) or Image.new("RGBA", (1040,1040), (0,0,0,0))
-
-    png = render_card(
-        template="single",
-        player_name=ru_name or display_name_for(player),
-        team_name=team_id,
-        team_logo_img=logo_img,
-        team_colors=(primary, dark, light),
-        head_img=head_img,
-        stats=stats,
-        note=None,
-    )
-    _tg_send_document_png_safe(chat_id, png, filename="card.png")
-    from team_brand import color_name_ru
-    _tg_send_message_safe(chat_id, f"Цвет: {color_name_ru(primary)} ({primary})")
-
-def _ensure_ru_then_color(chat_id: int, message_id: int, p: Dict[str,Any],
-                          stats: List[Tuple[str,str]], mode: str, extras: Dict[str,Any] | None = None):
-    pid = str(p.get("personId"))
-    ov = get_overrides().get(pid) or {}
-    saved_ru = str(ov.get("ruName") or "").strip()
-
-    _tg_send_message_safe(chat_id, "<i>Уточнения…</i>")
-    if not saved_ru:
-        en = display_name_for(p)
-        msg = _tg_send_message_safe(
-            chat_id,
-            f"Как подписать игрока <b>{en}</b> на плашке?\nОтветьте на это сообщение русским именем.",
-            reply_to_message_id=message_id, reply_markup=_force_reply()
-        )
-        if msg.get("ok"):
-            _set_dialog(chat_id, {"mode":"set_ru_then_color", "pid": pid, "stats": stats, "flow_mode": mode, "extras": extras or {}})
-            return
-        else:
-            saved_ru = en
-
-    # только 2 опции: авто и свой HEX
-    team_id = str(p.get("teamId") or "0")
-    _ask_color_minimal(chat_id, team_id, "Выберите основной цвет плашки:")
-    _set_dialog(chat_id, {"mode":"wait_color_for_flow", "pid": pid, "stats": stats, "ru": saved_ru, "flow_mode": mode, "extras": extras or {}})
-
+# ------------------- маршруты -------------------
 @app.get("/api/telegram")
-async def telegram_get(request: Request):
-    secret = request.query_params.get("secret", "")
+async def webhook_get(secret: str, action: Optional[str] = None):
     if secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="bad secret")
-    action = request.query_params.get("action")
+        raise HTTPException(status_code=400, detail="bad secret")
     if action == "refresh":
-        n, meta = refresh_players()
-        return JSONResponse({"ok": True, "refreshed": True, "players_indexed": n, **meta})
+        cnt, info = refresh_players()
+        ok = info.get("ok", False)
+        return JSONResponse({"ok": ok, "refreshed": True, "players_indexed": cnt, **info})
     return JSONResponse({"ok": True, "route": "telegram-get"})
 
 @app.post("/api/telegram")
-async def webhook_query(request: Request):
-    secret = request.query_params.get("secret", "")
+async def webhook_query(request: Request, secret: str):
     if secret != WEBHOOK_SECRET:
-        return PlainTextResponse("forbidden", status_code=403)
-    if not BOT_TOKEN:
-        return PlainTextResponse("no bot token", status_code=500)
+        raise HTTPException(status_code=400, detail="bad secret")
 
-    try:
-        upd = await request.json()
-    except Exception as e:
-        _log("json parse error", repr(e))
+    update = await request.json()
+    chat_id, msg_id, text = _extract_text(update)
+    if not chat_id:
         return PlainTextResponse("OK")
 
     try:
-        # callback_query
-        if "callback_query" in upd:
-            cb = upd["callback_query"]; data = cb.get("data") or ""
-            chat_id = cb["message"]["chat"]["id"]
-            msg_id = cb["message"]["message_id"]
-
-            # выбор игрока из кандидатов
-            if data.startswith("pick:"):
-                pid = data.split(":",1)[1]
-                p = get_players_index().get(pid)
-                _ = _tg_post_json("answerCallbackQuery", {"callback_query_id": cb["id"]})
-                if not p:
-                    _tg_send_message_safe(chat_id, "Игрок не найден в базе. Обновите список и попробуйте снова.")
-                    return PlainTextResponse("OK")
-                _ensure_ru_then_color(chat_id, msg_id, p, stats=[], mode="single")
-                return PlainTextResponse("OK")
-
-            # color: авто
-            if data.startswith("pickcol:"):
-                _, team_id, hexv = data.split(":")
-                _ = _tg_post_json("answerCallbackQuery", {"callback_query_id": cb["id"]})
-                dlg = _get_dialog(chat_id) or {}
-                flow_mode = dlg.get("flow_mode") or "single"
-                pid = (dlg.get("pid") or "")
-                p = get_players_index().get(str(pid))
-                if not p:
-                    _clear_dialog(chat_id); _tg_send_message_safe(chat_id, "Игрок не найден."); return PlainTextResponse("OK")
-                ru = dlg.get("ru") or display_name_for(p)
-                stats = dlg.get("stats") or []
-                extras = dlg.get("extras") or {}
-                _tg_send_message_safe(chat_id, "<i>Готовлю плашку…</i>")
-                _clear_dialog(chat_id)
-                # маршрутизация по flow
-                if flow_mode == "single":
-                    _render_single_flow(chat_id, p, ru, stats, primary_override=None if hexv=="AUTO" else hexv)
-                elif flow_mode == "special":
-                    # /cardS — без выбора здесь, но на случай, если попросили — применим разовый цвет
-                    (primary, dark, light), logo_path, _pc, _hs = get_team_brand(str(p.get("teamId") or "0"))
-                    if hexv != "AUTO":
-                        from team_brand import _hex_to_rgb, _shade, _hex as _tohex
-                        primary = hexv
-                        rgb = _hex_to_rgb(primary)
-                        dark = _tohex(_shade(rgb, 0.65)); light = primary
-                    logo_img = None
-                    if logo_path and os.path.exists(logo_path):
-                        try: logo_img = Image.open(logo_path).convert("RGBA")
-                        except: pass
-                    head_url = ensure_headshot_png(p)
-                    head_img = open_headshot_variants(head_url) or Image.new("RGBA", (1040,1040), (0,0,0,0))
-                    png = render_card_special(
-                        player_name=ru, team_logo_img=logo_img, team_colors=(primary,dark,light),
-                        head_img=head_img, stats=stats, info_text=str(extras.get("info") or "")
-                    )
-                    _tg_send_document_png_safe(chat_id, png, filename="card.png")
-                    from team_brand import color_name_ru
-                    _tg_send_message_safe(chat_id, f"Цвет: {color_name_ru(primary)} ({primary})")
-                else:
-                    # прочие флоу не используют выбор цвета (BAD/DR/DUO) — игнор
-                    pass
-                return PlainTextResponse("OK")
-
-            # color: запрос на ввод HEX
-            if data.startswith("askhex:"):
-                _, team_id, _ = data.split(":")
-                _ = _tg_post_json("answerCallbackQuery", {"callback_query_id": cb["id"]})
-                _tg_send_message_safe(chat_id, "Пришлите код цвета в формате <b>#RRGGBB</b> (только для этой плашки).", reply_to_message_id=msg_id, reply_markup=_force_reply())
-                dlg = _get_dialog(chat_id) or {}
-                if not dlg: dlg = {}
-                dlg["pending_team_id"] = team_id
-                dlg["mode"] = "wait_hex_then_render"
-                _set_dialog(chat_id, dlg)
-                return PlainTextResponse("OK")
-
-            _ = _tg_post_json("answerCallbackQuery", {"callback_query_id": cb["id"]})
+        # простые команды
+        if not text or text.strip() == "/start":
+            _tg_send_message_safe(chat_id, "Я тут. Отправьте /help для списка команд.")
             return PlainTextResponse("OK")
-
-        # обычные сообщения
-        if "message" in upd:
-            m = upd["message"]
-            chat_id = m["chat"]["id"]
-            text = (m.get("text") or "").strip()
-
-            dlg = _get_dialog(chat_id)
-            if dlg and m.get("reply_to_message"):
-                mode = dlg.get("mode")
-
-                if mode == "set_ru_then_color":
-                    pid = dlg["pid"]; ru = text.strip()
-                    set_player_ru_name(pid, ru)
-                    p = get_players_index().get(pid)
-                    if not p:
-                        _clear_dialog(chat_id); _tg_send_message_safe(chat_id, "Игрок не найден."); return PlainTextResponse("OK")
-                    team_id = str(p.get("teamId") or "0")
-                    _ask_color_minimal(chat_id, team_id, "Выберите основной цвет плашки:")
-                    _set_dialog(chat_id, {"mode":"wait_color_for_flow", "pid": pid, "stats": dlg.get("stats") or [], "ru": ru, "flow_mode": dlg.get("flow_mode") or "single", "extras": dlg.get("extras") or {}})
-                    return PlainTextResponse("OK")
-
-                if mode == "wait_hex_then_render":
-                    hexv = text.strip().upper()
-                    if not re.fullmatch(r"#([0-9A-F]{6})", hexv):
-                        _tg_send_message_safe(chat_id, "Формат цвета: <b>#RRGGBB</b>. Пришлите заново.", reply_to_message_id=m.get("message_id"), reply_markup=_force_reply())
-                        return PlainTextResponse("OK")
-                    flow_mode = dlg.get("flow_mode") or "single"
-                    pid = dlg.get("pid") or ""
-                    p = get_players_index().get(str(pid))
-                    if not p:
-                        _clear_dialog(chat_id); _tg_send_message_safe(chat_id, "Игрок не найден."); return PlainTextResponse("OK")
-                    ru = dlg.get("ru") or display_name_for(p)
-                    stats = dlg.get("stats") or []
-                    extras = dlg.get("extras") or {}
-                    _tg_send_message_safe(chat_id, "<i>Готовлю плашку…</i>")
-                    _clear_dialog(chat_id)
-                    if flow_mode == "single":
-                        _render_single_flow(chat_id, p, ru, stats, primary_override=hexv)
-                    elif flow_mode == "special":
-                        (primary, dark, light), logo_path, _pc, _hs = get_team_brand(str(p.get("teamId") or "0"))
-                        from team_brand import _hex_to_rgb, _shade, _hex as _tohex
-                        primary = hexv
-                        rgb = _hex_to_rgb(primary)
-                        dark = _tohex(_shade(rgb, 0.65)); light = primary
-                        logo_img = None
-                        if logo_path and os.path.exists(logo_path):
-                            try: logo_img = Image.open(logo_path).convert("RGBA")
-                            except: pass
-                        head_url = ensure_headshot_png(p)
-                        head_img = open_headshot_variants(head_url) or Image.new("RGBA", (1040,1040), (0,0,0,0))
-                        png = render_card_special(
-                            player_name=ru, team_logo_img=logo_img, team_colors=(primary,dark,light),
-                            head_img=head_img, stats=stats, info_text=str(extras.get("info") or "")
-                        )
-                        _tg_send_document_png_safe(chat_id, png, filename="card.png")
-                        from team_brand import color_name_ru
-                        _tg_send_message_safe(chat_id, f"Цвет: {color_name_ru(primary)} ({primary})")
-                    else:
-                        pass
-                    return PlainTextResponse("OK")
-
-                if mode == "set_ru_interactive":
-                    pid = dlg["pid"]; ru = text
-                    set_player_ru_name(pid, ru)
-                    _clear_dialog(chat_id)
-                    _tg_send_message_safe(chat_id, f"Ок! Имя сохранено: <b>{ru}</b> (pid={pid})")
-                    return PlainTextResponse("OK")
-
-                if mode == "set_team_interactive":
-                    pid = dlg["pid"]
-                    team_text = text.strip()
-                    if not re.fullmatch(r"\d{9,}", team_text):
-                        _tg_send_message_safe(chat_id, "Ожидаю числовой teamId (например: 1610612756). Попробуйте ещё раз.", reply_to_message_id=m.get("message_id"), reply_markup=_force_reply())
-                        return PlainTextResponse("OK")
-                    set_player_team(pid, team_text)
-                    _clear_dialog(chat_id)
-                    _tg_send_message_safe(chat_id, f"Команда обновлена: <b>{team_text}</b> для pid={pid}")
-                    return PlainTextResponse("OK")
-
-            # команды
-            if text.startswith("/start") or text.startswith("/help"):
-                _tg_send_message_safe(chat_id, HELP_TEXT); return PlainTextResponse("OK")
-
-            if text.startswith("/find"):
-                q = text[len("/find"):].strip()
-                if not q:
-                    _tg_send_message_safe(chat_id, "Укажите часть имени: /find Doncic"); return PlainTextResponse("OK")
-                res = find_player_by_name(q)
-                if not res:
-                    cand = _best_candidates(q)
-                    if not cand:
-                        _tg_send_message_safe(chat_id, "Ничего не найдено.")
-                        return PlainTextResponse("OK")
-                    kb = [[{"text": f"{p.get('firstName','')} {p.get('lastName','')} (pid={p.get('personId')})", "callback_data": "pick:"+str(p.get("personId"))}] for p in cand]
-                    _tg_send_message_safe(chat_id, "Выберите игрока:", reply_markup={"inline_keyboard": kb})
-                    return PlainTextResponse("OK")
-                lines = [f"• {p.get('firstName','')} {p.get('lastName','')} (pid={p.get('personId')}, teamId={p.get('teamId')})" for p in res[:10]]
-                _tg_send_message_safe(chat_id, "\n".join(lines) if lines else "Пусто")
-                return PlainTextResponse("OK")
-
-            if text.startswith("/name"):
-                q = text[len("/name"):].strip()
-                if not q:
-                    _tg_send_message_safe(chat_id, "Формат: /name <имя на англ/рус>"); return PlainTextResponse("OK")
-                res = find_player_by_name(q)
-                if not res:
-                    cand = _best_candidates(q)
-                    if not cand:
-                        _tg_send_message_safe(chat_id, "Игрок не найден."); return PlainTextResponse("OK")
-                    kb = [[{"text": f"{p.get('firstName','')} {p.get('lastName','')} (pid={p.get('personId')})", "callback_data": "pick:"+str(p.get("personId"))}] for p in cand]
-                    _tg_send_message_safe(chat_id, "Выберите игрока:", reply_markup={"inline_keyboard": kb})
-                    return PlainTextResponse("OK")
-                p = res[0]
-                en = f"{p.get('firstName','')} {p.get('lastName','')}".strip()
-                msg = _tg_send_message_safe(chat_id, f"Как подписать игрока <b>{en}</b> на русском?\nОтветьте на это сообщение именем.", reply_to_message_id=m.get("message_id"), reply_markup=_force_reply())
-                if msg.get("ok"):
-                    _set_dialog(chat_id, {"mode":"set_ru_interactive", "pid": str(p.get("personId")), "ask_msg_id": msg["result"]["message_id"]})
-                return PlainTextResponse("OK")
-
-            if text.startswith("/team"):
-                q = text[len("/team"):].strip()
-                if not q:
-                    _tg_send_message_safe(chat_id, "Формат: /team <имя>"); return PlainTextResponse("OK")
-                res = find_player_by_name(q)
-                if not res:
-                    _tg_send_message_safe(chat_id, "Игрок не найден."); return PlainTextResponse("OK")
-                p = res[0]
-                en = f"{p.get('firstName','')} {p.get('lastName','')}".strip()
-                msg = _tg_send_message_safe(chat_id, f"Введите числовой teamId для <b>{en}</b> (например 1610612756).", reply_to_message_id=m.get("message_id"), reply_markup=_force_reply())
-                if msg.get("ok"):
-                    _set_dialog(chat_id, {"mode":"set_team_interactive", "pid": str(p.get("personId")), "ask_msg_id": msg["result"]["message_id"]})
-                return PlainTextResponse("OK")
-
-            if text.startswith("/alias"):
-                rest = text[len("/alias"):].strip()
-                m2 = re.match(r"^(\d+)\s+(.+)$", rest)
-                if not m2:
-                    _tg_send_message_safe(chat_id, "Формат: /alias <pid> <алиас>"); return PlainTextResponse("OK")
-                pid, alias = m2.group(1), m2.group(2)
-                set_player_alias(pid, alias)
-                _tg_send_message_safe(chat_id, f"Алиас добавлен: <b>{alias}</b> для pid={pid}")
-                return PlainTextResponse("OK")
-
-            if text.startswith("/color"):
-                q = text[len("/color"):].strip()
-                team_id = None
-                if re.fullmatch(r"\d{9,}", q):
-                    team_id = q
-                else:
-                    res = find_player_by_name(q)
-                    if res:
-                        team_id = str(res[0].get("teamId") or "0")
-                if not team_id:
-                    _tg_send_message_safe(chat_id, "Формат: /color <teamId> или /color <имя игрока>")
-                    return PlainTextResponse("OK")
-                _tg_send_message_safe(chat_id, "Пришлите <b>#RRGGBB</b> — сохраню как дефолт для этой команды. Или <b>AUTO</b> чтобы сбросить.", reply_to_message_id=m.get("message_id"), reply_markup=_force_reply())
-                _set_dialog(chat_id, {"mode":"save_team_color", "team_id": team_id})
-                return PlainTextResponse("OK")
-
-            if dlg and dlg.get("mode") == "save_team_color":
-                team_id = dlg.get("team_id")
-                val = text.strip().upper()
-                if val == "AUTO":
-                    ok = set_team_primary_color(team_id, "AUTO")
-                else:
-                    if not re.fullmatch(r"#([0-9A-F]{6})", val):
-                        _tg_send_message_safe(chat_id, "Формат: #RRGGBB или AUTO. Ещё раз.", reply_to_message_id=m.get("message_id"), reply_markup=_force_reply())
-                        return PlainTextResponse("OK")
-                    ok = set_team_primary_color(team_id, val)
-                _clear_dialog(chat_id)
-                _tg_send_message_safe(chat_id, "Ок!") if ok else _tg_send_message_safe(chat_id, "Не удалось сохранить.")
-                return PlainTextResponse("OK")
-
-            # ---- Генерация карточек ----
-            if text.startswith("/card2"):
-                args = _parse_pipe_args(text, "/card2", 4)
-                if not args:
-                    _tg_send_message_safe(chat_id, "Формат: /card2 игрок1 | метрики1 | игрок2 | метрики2")
-                    return PlainTextResponse("OK")
-                n1, s1, n2, s2 = args
-                stats1, stats2 = _parse_stats(s1), _parse_stats(s2)
-                res1, res2 = find_player_by_name(n1), find_player_by_name(n2)
-                if not res1 or not res2:
-                    _tg_send_message_safe(chat_id, "Не нашёл одного из игроков.")
-                    return PlainTextResponse("OK")
-                p1, p2 = res1[0], res2[0]
-
-                # p1
-                (c1, logo1p, _pc1, _hs1) = (*get_team_brand(str(p1.get("teamId") or "0"))[:4],)
-                (primary1, dark1, light1) = c1
-                logo1 = None
-                if logo1p and os.path.exists(logo1p):
-                    try: logo1 = Image.open(logo1p).convert("RGBA")
-                    except: pass
-                head1_url = ensure_headshot_png(p1)
-                head1 = open_headshot_variants(head1_url) or Image.new("RGBA", (1040,1040), (0,0,0,0))
-                # p2
-                (c2, logo2p, _pc2, _hs2) = (*get_team_brand(str(p2.get("teamId") or "0"))[:4],)
-                (primary2, dark2, light2) = c2
-                logo2 = None
-                if logo2p and os.path.exists(logo2p):
-                    try: logo2 = Image.open(logo2p).convert("RGBA")
-                    except: pass
-                head2_url = ensure_headshot_png(p2)
-                head2 = open_headshot_variants(head2_url) or Image.new("RGBA", (1040,1040), (0,0,0,0))
-
-                png = render_card2(
-                    display_name_for(p1), logo1, (primary1,dark1,light1), head1, stats1,
-                    display_name_for(p2), logo2, (primary2,dark2,light2), head2, stats2
-                )
-                _tg_send_document_png_safe(chat_id, png, filename="card.png")
-                return PlainTextResponse("OK")
-
-            if text.startswith("/cardBAD"):
-                args = _parse_pipe_args(text, "/cardBAD", 2)
-                if not args:
-                    _tg_send_message_safe(chat_id, "Формат: /cardBAD игрок | метрики")
-                    return PlainTextResponse("OK")
-                name, s = args
-                stats = _parse_stats(s)
-                res = find_player_by_name(name)
-                if not res:
-                    _tg_send_message_safe(chat_id, "Игрок не найден.")
-                    return PlainTextResponse("OK")
-                p = res[0]
-                ru = (get_overrides().get(str(p.get("personId")), {}) or {}).get("ruName") or display_name_for(p)
-                head_url = ensure_headshot_png(p)
-                head_img = open_headshot_variants(head_url) or Image.new("RGBA", (1040,1040), (0,0,0,0))
-                png = render_card_bad(ru, head_img, stats)
-                _tg_send_document_png_safe(chat_id, png, filename="card.png")
-                return PlainTextResponse("OK")
-
-            if text.startswith("/cardDR"):
-                args = _parse_pipe_args(text, "/cardDR", 2)
-                if not args:
-                    _tg_send_message_safe(chat_id, "Формат: /cardDR игрок | метрики")
-                    return PlainTextResponse("OK")
-                name, s = args
-                stats = _parse_stats(s)
-                res = find_player_by_name(name)
-                if not res:
-                    _tg_send_message_safe(chat_id, "Игрок не найден.")
-                    return PlainTextResponse("OK")
-                p = res[0]
-                ru = (get_overrides().get(str(p.get("personId")), {}) or {}).get("ruName") or display_name_for(p)
-                head_url = ensure_headshot_png(p)
-                head_img = open_headshot_variants(head_url) or Image.new("RGBA", (1040,1040), (0,0,0,0))
-                png = render_card_dr(ru, head_img, stats, template_path=DR_TEMPLATE_PATH)
-                _tg_send_document_png_safe(chat_id, png, filename="card.png")
-                return PlainTextResponse("OK")
-
-            if text.startswith("/cardS"):
-                args = _parse_pipe_args(text, "/cardS", 3)
-                if not args:
-                    _tg_send_message_safe(chat_id, "Формат: /cardS игрок | метрики | информация")
-                    return PlainTextResponse("OK")
-                name, s, info = args
-                stats = _parse_stats(s)
-                res = find_player_by_name(name)
-                if not res:
-                    _tg_send_message_safe(chat_id, "Игрок не найден.")
-                    return PlainTextResponse("OK")
-                p = res[0]
-                # Уточнения + цвет (минимальный выбор)
-                extras = {"info": info}
-                _ensure_ru_then_color(chat_id, m.get("message_id"), p, stats, mode="special", extras=extras)
-                return PlainTextResponse("OK")
-
-            if text.startswith("/card"):
-                # обычная плашка (без impact/single в конце)
-                args_raw = text[len("/card"):].strip()
-                if "|" not in args_raw:
-                    _tg_send_message_safe(chat_id, "Формат: /card игрок | метрики")
-                    return PlainTextResponse("OK")
-                name, s = [c.strip() for c in args_raw.split("|", 1)]
-                stats = _parse_stats(s)
-                res = find_player_by_name(name)
-                if not res:
-                    cand = _best_candidates(name)
-                    kb = [[{"text": f"{p.get('firstName','')} {p.get('lastName','')} (pid={p.get('personId')})", "callback_data": "pick:"+str(p.get('personId'))}] for p in cand]
-                    _tg_send_message_safe(chat_id, "Не нашёл точного игрока. Выберите:", reply_markup={"inline_keyboard": kb})
-                    return PlainTextResponse("OK")
-                p = res[0]
-                _ensure_ru_then_color(chat_id, m.get("message_id"), p, stats, mode="single")
-                return PlainTextResponse("OK")
-
+        if text.strip().startswith("/help"):
             _tg_send_message_safe(chat_id, HELP_TEXT)
             return PlainTextResponse("OK")
+        if text.strip().startswith("/find"):
+            q = text.split(" ",1)[1].strip() if " " in text else ""
+            if not q:
+                _tg_send_message_safe(chat_id, "Укажите имя: /find Doncic")
+                return PlainTextResponse("OK")
+            p = _find_best_player(q)
+            if not p:
+                _tg_send_message_safe(chat_id, f"Не нашёл игрока: {q}")
+                return PlainTextResponse("OK")
+            disp = display_name_for(p)
+            _tg_send_message_safe(chat_id, f"{disp} (id={p['personId']}, teamId={p.get('teamId','0')})")
+            return PlainTextResponse("OK")
+
+        # --- /card (single, автоцвет)
+        if text.startswith("/card2"):
+            # /card2 name1 | stats1 | name2 | stats2
+            st_id = _status(chat_id, "Уточнения…", reply_to=msg_id)
+            try:
+                parts = [s.strip() for s in text[len("/card2"):].split("|")]
+                if len(parts) < 4: 
+                    _status_edit(chat_id, st_id, "Ошибка: формат. Пример: <code>/card2 Игрок1 | 10 очков | Игрок2 | 8 передач</code>")
+                    return PlainTextResponse("OK")
+                n1, s1, n2, s2 = parts[0], parts[1], parts[2], parts[3]
+                p1 = _find_best_player(n1); p2 = _find_best_player(n2)
+                if not p1 or not p2:
+                    _status_edit(chat_id, st_id, "Ошибка: один из игроков не найден.")
+                    return PlainTextResponse("OK")
+                _status_edit(chat_id, st_id, "Готовлю плашку…")
+                head1 = _load_head_img(p1["personId"])
+                head2 = _load_head_img(p2["personId"])
+                colors1 = _ensure_colors(p1.get("teamId","0"))
+                colors2 = _ensure_colors(p2.get("teamId","0"))
+                logo1 = _load_logo_img(p1.get("teamId","0"))
+                logo2 = _load_logo_img(p2.get("teamId","0"))
+                stats1 = _parse_stats_chunk(s1)
+                stats2 = _parse_stats_chunk(s2)
+                png = render_card2(display_name_for(p1), logo1, colors1, head1, stats1,
+                                   display_name_for(p2), logo2, colors2, head2, stats2)
+                _tg_send_action(chat_id, "upload_document")
+                _tg_send_document_png_safe(chat_id, png, "card2.png")
+                _status_edit(chat_id, st_id, "Готово ✅")
+            except Exception as e:
+                _log("card2 err", traceback.format_exc())
+                _status_edit(chat_id, st_id, f"Ошибка: {e}")
+            return PlainTextResponse("OK")
+
+        if text.startswith("/cardBAD"):
+            st_id = _status(chat_id, "Готовлю плашку…", reply_to=msg_id)
+            try:
+                parts = [s.strip() for s in text[len("/cardBAD"):].split("|")]
+                if len(parts) < 2:
+                    _status_edit(chat_id, st_id, "Ошибка: формат. Пример: <code>/cardBAD Игрок | 2 очка, 6 потерь</code>")
+                    return PlainTextResponse("OK")
+                name_q, stats_raw = parts[0], parts[1]
+                p = _find_best_player(name_q)
+                if not p:
+                    _status_edit(chat_id, st_id, f"Ошибка: не нашёл {name_q}")
+                    return PlainTextResponse("OK")
+                head = _load_head_img(p["personId"])
+                stats = _parse_stats_chunk(stats_raw)
+                png = render_card_bad(display_name_for(p), head, stats)
+                _tg_send_action(chat_id, "upload_document")
+                _tg_send_document_png_safe(chat_id, png, "card_bad.png")
+                _status_edit(chat_id, st_id, "Готово ✅")
+            except Exception as e:
+                _log("cardBAD err", traceback.format_exc())
+                _status_edit(chat_id, st_id, f"Ошибка: {e}")
+            return PlainTextResponse("OK")
+
+        if text.startswith("/cardS"):
+            st_id = _status(chat_id, "Уточнения…", reply_to=msg_id)
+            try:
+                # /cardS name | stats | info
+                parts = [s.strip() for s in text[len("/cardS"):].split("|")]
+                if len(parts) < 3:
+                    _status_edit(chat_id, st_id, "Ошибка: формат. Пример: <code>/cardS Игрок | 28 очков | сломал серию</code>")
+                    return PlainTextResponse("OK")
+                name_q, stats_raw, info = parts[0], parts[1], parts[2]
+                p = _find_best_player(name_q)
+                if not p:
+                    _status_edit(chat_id, st_id, f"Ошибка: не нашёл {name_q}")
+                    return PlainTextResponse("OK")
+                _status_edit(chat_id, st_id, "Готовлю плашку…")
+                head = _load_head_img(p["personId"])
+                colors = _ensure_colors(p.get("teamId","0"))
+                logo  = _load_logo_img(p.get("teamId","0"))
+                stats = _parse_stats_chunk(stats_raw)
+                png = render_card_special(display_name_for(p), logo, colors, head, stats, info)
+                _tg_send_action(chat_id, "upload_document")
+                _tg_send_document_png_safe(chat_id, png, "card_special.png")
+                _status_edit(chat_id, st_id, "Готово ✅")
+            except Exception as e:
+                _log("cardS err", traceback.format_exc())
+                _status_edit(chat_id, st_id, f"Ошибка: {e}")
+            return PlainTextResponse("OK")
+
+        # DRN
+        if text.startswith("/cardDR3") or text.startswith("/cardDR4") or text.startswith("/cardDR5"):
+            st_id = _status(chat_id, "Готовлю плашку…", reply_to=msg_id)
+            try:
+                m = re.match(r"^/cardDR(\d+)\s+(.+)$", text.strip())
+                if not m: 
+                    _status_edit(chat_id, st_id, "Ошибка: формат. Пример: <code>/cardDR3 Игрок | 30 очков, 12 подборов, 5 передач</code>")
+                    return PlainTextResponse("OK")
+                n = int(m.group(1))
+                rest = m.group(2)
+                parts = [s.strip() for s in rest.split("|")]
+                if len(parts) < 2:
+                    _status_edit(chat_id, st_id, "Ошибка: укажите игрока и метрики.")
+                    return PlainTextResponse("OK")
+                name_q, stats_raw = parts[0], parts[1]
+                p = _find_best_player(name_q)
+                if not p:
+                    _status_edit(chat_id, st_id, f"Ошибка: не нашёл {name_q}")
+                    return PlainTextResponse("OK")
+                head = _load_head_img(p["personId"])
+                logo = _load_logo_img(p.get("teamId","0"))
+                stats = _parse_stats_chunk(stats_raw)
+                png = render_card_drN(n, display_name_for(p), head, logo, stats)
+                _tg_send_action(chat_id, "upload_document")
+                _tg_send_document_png_safe(chat_id, png, f"cardDR{n}.png")
+                _status_edit(chat_id, st_id, "Готово ✅")
+            except Exception as e:
+                _log("cardDRN err", traceback.format_exc())
+                _status_edit(chat_id, st_id, f"Ошибка: {e}")
+            return PlainTextResponse("OK")
+
+        # /card (single, автоцвет)
+        if text.startswith("/card"):
+            st_id = _status(chat_id, "Уточнения…", reply_to=msg_id)
+            try:
+                body = text[len("/card"):].strip()
+                parts = [s.strip() for s in body.split("|")]
+                if len(parts) < 2:
+                    _status_edit(chat_id, st_id, "Ошибка: формат. Пример: <code>/card Игрок | 10 очков, 12 передач</code>")
+                    return PlainTextResponse("OK")
+                name_q, stats_raw = parts[0], parts[1]
+                p = _find_best_player(name_q)
+                if not p:
+                    _status_edit(chat_id, st_id, f"Ошибка: не нашёл {name_q}")
+                    return PlainTextResponse("OK")
+
+                # всё есть — готовим
+                _status_edit(chat_id, st_id, "Готовлю плашку…")
+                head = _load_head_img(p["personId"])
+                colors = _ensure_colors(p.get("teamId","0"))
+                logo  = _load_logo_img(p.get("teamId","0"))
+                stats = _parse_stats_chunk(stats_raw)
+                png = render_card("single", display_name_for(p), "", logo, colors, head, stats)
+                _tg_send_action(chat_id, "upload_document")
+                _tg_send_document_png_safe(chat_id, png, "card.png")
+                _status_edit(chat_id, st_id, "Готово ✅")
+            except Exception as e:
+                _log("card err", traceback.format_exc())
+                _status_edit(chat_id, st_id, f"Ошибка: {e}")
+            return PlainTextResponse("OK")
+
+        # name/team интерактив (как у вас было)
+        if text.startswith("/name"):
+            q = text.split(" ",1)[1].strip() if " " in text else ""
+            if not q:
+                _tg_send_message_safe(chat_id, "Укажите игрока: /name Kevin Durant")
+                return PlainTextResponse("OK")
+            p = _find_best_player(q)
+            if not p:
+                _tg_send_message_safe(chat_id, f"Не нашёл игрока: {q}")
+                return PlainTextResponse("OK")
+            msg = _tg_send_message_safe(chat_id, f"Как подписать игрока {display_name_for(p)} на плашке?\nОтветьте на это сообщение русским именем.\n[setname:{p['personId']}]")
+            return PlainTextResponse("OK")
+
+        if text.startswith("/team"):
+            q = text.split(" ",1)[1].strip() if " " in text else ""
+            if not q:
+                _tg_send_message_safe(chat_id, "Укажите игрока: /team Kevin Durant")
+                return PlainTextResponse("OK")
+            p = _find_best_player(q)
+            if not p:
+                _tg_send_message_safe(chat_id, f"Не нашёл игрока: {q}")
+                return PlainTextResponse("OK")
+            _tg_send_message_safe(chat_id, f"Какой teamId назначить для {display_name_for(p)}?\nОтветьте числом.\n[setteam:{p['personId']}]")
+            return PlainTextResponse("OK")
+
+        # обработка reply на setname/setteam
+        msg = update.get("message") or {}
+        if msg.get("reply_to_message") and msg.get("text"):
+            reply_text = msg["reply_to_message"].get("text") or ""
+            if "[setname:" in reply_text:
+                m = re.search(r"\[setname:(\d+)\]", reply_text)
+                if m:
+                    pid = m.group(1)
+                    ru = msg["text"].strip()
+                    set_player_ru_name(pid, ru)
+                    _tg_send_message_safe(chat_id, f"Имя сохранено: {ru}")
+                    return PlainTextResponse("OK")
+            if "[setteam:" in reply_text:
+                m = re.search(r"\[setteam:(\d+)\]", reply_text)
+                if m:
+                    pid = m.group(1)
+                    team_id = msg["text"].strip()
+                    set_player_team(pid, team_id)
+                    _tg_send_message_safe(chat_id, f"Команда сохранена: {team_id}")
+                    return PlainTextResponse("OK")
+
+        # неизвестная команда
+        _tg_send_message_safe(chat_id, HELP_TEXT)
+        return PlainTextResponse("OK")
 
     except Exception as e:
-        _log("webhook error", repr(e))
-    return PlainTextResponse("OK")
+        _log("top-level err", traceback.format_exc())
+        # стараемся не молчать:
+        try:
+            _tg_send_message_safe(chat_id, f"<i>Ошибка:</i> {e}", parse_mode="HTML")
+        except:
+            pass
+        return PlainTextResponse("OK")
