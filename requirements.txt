@@ -1,5 +1,5 @@
-fastapi>=0.110,<1
-starlette>=0.36,<0.40
-pydantic>=2,<3
+fastapi==0.115.5
+starlette==0.40.0
+pydantic>=2.8
 requests>=2.31
 Pillow>=10
