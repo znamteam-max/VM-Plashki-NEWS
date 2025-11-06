@@ -1,5 +1,5 @@
-# graphics.py — логотип поверх фото, мягкий градиент, мелкие подписи метрик
-
+# graphics.py
+from __future__ import annotations
 from typing import List, Tuple, Optional
 from PIL import Image, ImageDraw, ImageFont
 import io
@@ -17,7 +17,7 @@ BOT_IN         = 20
 # Интервалы
 NAME_STATS_GAP = 30
 BLOCK_HGAP     = 56
-INNER_VGAP     = 20  # зазор между числом и подписью
+INNER_VGAP     = 20
 
 # «Антиллипкие» паддинги
 NAME_PAD_TOP       = 4
@@ -27,9 +27,8 @@ BLOCK_PAD_BOTTOM   = 6
 
 # Размеры головы/логотипа
 HEAD_SIZE   = 360
-LOGO_D      = 140   # диаметр круга под логотип
-LOGO_SIZE   = 124   # размер логотипа внутри круга
-# Позиция логотипа на голове (нижний-левый сектор)
+LOGO_D      = 140
+LOGO_SIZE   = 124
 LOGO_OFFSET_X = 18
 LOGO_OFFSET_Y = 210
 
@@ -42,12 +41,10 @@ def _load_font(path: str, size: int):
     try: return ImageFont.truetype(path, size)
     except Exception: return ImageFont.load_default()
 
-# Базовые размеры шрифтов
-BASE_NAME = 60   # ИМЯ
-BASE_VAL  = 50   # ЧИСЛО
-BASE_LBL  = 28   # ПОДПИСИ — меньше
+BASE_NAME = 60
+BASE_VAL  = 50
+BASE_LBL  = 28
 
-# ---------- текст без «срезов» ----------
 def _text_img(text: str, font: ImageFont.FreeTypeFont, fill=(255,255,255,255)) -> Image.Image:
     probe = Image.new("RGBA", (1, 1))
     d = ImageDraw.Draw(probe)
@@ -65,7 +62,8 @@ def _pad_v(img: Image.Image, top: int, bottom: int) -> Image.Image:
 
 def _fit_text_to_width(text: str, font_path: str, max_w: int, max_size: int, min_size: int = 26):
     lo, hi = min_size, max_size
-    probe = Image.new("RGBA", (1, 1)); d = ImageDraw.Draw(probe)
+    probe = Image.new("RGBA", (1, 1))
+    d = ImageDraw.Draw(probe)
     best = _load_font(font_path, lo)
     while lo <= hi:
         mid = (lo + hi) // 2
@@ -80,8 +78,8 @@ def _fit_text_to_width(text: str, font_path: str, max_w: int, max_size: int, min
 def _circle_crop_img(img: Image.Image, d: int) -> Image.Image:
     im = img.convert("RGBA")
     s = min(im.size)
-    left = (im.width - s) // 2
-    top  = max(0, im.height - s)
+    left = max(0,(im.width - s)//2)
+    top  = max(0,(im.height - s)//2)
     im   = im.crop((left, top, left + s, top + s)).resize((d, d), Image.LANCZOS)
     mask = Image.new("L", (d, d), 0)
     ImageDraw.Draw(mask).ellipse((0,0,d,d), fill=255)
@@ -89,17 +87,9 @@ def _circle_crop_img(img: Image.Image, d: int) -> Image.Image:
     out.paste(im, (0,0), mask)
     return out
 
-# ---------- цвет и мягкий градиент ----------
 def _hex_to_rgb(h: str) -> Tuple[int,int,int]:
-    h = h.strip()
-    if h.startswith("#"): h = h[1:]
-    return tuple(int(h[i:i+2], 16) for i in (0,2,4))
-
-def _clamp(c: int) -> int:
-    return max(0, min(255, c))
-
-def _shade(rgb: Tuple[int,int,int], k: float) -> Tuple[int,int,int]:
-    return (_clamp(int(rgb[0]*k)), _clamp(int(rgb[1]*k)), _clamp(int(rgb[2]*k)))
+    h = h.strip().lstrip("#")
+    return (int(h[0:2],16), int(h[2:4],16), int(h[4:6],16))
 
 def _rounded_horizontal_gradient(width: int, height: int, radius: int,
                                  left_rgb: Tuple[int,int,int], right_rgb: Tuple[int,int,int]) -> Image.Image:
@@ -117,7 +107,6 @@ def _rounded_horizontal_gradient(width: int, height: int, radius: int,
     out.paste(grad, (0,0), mask)
     return out
 
-# ---------- строка метрик ----------
 def _metric_line(
     stats: List[Tuple[str, str]],
     f_val: ImageFont.FreeTypeFont,
@@ -149,27 +138,27 @@ def _metric_line(
         x += b.width + hgap
     return line
 
-# ---------- основной рендер ----------
 def render_card(
     template: str,
     player_name: str,
     team_name: str,
-    team_logo_img: Optional[Image.Image],    # готовый RGBA Image логотипа или None
-    team_colors: Tuple[str, str, str],       # (primary, dark, light)
-    head_img: Image.Image,                   # уже загруженная RGBA голова (круг вырежем здесь)
+    team_logo_img: Optional[Image.Image],
+    team_colors: Tuple[str, str, str],  # (primary, dark, light)
+    head_img: Image.Image,
     stats: List[Tuple[str, str]],
     note: Optional[str] = None,
 ) -> bytes:
     primary_hex, dark_hex, light_hex = team_colors
     primary_rgb = _hex_to_rgb(primary_hex)
-    left_rgb  = _shade(primary_rgb, 0.65)
-    right_rgb = primary_rgb
+    left_rgb    = _hex_to_rgb(dark_hex)
+    right_rgb   = primary_rgb
 
     canvas = Image.new("RGBA", (W, H), (0,0,0,0))
 
-    # Фото игрока (circle)
+    # Фото игрока (круг)
     head = _circle_crop_img(head_img, HEAD_SIZE)
 
+    # Имя
     name_area_x = PAD_L + HEAD_SIZE + 36
     name_max_w  = W - name_area_x - PAD_R
     name_img, _ = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, name_max_w, BASE_NAME, 28)
@@ -179,75 +168,62 @@ def render_card(
     f_lbl = _load_font(F_SB_PATH,  BASE_LBL)
     stats_line = _metric_line(stats, f_val, f_lbl)
 
+    # Высотный лимит метрик
     avail_h_for_stats = BAR_H - TOP_IN - name_img.height - NAME_STATS_GAP - BOT_IN
     if avail_h_for_stats < 1: avail_h_for_stats = 1
     if stats_line.height > avail_h_for_stats:
         k = avail_h_for_stats / stats_line.height
         stats_line = stats_line.resize((max(1,int(stats_line.width*k)), max(1,int(stats_line.height*k))), Image.LANCZOS)
 
-    # Impact tag
-    star_img = tag_img = None
-    if template == "impact":
-        try:
-            star_img = Image.open("assets/icons/star.png").convert("RGBA").resize((56,56), Image.LANCZOS)
-        except Exception:
-            star_img = None
-        tag_img, _ = _fit_text_to_width("ДЕЛАЕТ РАЗНИЦУ", F_SB_PATH, 260, 40, 22)
-
-    right_by_name  = name_area_x + name_img.width + (14 + (star_img.width if star_img else 0) + (10 if star_img else 0) + (tag_img.width if tag_img else 0) if template == "impact" else 0)
+    # Правая граница панели
+    right_by_name  = name_area_x + name_img.width
     right_by_stats = name_area_x + stats_line.width
     content_right  = max(right_by_name, right_by_stats)
     bar_w = min(W, content_right + PAD_R)
 
-    # --- Панель с градиентом ---
+    # Панель с градиентом
     bar_y = H - BAR_H
     panel = _rounded_horizontal_gradient(bar_w, BAR_H, 24, left_rgb, right_rgb)
     canvas.alpha_composite(panel, (0, bar_y))
 
-    # Размещаем голову
+    # Голова
     head_x = PAD_L
     head_y = bar_y - head.height//3
     canvas.alpha_composite(head, (head_x, head_y))
 
-    # ЛОГОТИП СВЕРХУ ФОТО
-    if team_logo_img is not None:
-        logo_raw = team_logo_img.convert("RGBA").resize((LOGO_SIZE, LOGO_SIZE), Image.LANCZOS)
-        # тень
-        shadow = Image.new("RGBA", (LOGO_D+6, LOGO_D+6), (0,0,0,0))
-        sh_mask = Image.new("L", (LOGO_D+6, LOGO_D+6), 0)
-        ImageDraw.Draw(sh_mask).ellipse((3,3,LOGO_D+3,LOGO_D+3), fill=90)
-        shadow.putalpha(sh_mask)
-        # белый круг
-        logo_circle = Image.new("RGBA", (LOGO_D, LOGO_D), (255,255,255,255))
-        mask = Image.new("L", (LOGO_D, LOGO_D), 0)
-        ImageDraw.Draw(mask).ellipse((0,0,LOGO_D,LOGO_D), fill=255)
-        logo_circle.putalpha(mask)
-        logo_circle.alpha_composite(logo_raw, ((LOGO_D - LOGO_SIZE)//2, (LOGO_D - LOGO_SIZE)//2))
-        # позиция на голове
-        logo_x = head_x + LOGO_OFFSET_X
-        logo_y = head_y + LOGO_OFFSET_Y
-        canvas.alpha_composite(shadow, (logo_x - 3, logo_y - 3))
-        canvas.alpha_composite(logo_circle, (logo_x, logo_y))
+    # Логотип на фото (поверх)
+    if team_logo_img:
+        try:
+            logo_raw = team_logo_img.convert("RGBA").resize((LOGO_SIZE, LOGO_SIZE), Image.LANCZOS)
+            # тень
+            shadow = Image.new("RGBA", (LOGO_D+6, LOGO_D+6), (0,0,0,0))
+            sh_mask = Image.new("L", (LOGO_D+6, LOGO_D+6), 0)
+            ImageDraw.Draw(sh_mask).ellipse((3,3,LOGO_D+3,LOGO_D+3), fill=90)
+            shadow.putalpha(sh_mask)
+            # белый круг
+            logo_circle = Image.new("RGBA", (LOGO_D, LOGO_D), (255,255,255,255))
+            mask = Image.new("L", (LOGO_D, LOGO_D), 0)
+            ImageDraw.Draw(mask).ellipse((0,0,LOGO_D,LOGO_D), fill=255)
+            logo_circle.putalpha(mask)
+            logo_circle.alpha_composite(logo_raw, ((LOGO_D - LOGO_SIZE)//2, (LOGO_D - LOGO_SIZE)//2))
+            logo_x = head_x + LOGO_OFFSET_X
+            logo_y = head_y + LOGO_OFFSET_Y
+            canvas.alpha_composite(shadow, (logo_x - 3, logo_y - 3))
+            canvas.alpha_composite(logo_circle, (logo_x, logo_y))
+        except Exception:
+            pass
 
     # Имя
     name_x = name_area_x
     name_y = bar_y + TOP_IN
     canvas.alpha_composite(name_img, (name_x, name_y))
 
-    # Impact tag
-    if template == "impact":
-        cur_x = name_x + name_img.width + 14
-        if star_img:
-            canvas.alpha_composite(star_img, (cur_x, name_y - 2))
-            cur_x += star_img.width + 10
-        if tag_img:
-            canvas.alpha_composite(tag_img, (cur_x, name_y + 4))
-
     # Метрики
     stats_x = name_x
     stats_y = name_y + name_img.height + NAME_STATS_GAP
     canvas.alpha_composite(stats_line, (stats_x, stats_y))
 
+    # PNG
     bio = io.BytesIO()
     canvas.save(bio, format="PNG")
     return bio.getvalue()
