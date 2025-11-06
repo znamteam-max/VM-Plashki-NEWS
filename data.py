@@ -9,29 +9,33 @@ from urllib.error import URLError, HTTPError
 # ============================= ENV =============================
 PLAYERS_SEASON = os.getenv("PLAYERS_SEASON", "2025-26").strip()
 
-# 1) Основной источник (твой воркер / любой прокси)
+# Основные источники (Cloudflare Workers / прокси)
+# Можно передать один URL в PLAYERS_CUSTOM_URL
+# и/или несколько через PLAYERS_CUSTOM_URLS (через запятую).
 PLAYERS_USE_CUSTOM = os.getenv("PLAYERS_USE_CUSTOM", "1") == "1"
-PLAYERS_CUSTOM_URL = os.getenv("PLAYERS_CUSTOM_URL", "").strip() or \
-    f"https://nba-players-proxy.znamteam-903.workers.dev/players?season={PLAYERS_SEASON}&format=passthrough"
+PLAYERS_CUSTOM_URL = os.getenv("PLAYERS_CUSTOM_URL", "").strip()
+PLAYERS_CUSTOM_URLS = [
+    u.strip() for u in os.getenv("PLAYERS_CUSTOM_URLS", "").split(",") if u.strip()
+]
 
 # Таймауты/ретраи для custom
 CUSTOM_ATTEMPTS = int(os.getenv("PLAYERS_CUSTOM_ATTEMPTS", "3"))
-CUSTOM_BASE_TIMEOUT = int(os.getenv("PLAYERS_CUSTOM_TIMEOUT", "30"))
+CUSTOM_BASE_TIMEOUT = int(os.getenv("PLAYERS_CUSTOM_TIMEOUT", "30"))  # сек
 
-# 2) Legacy (выкл по умолчанию)
+# Legacy (data.nba.net) по умолчанию ВЫКЛ
 ALLOW_LEGACY_FALLBACK = os.getenv("PLAYERS_ALLOW_LEGACY", "0") == "1"
 ALLOW_INSECURE_SSL_LEGACY = os.getenv("PLAYERS_INSECURE_SSL", "0") == "1"
 LEGACY_URL = os.getenv("PLAYERS_LEGACY_URL",
     "https://data.nba.net/data/10s/prod/v1/2025/players.json")
 
-# 3) Удалённые снапшоты
+# Удалённые снапшоты (raw GitHub/Gist/S3 и т.п.). Формат: либо resultSets, либо нормализованный список.
 PLAYERS_SNAPSHOT_URLS = [u.strip() for u in os.getenv("PLAYERS_SNAPSHOT_URLS", "").split(",") if u.strip()]
 
-# 4) Локальный снапшот
+# Локальный снапшот
 DISABLE_LOCAL_SNAPSHOT = os.getenv("PLAYERS_DISABLE_LOCAL", "0") == "1"
 
-# 5) Прочее
-MIN_EXPECTED = int(os.getenv("PLAYERS_MIN_EXPECTED", "350"))
+# Прочее
+MIN_EXPECTED = int(os.getenv("PLAYERS_MIN_EXPECTED", "350"))  # минимально «адекватная» выборка
 CACHE_TTL_SEC = int(os.getenv("PLAYERS_CACHE_TTL", "43200"))  # 12h
 PHOTO_FMT = os.getenv("PLAYERS_PHOTO_FMT",
     "https://cdn.nba.com/headshots/nba/latest/{size}/{personId}.png")
@@ -41,16 +45,23 @@ ASSETS_DIR = os.path.join(ROOT_DIR, "assets")
 LOCAL_SNAPSHOT = os.path.join(ASSETS_DIR, "players.json")
 CACHE_PATH = os.path.join("/tmp", "players_cache.json")
 
-# ==== overrides persistence (новое) ====
+# ==== overrides persistence ====
 OVERRIDES_FILE = os.path.join(ASSETS_DIR, "players_overrides.json")  # read-only в Vercel
 OVERRIDES_TMP = os.path.join("/tmp", "players_overrides.json")       # read/write
-# Опционально — запись в GitHub (если заданы все 3 переменные)
+
+# Опционально — запись в GitHub (если заданы все 3–4 переменные)
 OVERRIDES_GH_TOKEN  = os.getenv("OVERRIDES_GH_TOKEN", "").strip()
 OVERRIDES_GH_REPO   = os.getenv("OVERRIDES_GH_REPO", "").strip()      # "owner/repo"
 OVERRIDES_GH_BRANCH = os.getenv("OVERRIDES_GH_BRANCH", "main").strip()
 OVERRIDES_GH_PATH   = os.getenv("OVERRIDES_GH_PATH", "assets/players_overrides.json").strip()
 
-_CACHED: Dict[str, Any] = {"ts": 0.0, "players": None, "index": None, "overrides": None}
+_CACHED: Dict[str, Any] = {
+    "ts": 0.0,
+    "players": None,
+    "index": None,
+    "overrides": None,
+    "last_source_url": None,  # для отладки — откуда взяли игроков
+}
 
 # ============================= utils =============================
 def _log(*args: Any) -> None:
@@ -106,8 +117,8 @@ def _get_json_with_retries(url: str, attempts: int, base_timeout: int, verify_ss
             return j
         except BaseException as e:
             last_err = e
-            _log(f"fetch try {i+1}/{attempts} failed:", repr(e))
-            time.sleep(1.1 * (i + 1))
+            _log(f"fetch try {i+1}/{attempts} failed:", repr(e), "for", url)
+            time.sleep(1.25 * (i + 1))
     if last_err:
         raise last_err
 
@@ -150,7 +161,6 @@ def _merge_overrides(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 def _github_get_file(repo: str, path: str, ref: str) -> Tuple[Optional[str], Optional[str]]:
-    """return (content_str, sha) or (None, None)"""
     try:
         import urllib.request, json as _json
         url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={ref}"
@@ -200,7 +210,6 @@ def _load_overrides() -> Dict[str, Dict[str, Any]]:
     assets_ov = _load_overrides_from_assets()
     tmp_ov = _load_overrides_from_tmp()
 
-    # если задан GitHub — подмешаем оттуда
     gh_ov: Dict[str, Any] = {}
     if OVERRIDES_GH_TOKEN and OVERRIDES_GH_REPO:
         content, _sha = _github_get_file(OVERRIDES_GH_REPO, OVERRIDES_GH_PATH, OVERRIDES_GH_BRANCH)
@@ -220,9 +229,7 @@ def _load_overrides() -> Dict[str, Dict[str, Any]]:
     return ov
 
 def _save_overrides(ov: Dict[str, Dict[str, Any]]) -> bool:
-    """Сохраняем в GitHub (если настроен) и в /tmp как бэкап."""
     ok = True
-    # GitHub
     if OVERRIDES_GH_TOKEN and OVERRIDES_GH_REPO:
         current, sha = _github_get_file(OVERRIDES_GH_REPO, OVERRIDES_GH_PATH, OVERRIDES_GH_BRANCH)
         try:
@@ -232,7 +239,6 @@ def _save_overrides(ov: Dict[str, Dict[str, Any]]) -> bool:
         except Exception as e:
             _log("save to github failed:", e)
             ok = False
-    # /tmp
     try:
         _write_json_file(OVERRIDES_TMP, ov)
     except Exception as e:
@@ -247,11 +253,9 @@ def set_player_ru_name(person_id: str, ru_name: str, alias: Optional[str] = None
     pid = str(person_id)
     ent = dict(ov.get(pid) or {})
     ent["ruName"] = ru_name.strip()
-    # алиасы = множества в нижнем регистре
     aliases = set([a.strip().lower() for a in ent.get("aliases", []) if isinstance(a, str)])
     if alias:
         aliases.add(alias.strip().lower())
-    # добавим простую форму по-умолчанию: если ru_name содержит пробелы — добавим фамилию
     parts = ru_name.strip().split()
     if len(parts) >= 1:
         aliases.add(parts[-1].lower())
@@ -274,6 +278,7 @@ def get_overrides() -> Dict[str, Dict[str, Any]]:
 def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not j:
         return []
+
     # Вариант 1: NBA stats (resultSets)
     if "resultSets" in j:
         try:
@@ -308,8 +313,11 @@ def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
                 })
             return out
         except Exception as e:
-            _log("stats extract error:", e); _log(traceback.format_exc()); return []
-    # Вариант 2: legacy
+            _log("stats extract error:", e)
+            _log(traceback.format_exc())
+            return []
+
+    # Вариант 2: legacy data.nba.net
     league_std = j.get("league", {}).get("standard")
     if isinstance(league_std, list):
         out: List[Dict[str, Any]] = []
@@ -325,37 +333,117 @@ def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
             except Exception:
                 continue
         return out
-    # Вариант 3: уже нормализованный список
+
+    # Вариант 3: список уже нормализован
     if isinstance(j, list) and j and isinstance(j[0], dict) and "personId" in j[0]:
         return j
+
     return []
 
 # ============================= sources =============================
-def _fetch_from_custom(url: Optional[str] = None) -> List[Dict[str, Any]]:
-    if not PLAYERS_USE_CUSTOM:
-        return []
-    u = (url or PLAYERS_CUSTOM_URL or "").strip()
-    if not u:
-        return []
-    try:
-        j = _get_json_with_retries(u, attempts=CUSTOM_ATTEMPTS, base_timeout=CUSTOM_BASE_TIMEOUT, verify_ssl=True)
-        players = _extract_players(j)
-        _log(f"custom parsed {len(players)} from {u}")
-        return players
-    except BaseException as e:
-        _log("custom fetch error:", e)
-        _log(traceback.format_exc())
-        return []
+def _build_custom_candidates(bases: List[str]) -> List[str]:
+    """
+    Для каждого базового URL генерируем набор кандидатов:
+      - сам base
+      - если есть /players — добавляем format=normalized, format=passthrough
+      - если нет /players — добавляем .../players?season=...&format=normalized|passthrough
+      - корневой (если это ваш конкретный воркер) с ?season=...
+    """
+    candidates: List[str] = []
+    def _add(u: str):
+        if u and u not in candidates:
+            candidates.append(u)
 
-def _fetch_from_legacy() -> List[Dict[str, Any]]:
+    for base in bases:
+        if not base:
+            continue
+        b = base.strip()
+        _add(b)
+
+        pr = urlparse(b)
+        path = pr.path or ""
+        qs = dict(parse_qsl(pr.query))
+
+        # 1) Если уже /players — докрутить format и season
+        if "/players" in path:
+            for fmt in ("normalized", "passthrough"):
+                u = _with_query(b, season=qs.get("season") or PLAYERS_SEASON, format=fmt)
+                _add(u)
+        else:
+            # 2) Добавить /players с нужными параметрами
+            root = b.rstrip("/")
+            for fmt in ("normalized", "passthrough"):
+                u = f"{root}/players"
+                u = _with_query(u, season=PLAYERS_SEASON, format=fmt)
+                _add(u)
+
+        # 3) Совместимость: корень с season (если прокси ожидал именно его)
+        if pr.scheme and pr.netloc:
+            root = f"{pr.scheme}://{pr.netloc}"
+            u = _with_query(root, season=PLAYERS_SEASON)
+            _add(u)
+
+    # Если ничего не задано в ENV — добавим разумный дефолт вашего воркера
+    if not candidates:
+        root = "https://nba-players-proxy.znamteam-903.workers.dev"
+        candidates += [
+            f"{root}/players?season={PLAYERS_SEASON}&format=normalized",
+            f"{root}/players?season={PLAYERS_SEASON}&format=passthrough",
+            f"{root}?season={PLAYERS_SEASON}",
+        ]
+
+    # Дедупликация и возврат
+    out: List[str] = []
+    seen = set()
+    for u in candidates:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+def _fetch_from_custom(url: Optional[str] = None) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if not PLAYERS_USE_CUSTOM:
+        return [], None
+
+    bases: List[str] = []
+    if url and url.strip():
+        bases.append(url.strip())
+    if PLAYERS_CUSTOM_URL:
+        bases.append(PLAYERS_CUSTOM_URL)
+    if PLAYERS_CUSTOM_URLS:
+        bases.extend(PLAYERS_CUSTOM_URLS)
+
+    candidates = _build_custom_candidates(bases)
+    _log("custom candidates:", len(candidates))
+
+    best: List[Dict[str, Any]] = []
+    best_url: Optional[str] = None
+
+    for u in candidates:
+        try:
+            j = _get_json_with_retries(u, attempts=CUSTOM_ATTEMPTS, base_timeout=CUSTOM_BASE_TIMEOUT, verify_ssl=True)
+            p = _extract_players(j)
+            _log(f"custom parsed {len(p)} from {u}")
+            if len(p) > len(best):
+                best = p
+                best_url = u
+            if len(p) >= MIN_EXPECTED:
+                return p, u
+        except BaseException as e:
+            _log("custom fetch error:", u, repr(e))
+            _log(traceback.format_exc())
+
+    return best, best_url
+
+def _fetch_from_legacy() -> Tuple[List[Dict[str, Any]], Optional[str]]:
     if not ALLOW_LEGACY_FALLBACK:
-        return []
+        return [], None
     url = LEGACY_URL
     try:
         j = _get_json_with_retries(url, attempts=2, base_timeout=15, verify_ssl=True)
         p = _extract_players(j)
         _log(f"legacy parsed {len(p)} from {url}")
-        return p
+        return p, url
     except BaseException as e:
         msg = repr(e)
         _log("legacy fetch error:", msg)
@@ -365,46 +453,46 @@ def _fetch_from_legacy() -> List[Dict[str, Any]]:
                 j2 = _get_json_with_retries(http_url, attempts=2, base_timeout=15, verify_ssl=ALLOW_INSECURE_SSL_LEGACY is False)
                 p2 = _extract_players(j2)
                 _log(f"legacy (http{' insecure' if not ALLOW_INSECURE_SSL_LEGACY else ''}) parsed {len(p2)} from {http_url}")
-                return p2
+                return p2, http_url
             except BaseException as e2:
                 _log("legacy http fallback failed:", repr(e2))
-        return []
+        return [], None
 
-def _fetch_remote_snapshots() -> List[Dict[str, Any]]:
+def _fetch_remote_snapshots() -> Tuple[List[Dict[str, Any]], Optional[str]]:
     best: List[Dict[str, Any]] = []
+    best_u: Optional[str] = None
     for u in PLAYERS_SNAPSHOT_URLS:
         try:
             j = _get_json_with_retries(u, attempts=2, base_timeout=20, verify_ssl=True)
             p = _extract_players(j)
             _log(f"remote snapshot parsed {len(p)} from {u}")
             if len(p) > len(best):
-                best = p
+                best = p; best_u = u
             if len(p) >= MIN_EXPECTED:
-                return p
+                return p, u
         except BaseException as e:
             _log("remote snapshot error:", u, repr(e))
-    return best
+    return best, best_u
 
-def _fetch_local_snapshot() -> List[Dict[str, Any]]:
+def _fetch_local_snapshot() -> Tuple[List[Dict[str, Any]], Optional[str]]:
     if DISABLE_LOCAL_SNAPSHOT:
-        return []
+        return [], None
     try:
         j = _read_json_file(LOCAL_SNAPSHOT)
         players = _extract_players(j) if isinstance(j, dict) else (j or [])
         _log(f"local snapshot parsed {len(players)} from {LOCAL_SNAPSHOT}")
-        return players
+        return players, LOCAL_SNAPSHOT
     except Exception as e:
         _log("local snapshot error:", e)
-        return []
+        return [], None
 
-# ============================= enriched helpers (новое) =============================
+# ============================= enriched helpers =============================
 def ensure_headshot_png(p: Dict[str, Any], size: str = "520x380") -> str:
-    """Корректный PNG-URL на CDN NBA (всегда прозрачный фон)."""
+    """Корректный PNG-URL на CDN NBA (прозрачный фон)."""
     pid = str(p.get("personId") or "").strip()
     if not pid:
         return PHOTO_FMT.format(size=size, personId="0")
     ov = _load_overrides().get(pid) or {}
-    # если в overrides задан кастомный photo — используем
     photo = ov.get("photo")
     if isinstance(photo, str) and photo.strip():
         return photo.strip()
@@ -422,7 +510,6 @@ def _apply_overrides(players: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 if "teamId"    in patch: base["teamId"]    = _safe_str(patch["teamId"]).strip() or "0"
                 if "isActive"  in patch: base["isActive"]  = bool(patch["isActive"])
                 if "photo"     in patch and patch["photo"]: base["photo"] = _safe_str(patch["photo"]).strip()
-                # ruName/aliases не меняют саму структуру, используем при отображении/поиске
             else:
                 add = {
                     "personId": pid,
@@ -453,8 +540,11 @@ def display_name_for(p: Dict[str, Any]) -> str:
     disp = (fn + " " + ln).strip()
     return disp or _safe_str(p.get("displayName") or "").strip()
 
-def _normalize(s: str) -> str:
-    return (s or "").strip().lower()
+def _aliases_for(pid: str) -> List[str]:
+    ent = _load_overrides().get(str(pid)) or {}
+    al = ent.get("aliases") or []
+    if not isinstance(al, list): return []
+    return [str(x).strip().lower() for x in al if isinstance(x, str)]
 
 # ============================= cache/build =============================
 def _load_cache_from_disk() -> Optional[Tuple[List[Dict[str, Any]], float]]:
@@ -482,28 +572,44 @@ def _save_cache_to_disk(players: List[Dict[str, Any]]) -> None:
 def _valid_cache(ts: float) -> bool:
     return (time.time() - ts) < CACHE_TTL_SEC
 
-def _build_from_sources() -> Tuple[List[Dict[str, Any]], str]:
-    custom = _fetch_from_custom()
+def _build_from_sources() -> Tuple[List[Dict[str, Any]], str, Optional[str]]:
+    """
+    Порядок (новый): custom → remote snapshots → (опционально) legacy → local → best-partial
+    Возвращает (players, tag, source_url)
+    """
+    # 1) custom
+    custom, custom_url = _fetch_from_custom()
     if custom and len(custom) >= MIN_EXPECTED:
-        return custom, "custom"
-    rem = _fetch_remote_snapshots()
+        return custom, "custom", custom_url
+
+    # 2) удалённые снапшоты
+    rem, rem_u = _fetch_remote_snapshots()
     if rem and len(rem) >= MIN_EXPECTED:
-        return rem, "remote_snapshot"
-    leg = _fetch_from_legacy()
+        return rem, "remote_snapshot", rem_u
+
+    # 3) legacy — только если явно включён
+    leg, leg_u = _fetch_from_legacy()
     if leg and len(leg) >= MIN_EXPECTED:
-        return leg, "legacy"
-    loc = _fetch_local_snapshot()
+        return leg, "legacy", leg_u
+
+    # 4) локальный снапшот
+    loc, loc_u = _fetch_local_snapshot()
     if loc and len(loc) > 0:
-        return loc, "local"
+        return loc, "local", loc_u
+
+    # 5) хоть что-то из того, что удалось частично
     best = custom if len(custom) >= len(rem) else rem
-    if len(leg) > len(best): best = leg
-    if len(loc) > len(best): best = loc
-    return (best or []), "partial"
+    best_u = custom_url if len(custom) >= len(rem) else rem_u
+    if len(leg) > len(best): best, best_u = leg, leg_u
+    if len(loc) > len(best): best, best_u = loc, loc_u
+    tag = "partial"
+    return (best or []), tag, best_u
 
 # ============================= public API =============================
 def get_players(force_refresh: bool = False) -> List[Dict[str, Any]]:
     if not force_refresh and _CACHED["players"] and _valid_cache(_CACHED["ts"]):
         return _CACHED["players"]
+
     if not force_refresh:
         disk = _load_cache_from_disk()
         if disk:
@@ -512,12 +618,17 @@ def get_players(force_refresh: bool = False) -> List[Dict[str, Any]]:
                 _CACHED.update({"players": players, "index": {p["personId"]: p for p in players}, "ts": ts})
                 return players
 
-    raw, source = _build_from_sources()
+    raw, source, source_url = _build_from_sources()
     players = _apply_overrides(raw)
     if players:
-        _CACHED.update({"players": players, "index": {p["personId"]: p for p in players}, "ts": time.time()})
+        _CACHED.update({
+            "players": players,
+            "index": {p["personId"]: p for p in players},
+            "ts": time.time(),
+            "last_source_url": source_url,
+        })
         _save_cache_to_disk(players)
-        _log(f"final players count: {len(players)} (source={source})")
+        _log(f"final players count: {len(players)} (source={source})", "url:", source_url or "-")
         return players
 
     disk = _load_cache_from_disk()
@@ -538,22 +649,30 @@ def get_players_index(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
     return idx
 
 def refresh_players(drop_cache: bool = False) -> Tuple[int, Dict[str, Any]]:
+    """
+    Не чистим кэш заранее. Если новый фетч удачный — заменяем.
+    """
     prev = _CACHED.get("players") or []
     try:
-        raw, source = _build_from_sources()
+        raw, source, source_url = _build_from_sources()
         players = _apply_overrides(raw)
         if players and len(players) >= MIN_EXPECTED:
-            _CACHED.update({"players": players, "index": {p["personId"]: p for p in players}, "ts": time.time()})
+            _CACHED.update({
+                "players": players,
+                "index": {p["personId"]: p for p in players},
+                "ts": time.time(),
+                "last_source_url": source_url,
+            })
             _save_cache_to_disk(players)
-            return len(players), {"ok": True, "players_indexed": len(players), "source": source}
+            return len(players), {"ok": True, "players_indexed": len(players), "source": source, "source_url": source_url}
         else:
             if prev:
-                return len(prev), {"ok": True, "players_indexed": len(prev), "source": "cache_preserved"}
+                return len(prev), {"ok": True, "players_indexed": len(prev), "source": "cache_preserved", "source_url": _CACHED.get("last_source_url")}
             return 0, {"ok": False, "error": "no_source_available"}
     except Exception as e:
         _log("refresh error:", e)
         if prev:
-            return len(prev), {"ok": True, "players_indexed": len(prev), "source": "cache_preserved"}
+            return len(prev), {"ok": True, "players_indexed": len(prev), "source": "cache_preserved", "source_url": _CACHED.get("last_source_url")}
         return 0, {"ok": False, "error": repr(e)}
 
 def drop_players_cache() -> bool:
@@ -561,20 +680,17 @@ def drop_players_cache() -> bool:
         _CACHED["ts"] = 0.0
         _CACHED["players"] = None
         _CACHED["index"] = None
+        _CACHED["last_source_url"] = None
         if os.path.exists(CACHE_PATH):
-            try: os.remove(CACHE_PATH)
-            except Exception: pass
+            try:
+                os.remove(CACHE_PATH)
+            except Exception:
+                pass
         _log("players cache dropped")
         return True
     except Exception as e:
         _log("drop cache error:", e)
         return False
-
-def _aliases_for(pid: str) -> List[str]:
-    ent = _load_overrides().get(str(pid)) or {}
-    al = ent.get("aliases") or []
-    if not isinstance(al, list): return []
-    return [str(x).strip().lower() for x in al if isinstance(x, str)]
 
 def find_player_by_name(query: str) -> List[Dict[str, Any]]:
     q = (query or "").strip().lower()
@@ -584,21 +700,18 @@ def find_player_by_name(query: str) -> List[Dict[str, Any]]:
     for p in get_players():
         pid = p.get("personId")
         name = (p.get("displayName") or f"{p.get('firstName','')} {p.get('lastName','')}").strip()
-        dn = name.lower()
-        # basic english substr
+        dn = (name or "").lower()
         ok = (q in dn)
-        # overrides: ruName and aliases
         if not ok:
             ov = _load_overrides().get(str(pid)) or {}
             ru = str(ov.get("ruName") or "").strip().lower()
             if ru and q in ru:
                 ok = True
             if not ok:
-                if q in _aliases_for(pid):
+                if q in _aliases_for(str(pid)):
                     ok = True
         if ok:
             res.append(p)
-    # чуть сортировки: активные первыми, близость длины
     def key(p: Dict[str, Any]):
         dn = (p.get("displayName") or "").lower()
         return (0 if p.get("isActive", True) else 1, abs(len(dn) - len(q)), len(dn))
