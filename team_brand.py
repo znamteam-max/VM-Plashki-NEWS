@@ -6,40 +6,29 @@ from PIL import Image
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(ROOT_DIR, "assets")
-# Лого ищем и тут, и тут
 TEAM_LOGO_DIRS = [
-    os.path.join(ASSETS_DIR, "cache"),
+    os.path.join(ASSETS_DIR, "cache"),   # ваша папка с реальными логотипами
     os.path.join(ASSETS_DIR, "teams"),
 ]
 
-# Можно управлять порядком источников палитры:
-# 'preset,logo,auto'  — СНАЧАЛА пресет (официальные), потом из лого, потом универсальные (дефолт)
-# 'logo,preset,auto'  — сначала из лого, потом пресет, потом универсальные
+# порядок источников палитры: пресет -> лого -> универсальные
 TEAM_PALETTE_PRIORITY = os.getenv("TEAM_PALETTE_PRIORITY", "preset,logo,auto").strip().lower()
 
-# Персистентность: default -> /tmp -> ENV (ENV — самый высокий приоритет)
+# персистентность дефолтного цвета команды
 TEAM_OVERRIDES_ENV = os.getenv("TEAM_OVERRIDES_JSON", "").strip()
 TEAM_OVERRIDES_TMP = "/tmp/team_overrides.json"
 TEAM_OVERRIDES_DEFAULT = os.path.join(ASSETS_DIR, "team_overrides_default.json")
 
-# Официальные пресеты (минимальный набор — можно расширять)
+# официальные пресеты (можно расширять)
 TEAMS_PRESET: Dict[str, List[str]] = {
-    # Knicks
-    "1610612752": ["#F58426", "#006BB6", "#BEC0C2"],
-    # Warriors
-    "1610612744": ["#1D428A", "#FFC72C", "#006BB6"],
-    # Suns
-    "1610612756": ["#1D1160", "#E56020", "#F9AD1B"],
-    # Nuggets
-    "1610612743": ["#0E2240", "#FEC524", "#8B2131"],
-    # Celtics
-    "1610612738": ["#007A33", "#963821", "#BA9653"],
-    # Hawks
-    "1610612737": ["#E03A3E", "#C1D32F", "#000000"],
-    # Lakers (ВАЖНО для твоего кейса)
-    "1610612747": ["#552583", "#FDB927", "#000000"],
-    # Mavericks
-    "1610612742": ["#00538C", "#002B5E", "#B8C4CA"],
+    "1610612752": ["#F58426", "#006BB6", "#BEC0C2"],  # Knicks
+    "1610612744": ["#1D428A", "#FFC72C", "#006BB6"],  # Warriors
+    "1610612756": ["#1D1160", "#E56020", "#F9AD1B"],  # Suns
+    "1610612743": ["#0E2240", "#FEC524", "#8B2131"],  # Nuggets
+    "1610612738": ["#007A33", "#963821", "#BA9653"],  # Celtics
+    "1610612737": ["#E03A3E", "#C1D32F", "#000000"],  # Hawks
+    "1610612747": ["#552583", "#FDB927", "#000000"],  # Lakers
+    "1610612742": ["#00538C", "#002B5E", "#B8C4CA"],  # Mavericks
 }
 
 def _log(*a: Any) -> None:
@@ -76,7 +65,6 @@ def _shade(rgb: Tuple[int,int,int], k: float) -> Tuple[int,int,int]:
             max(0,min(255,int(b*k))))
 
 def _is_bad_color(rgb: Tuple[int,int,int]) -> bool:
-    # Фильтруем слишком светлые/тёмные и «серые»
     r,g,b = [v/255.0 for v in rgb]
     h,l,s = colorsys.rgb_to_hls(r,g,b)
     if l > 0.93 or l < 0.07: return True
@@ -87,16 +75,10 @@ def _distinct(a: Tuple[int,int,int], b: Tuple[int,int,int], thr: int = 40) -> bo
     return abs(a[0]-b[0]) + abs(a[1]-b[1]) + abs(a[2]-b[2]) >= thr
 
 def _extract_palette(img: Image.Image, top_k: int = 4) -> List[str]:
-    """
-    Берём несколько заметных цветов из PNG логотипа.
-    Иногда из-за антиалиасинга вылезают «неофиц.» розовые/оранжевые — поэтому ниже мы
-    всё равно даём приоритет пресетам (если есть).
-    """
     if img.mode != "RGBA":
         img = img.convert("RGBA")
     base = img.copy()
     base.thumbnail((240, 240))
-    # квантование по «непрозрачной» версии, чтобы честно учесть края
     no_alpha = Image.new("RGB", base.size, (255,255,255))
     no_alpha.paste(base, mask=base.split()[3])
     q = no_alpha.convert("P", palette=Image.ADAPTIVE, colors=max(4, top_k))
@@ -132,11 +114,9 @@ def _save_team_overrides(data: Dict[str, Any]) -> None:
     _write_json(TEAM_OVERRIDES_TMP, data)
 
 def _find_in_dirs(team_id: str) -> Optional[str]:
-    # 1) точное совпадение по имени файла
     for d in TEAM_LOGO_DIRS:
         p = os.path.join(d, f"{team_id}.png")
         if os.path.exists(p): return p
-    # 2) файл, содержащий teamId в имени
     for d in TEAM_LOGO_DIRS:
         try:
             for fn in os.listdir(d):
@@ -145,7 +125,6 @@ def _find_in_dirs(team_id: str) -> Optional[str]:
                     return os.path.join(d, fn)
         except FileNotFoundError:
             continue
-    # 3) generic
     for d in TEAM_LOGO_DIRS:
         gp = os.path.join(d, "generic.png")
         if os.path.exists(gp): return gp
@@ -156,7 +135,6 @@ def get_team_logo_path(team_id: str) -> Optional[str]:
     return _find_in_dirs(str(team_id))
 
 def _merge_unique_hex(primary: List[str], extra: List[str], limit: int = 3) -> List[str]:
-    """Собираем итоговую палитру без близких дублей, в исходном порядке списков."""
     out: List[str] = []
     def add(hexv: str):
         if not hexv or not hexv.startswith("#") or len(hexv) != 7: return
@@ -173,10 +151,6 @@ def _merge_unique_hex(primary: List[str], extra: List[str], limit: int = 3) -> L
     return out[:limit] if limit > 0 else out
 
 def list_palette_for_team(team_id: str) -> List[str]:
-    """
-    Возвращаем до 3-х кандидатов.
-    По умолчанию — пресет приоритетнее, чтобы у Lakers был #552583/#FDB927.
-    """
     team_id = str(team_id or "0")
     preset = TEAMS_PRESET.get(team_id) or []
     extracted: List[str] = []
@@ -187,45 +161,30 @@ def list_palette_for_team(team_id: str) -> List[str]:
                 extracted = _extract_palette(im, top_k=4)
         except Exception as e:
             _log("palette extract error:", e)
-
-    universal = ["#1D428A", "#FDB927", "#0B8043"]  # синий / «золото» / зелёный
-
+    universal = ["#1D428A", "#FDB927", "#0B8043"]
     order = [s.strip() for s in TEAM_PALETTE_PRIORITY.split(",") if s.strip()]
     parts: List[List[str]] = []
     for src in order:
-        if src == "preset":   parts.append(preset)
-        elif src == "logo":   parts.append(extracted)
-        elif src == "auto":   parts.append(universal)
-    if not parts:
-        parts = [preset, extracted, universal]
-
-    # Собираем уникально, предпочитая первый список
-    final = []
+        if src == "preset": parts.append(preset)
+        elif src == "logo": parts.append(extracted)
+        elif src == "auto": parts.append(universal)
+    if not parts: parts = [preset, extracted, universal]
+    final: List[str] = []
     for block in parts:
-        final = _merge_unique_hex(final, block, limit=0)  # limit позже
+        final = _merge_unique_hex(final, block, limit=0)
     return final[:3] if final else universal[:3]
 
 def get_team_brand(team_id: str) -> Tuple[Tuple[str,str,str], Optional[str], List[str], bool]:
-    """
-    Возвращает:
-      (primary_hex, dark_hex, light_hex), logo_path, palette_candidates, has_saved_primary
-    primary выбирается так:
-      — если есть сохранённый override → он;
-      — иначе первый кандидат из list_palette_for_team().
-    """
     team_id = str(team_id or "0")
     logo_path = get_team_logo_path(team_id)
     palette_candidates = list_palette_for_team(team_id)
-
     ov = _load_team_overrides()
     team_ov = ov.get(team_id) or {}
     has_saved = "primary" in team_ov and isinstance(team_ov["primary"], str) and team_ov["primary"].startswith("#")
-
     if has_saved:
         primary = team_ov["primary"]
     else:
         primary = palette_candidates[0] if palette_candidates else "#1D428A"
-
     rgb_primary = _hex_to_rgb(primary)
     dark = _hex(_shade(rgb_primary, 0.65))
     light = primary
@@ -252,7 +211,6 @@ def set_team_primary_color(team_id: str, primary_hex: str) -> bool:
         _log("set_team_primary_color error:", e)
         return False
 
-# Грубое русское название цвета — для кнопок и подписи
 def color_name_ru(hex_color: str) -> str:
     try:
         r,g,b = _hex_to_rgb(hex_color)
