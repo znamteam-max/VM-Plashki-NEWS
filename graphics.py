@@ -1,8 +1,8 @@
-# graphics.py — логотип поверх фото, мягкий градиент, мелкие подписи метрик, PNG с прозрачным фоном
+# graphics.py — логотип поверх фото, мягкий градиент, мелкие подписи метрик
+
 from typing import List, Tuple, Optional
 from PIL import Image, ImageDraw, ImageFont
-import io, re
-from teams import team_primary_color
+import io
 
 # Холст
 W, H = 1920, 1080
@@ -17,7 +17,7 @@ BOT_IN         = 20
 # Интервалы
 NAME_STATS_GAP = 30
 BLOCK_HGAP     = 56
-INNER_VGAP     = 20
+INNER_VGAP     = 20  # зазор между числом и подписью
 
 # «Антиллипкие» паддинги
 NAME_PAD_TOP       = 4
@@ -27,8 +27,9 @@ BLOCK_PAD_BOTTOM   = 6
 
 # Размеры головы/логотипа
 HEAD_SIZE   = 360
-LOGO_D      = 140
-LOGO_SIZE   = 124
+LOGO_D      = 140   # диаметр круга под логотип
+LOGO_SIZE   = 124   # размер логотипа внутри круга
+# Позиция логотипа на голове (нижний-левый сектор)
 LOGO_OFFSET_X = 18
 LOGO_OFFSET_Y = 210
 
@@ -38,16 +39,15 @@ F_SB_PATH   = "assets/fonts/Montserrat-SemiBold.ttf"
 F_EXO_PATH  = "assets/fonts/Exo2-Bold.ttf"
 
 def _load_font(path: str, size: int):
-    try:
-        return ImageFont.truetype(path, size)
-    except Exception:
-        return ImageFont.load_default()
+    try: return ImageFont.truetype(path, size)
+    except Exception: return ImageFont.load_default()
 
 # Базовые размеры шрифтов
-BASE_NAME = 60
-BASE_VAL  = 50
-BASE_LBL  = 28
+BASE_NAME = 60   # ИМЯ
+BASE_VAL  = 50   # ЧИСЛО
+BASE_LBL  = 28   # ПОДПИСИ — меньше
 
+# ---------- текст без «срезов» ----------
 def _text_img(text: str, font: ImageFont.FreeTypeFont, fill=(255,255,255,255)) -> Image.Image:
     probe = Image.new("RGBA", (1, 1))
     d = ImageDraw.Draw(probe)
@@ -58,50 +58,27 @@ def _text_img(text: str, font: ImageFont.FreeTypeFont, fill=(255,255,255,255)) -
     return img
 
 def _pad_v(img: Image.Image, top: int, bottom: int) -> Image.Image:
-    if top <= 0 and bottom <= 0:
-        return img
+    if top <= 0 and bottom <= 0: return img
     out = Image.new("RGBA", (img.width, img.height + max(0, top) + max(0, bottom)), (0,0,0,0))
     out.alpha_composite(img, (0, max(0, top)))
     return out
 
 def _fit_text_to_width(text: str, font_path: str, max_w: int, max_size: int, min_size: int = 26):
     lo, hi = min_size, max_size
-    probe = Image.new("RGBA", (1, 1))
-    d = ImageDraw.Draw(probe)
+    probe = Image.new("RGBA", (1, 1)); d = ImageDraw.Draw(probe)
     best = _load_font(font_path, lo)
     while lo <= hi:
         mid = (lo + hi) // 2
         f = _load_font(font_path, mid)
         l, t, r, b = d.textbbox((0, 0), text, font=f)
         if r - l <= max_w:
-            best = f
-            lo = mid + 1
+            best = f; lo = mid + 1
         else:
             hi = mid - 1
     return _text_img(text, best), best
 
-def _open_image(url_or_path: str) -> Optional[Image.Image]:
-    # локальные пути
-    try:
-        if "://" not in url_or_path:
-            return Image.open(url_or_path).convert("RGBA")
-        # remote
-        import ssl
-        from urllib.request import Request, urlopen
-        ctx = ssl.create_default_context()
-        req = Request(url_or_path, headers={
-            "User-Agent":"Mozilla/5.0",
-            "Accept":"image/png,image/*;q=0.8,*/*;q=0.5",
-            "Accept-Encoding":"identity",
-            "Referer":"https://www.nba.com/"
-        })
-        with urlopen(req, timeout=20, context=ctx) as resp:
-            raw = resp.read()
-        return Image.open(io.BytesIO(raw)).convert("RGBA")
-    except Exception:
-        return None
-
-def _circle_crop_image(im: Image.Image, d: int) -> Image.Image:
+def _circle_crop_img(img: Image.Image, d: int) -> Image.Image:
+    im = img.convert("RGBA")
     s = min(im.size)
     left = (im.width - s) // 2
     top  = max(0, im.height - s)
@@ -112,6 +89,7 @@ def _circle_crop_image(im: Image.Image, d: int) -> Image.Image:
     out.paste(im, (0,0), mask)
     return out
 
+# ---------- цвет и мягкий градиент ----------
 def _hex_to_rgb(h: str) -> Tuple[int,int,int]:
     h = h.strip()
     if h.startswith("#"): h = h[1:]
@@ -139,6 +117,7 @@ def _rounded_horizontal_gradient(width: int, height: int, radius: int,
     out.paste(grad, (0,0), mask)
     return out
 
+# ---------- строка метрик ----------
 def _metric_line(
     stats: List[Tuple[str, str]],
     f_val: ImageFont.FreeTypeFont,
@@ -170,78 +149,27 @@ def _metric_line(
         x += b.width + hgap
     return line
 
-def _team_logo_variants(team_id_or_url: str) -> List[str]:
-    """Если передали teamId — соберём список возможных PNG-логотипов на CDN NBA."""
-    s = team_id_or_url.strip()
-    if s.isdigit():
-        tid = s
-        bases = [
-            "https://cdn.nba.com/logos/nba/{tid}/global/L/logo.png",
-            "https://cdn.nba.com/logos/nba/{tid}/global/D/logo.png",
-            "https://cdn.nba.com/logos/nba/{tid}/primary/L/logo.png",
-            "https://cdn.nba.com/logos/nba/{tid}/primary/D/logo.png",
-        ]
-        return [b.format(tid=tid) for b in bases]
-    return [s]
-
-def _first_ok_image(urls: List[str]) -> Optional[Image.Image]:
-    for u in urls:
-        im = _open_image(u)
-        if im:
-            return im
-    return None
-
-def parse_metrics(raw: str) -> List[Tuple[str, str]]:
-    """
-    '10 очков, 12 передач, 5 подборов' -> [('10','очков'),('12','передач'),('5','подборов')]
-    также понимает 'PTS: 30', 'REB 10', '30 PTS'
-    """
-    items = [x.strip() for x in (raw or "").split(",") if x.strip()]
-    out: List[Tuple[str, str]] = []
-    for it in items:
-        m = re.search(r"(?P<val>[-+]?\d+(?:[.,]\d+)?)\s*(?P<label>.*)", it)
-        if m:
-            val = m.group("val").replace(",", ".")
-            label = m.group("label").strip(" -:").strip()
-            if not label and ":" in it:
-                parts = it.split(":", 1)
-                label = parts[0].strip()
-                val = parts[1].strip()
-            out.append((val, label))
-        else:
-            out.append((it, ""))  # fallback
-    return out
-
+# ---------- основной рендер ----------
 def render_card(
     template: str,
     player_name: str,
     team_name: str,
-    team_logo: str,                    # может быть teamId или URL
-    team_colors: Optional[Tuple[str, str, str]],  # (primary, dark, light) — можно None
-    headshot_image: Image.Image,       # уже открытая картинка (RGBA)
+    team_logo_img: Optional[Image.Image],    # готовый RGBA Image логотипа или None
+    team_colors: Tuple[str, str, str],       # (primary, dark, light)
+    head_img: Image.Image,                   # уже загруженная RGBA голова (круг вырежем здесь)
     stats: List[Tuple[str, str]],
     note: Optional[str] = None,
 ) -> bytes:
-    # цвета
-    if team_colors and len(team_colors) >= 1:
-        primary_hex = team_colors[0]
-    else:
-        # если цвета не передали — берём primary по teamId/URL
-        tid = team_logo.strip()
-        if tid.isdigit():
-            primary_hex = team_primary_color(tid)
-        else:
-            primary_hex = "#1a1a1a"
+    primary_hex, dark_hex, light_hex = team_colors
     primary_rgb = _hex_to_rgb(primary_hex)
     left_rgb  = _shade(primary_rgb, 0.65)
     right_rgb = primary_rgb
 
     canvas = Image.new("RGBA", (W, H), (0,0,0,0))
 
-    # Фото игрока (круг)
-    head = _circle_crop_image(headshot_image, HEAD_SIZE)
+    # Фото игрока (circle)
+    head = _circle_crop_img(head_img, HEAD_SIZE)
 
-    # Имя
     name_area_x = PAD_L + HEAD_SIZE + 36
     name_max_w  = W - name_area_x - PAD_R
     name_img, _ = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, name_max_w, BASE_NAME, 28)
@@ -271,7 +199,7 @@ def render_card(
     content_right  = max(right_by_name, right_by_stats)
     bar_w = min(W, content_right + PAD_R)
 
-    # Панель с градиентом
+    # --- Панель с градиентом ---
     bar_y = H - BAR_H
     panel = _rounded_horizontal_gradient(bar_w, BAR_H, 24, left_rgb, right_rgb)
     canvas.alpha_composite(panel, (0, bar_y))
@@ -281,9 +209,9 @@ def render_card(
     head_y = bar_y - head.height//3
     canvas.alpha_composite(head, (head_x, head_y))
 
-    # ЛОГОТИП: выберем рабочий вариант
-    logo_img = _first_ok_image(_team_logo_variants(team_logo))
-    if logo_img:
+    # ЛОГОТИП СВЕРХУ ФОТО
+    if team_logo_img is not None:
+        logo_raw = team_logo_img.convert("RGBA").resize((LOGO_SIZE, LOGO_SIZE), Image.LANCZOS)
         # тень
         shadow = Image.new("RGBA", (LOGO_D+6, LOGO_D+6), (0,0,0,0))
         sh_mask = Image.new("L", (LOGO_D+6, LOGO_D+6), 0)
@@ -294,8 +222,8 @@ def render_card(
         mask = Image.new("L", (LOGO_D, LOGO_D), 0)
         ImageDraw.Draw(mask).ellipse((0,0,LOGO_D,LOGO_D), fill=255)
         logo_circle.putalpha(mask)
-        logo_raw = logo_img.resize((LOGO_SIZE, LOGO_SIZE), Image.LANCZOS)
         logo_circle.alpha_composite(logo_raw, ((LOGO_D - LOGO_SIZE)//2, (LOGO_D - LOGO_SIZE)//2))
+        # позиция на голове
         logo_x = head_x + LOGO_OFFSET_X
         logo_y = head_y + LOGO_OFFSET_Y
         canvas.alpha_composite(shadow, (logo_x - 3, logo_y - 3))
@@ -320,7 +248,6 @@ def render_card(
     stats_y = name_y + name_img.height + NAME_STATS_GAP
     canvas.alpha_composite(stats_line, (stats_x, stats_y))
 
-    # PNG (прозрачный фон сохранится)
     bio = io.BytesIO()
     canvas.save(bio, format="PNG")
     return bio.getvalue()
