@@ -1,5 +1,5 @@
 # api/telegram.py
-# Webhook для Telegram. Безопасные импорты, локальные лого, интерактивные уточнения.
+# Webhook для Telegram. Безопасные импорты, ForceReply, устойчивое получение headshot.
 
 from __future__ import annotations
 import os, io, json, re, traceback, time
@@ -38,17 +38,16 @@ except Exception as e:
         raise RuntimeError(f"graphics import failed: {e}\n{traceback.format_exc()}")
     render_card = render_card2 = render_card_bad = render_card_special = render_card_drN = _gfx_fail
 else:
-    # совместимость для старого имени
     try:
-        from graphics import render_card_dr  # может отсутствовать
+        from graphics import render_card_dr  # совместимость
     except Exception:
         def render_card_dr(n, player_name, head_img, logo_img, stats):
             return render_card_drN(n, player_name, head_img, logo_img, stats)
 
-# team_brand — ОПЦИОНАЛЬНО. Никаких BOOT_ERR при его отсутствии!
+# team_brand — опционально
 _brand_mod = None
 try:
-    import team_brand as _brand_mod  # может не иметь функций, но иметь словарь
+    import team_brand as _brand_mod
 except Exception as e:
     BRAND_WARN = _exc_str(e)
 
@@ -62,7 +61,6 @@ ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
 CACHE_DIR = os.path.join(ASSETS_DIR, "cache")
 TMP_DIR = "/tmp"
 
-# /tmp «хранилище» (живёт, пока жив инстанс)
 RUS_NAMES_PATH = os.path.join(TMP_DIR, "rus_names.json")
 TEAM_OVR_PATH  = os.path.join(TMP_DIR, "team_overrides.json")
 COLOR_OVR_PATH = os.path.join(TMP_DIR, "color_overrides.json")
@@ -96,7 +94,7 @@ def _tg_post(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     if isinstance(payload.get("reply_markup"), dict):
         payload["reply_markup"] = json.dumps(payload["reply_markup"], ensure_ascii=False)
-    body = urlencode(payload).encode("utf-8")
+    body = urlencode({k: v for k, v in payload.items() if v is not None}).encode("utf-8")
     req = UrlReq(url, data=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
     with urlopen(req, timeout=25) as r:
         raw = r.read()
@@ -105,13 +103,14 @@ def _tg_post(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         return {"ok": False, "raw": raw[:200]}
 
-def _send_msg(chat_id: int, text: str, reply_to: Optional[int] = None, html: bool = True):
+def _send_msg(chat_id: int, text: str, reply_to: Optional[int] = None, html: bool = True, reply_markup: Optional[dict]=None):
     return _tg_post("sendMessage", {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML" if html else "Markdown",
-        "reply_to_message_id": reply_to or "",
+        "reply_to_message_id": reply_to or None,
         "disable_web_page_preview": 1,
+        "reply_markup": reply_markup,
     })
 
 def _edit_msg(chat_id: int, message_id: int, text: str, html: bool = True, reply_markup: Optional[dict] = None):
@@ -121,13 +120,14 @@ def _edit_msg(chat_id: int, message_id: int, text: str, html: bool = True, reply
         "text": text,
         "parse_mode": "HTML" if html else "Markdown",
         "disable_web_page_preview": 1,
-        "reply_markup": reply_markup or "",
+        "reply_markup": reply_markup,
     })
 
-def _send_photo(chat_id: int, png_bytes: bytes, caption: str = ""):
-    # Отправляем как документ, чтобы не потерять прозрачность PNG.
+def _send_png_as_document(chat_id: int, png_bytes: bytes, caption: str = ""):
+    # Чтобы не терять прозрачность — отправляем как документ
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
     boundary = "----VMFormBoundary" + str(int(time.time()*1000))
+
     def part(field, content, filename=None, ctype="application/octet-stream"):
         out = []
         out.append(f"--{boundary}".encode())
@@ -143,11 +143,9 @@ def _send_photo(chat_id: int, png_bytes: bytes, caption: str = ""):
         return b"\r\n".join(out)
 
     body = b""
-    body += part("chat_id", str(chat_id))
-    body += b"\r\n"
+    body += part("chat_id", str(chat_id)); body += b"\r\n"
     if caption:
-        body += part("caption", caption)
-        body += b"\r\n"
+        body += part("caption", caption); body += b"\r\n"
     body += part("document", png_bytes, filename="card.png", ctype="image/png")
     body += b"\r\n--" + boundary.encode() + b"--\r\n"
 
@@ -167,7 +165,7 @@ def _normalize_stats_block(text: str) -> List[Tuple[str, str]]:
         if m:
             out.append((m.group(1), m.group(2)))
         else:
-            out.append((p, ""))  # забираем целиком в значение
+            out.append((p, ""))
     return out
 
 def _pick_display_name(p: Dict[str, Any]) -> str:
@@ -179,6 +177,54 @@ def _pick_display_name(p: Dict[str, Any]) -> str:
     fn, ln = p.get("firstName","").strip(), p.get("lastName","").strip()
     return (fn + " " + ln).strip()
 
+# ---------------- Headshot: устойчивый враппер ----------------
+def _download_to_tmp(url: str, path: str, timeout: int = 20) -> Optional[str]:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        req = UrlReq(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "image/png,image/*;q=0.8,*/*;q=0.5"})
+        with urlopen(req, timeout=timeout) as r:
+            data = r.read()
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+    except Exception:
+        return None
+
+def _ensure_headshot_path(player: Dict[str, Any]) -> str:
+    """
+    Пробуем обе сигнатуры ensure_headshot_png (dict/str) + фолбэк на CDN/прокси.
+    Возвращает локальный путь к PNG.
+    """
+    pid = str(player.get("personId") or "")
+    # 1) ensure_headshot_png(player)
+    try:
+        path = ensure_headshot_png(player)  # если функция ожидает dict
+        if isinstance(path, str) and os.path.exists(path):
+            return path
+    except TypeError:
+        pass
+    except Exception:
+        pass
+    # 2) ensure_headshot_png(pid)
+    try:
+        path = ensure_headshot_png(pid)
+        if isinstance(path, str) and os.path.exists(path):
+            return path
+    except Exception:
+        pass
+    # 3) Фолбэки: локальный кеш, CDN, прокси
+    local = os.path.join(TMP_DIR, "headshots", f"{pid}.png")
+    if os.path.exists(local):
+        return local
+    cdn = f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png"
+    if _download_to_tmp(cdn, local):
+        return local
+    proxy = f"https://nba-players-proxy.znamteam-903.workers.dev/img?u={pid}"
+    if _download_to_tmp(proxy, local):
+        return local
+    raise RuntimeError("headshot not available")
+
+# ---------------- Logos & Colors ----------------
 def _load_team_logo_img(team_id: str) -> Optional["Image.Image"]:
     try:
         from PIL import Image
@@ -191,9 +237,7 @@ def _load_team_logo_img(team_id: str) -> Optional["Image.Image"]:
     except Exception:
         return None
 
-# Универсальный доступ к цветам команды (любой формат team_brand)
 def _team_colors_for(team_id: str) -> Tuple[str, str, str]:
-    # 1) team_brand.team_colors_for
     if _brand_mod and hasattr(_brand_mod, "team_colors_for"):
         try:
             c = _brand_mod.team_colors_for(team_id)
@@ -207,12 +251,11 @@ def _team_colors_for(team_id: str) -> Tuple[str, str, str]:
                 )
         except Exception:
             pass
-    # 2) team_brand.TEAM_BRANDS / TEAM_COLORS словарь
     for key in ("TEAM_BRANDS", "TEAM_COLORS", "BRANDS"):
         if _brand_mod and hasattr(_brand_mod, key):
             try:
                 d = getattr(_brand_mod, key)
-                b = d.get(str(team_id)) or d.get(int(team_id)) if isinstance(d, dict) else None
+                b = d.get(str(team_id)) or (d.get(int(team_id)) if isinstance(d, dict) else None)
                 if isinstance(b, dict):
                     return (
                         str(b.get("primary") or "#007ACC"),
@@ -223,22 +266,22 @@ def _team_colors_for(team_id: str) -> Tuple[str, str, str]:
                     return str(b[0]), str(b[1]), str(b[2])
             except Exception:
                 pass
-    # 3) дефолт
     return ("#007ACC", "#005A99", "#66B6FF")
 
+# ---------------- HELP TEXT ----------------
 HELP_TEXT = (
     "Привет! Я онлайн 🤖\n\n"
     "Команды:\n"
     "• /start — проверка связи\n"
     "• /help — это сообщение\n"
     "• /find <имя> — найти игрока (например: /find Doncic)\n"
-    "• /name <имя> — интерактивно задать русское имя (ответь на сообщение с подсказкой)\n"
+    "• /name <имя> — интерактивно задать русское имя (ответь на сообщение)\n"
     "• /team <имя> — задать/переопределить команду (ответь числом teamId)\n"
     "• /card <имя> | <статистика> — плашка (Авто/Свой цвет)\n"
     "• /cardBAD <имя> | <статистика> — «плохо сыграл» (коричневый, 💩)\n"
     "• /cardS <имя> | <статистика> | <инфо> — плашка с доп. блоком\n"
     "• /card2 <имя1> | <статистика1> | <имя2> | <статистика2> — дуо\n"
-    "• /cardDR3 (или 4/5) — шаблон «делает разницу» (подхват позиций из макета)\n"
+    "• /cardDR3 (или 4/5) — шаблон «делает разницу»\n"
 )
 
 # ---------------- GET (ping/diag/refresh) ----------------
@@ -269,17 +312,23 @@ async def telegram_get(secret: str = "", action: Optional[str] = None):
     return JSONResponse({"ok": True, "route": "telegram-get", "boot_error": BOOT_ERR})
 
 # ---------------- SCENARIO HELPERS ----------------
+def _force_reply(placeholder: str) -> dict:
+    return {"force_reply": True, "input_field_placeholder": placeholder, "selective": True}
+
 def _ask_rus_name(chat_id: int, pid: str, eng_name: str) -> None:
-    _send_msg(chat_id,
-              f"Как подписать игрока <b>{eng_name}</b> на плашке?\n"
-              f"Ответьте <u>на это сообщение</u> русским именем.\n"
-              f"[setname:{pid}]")
+    _send_msg(
+        chat_id,
+        f"Как подписать игрока <b>{eng_name}</b> на плашке?\nОтветьте на это сообщение русским именем.\n[setname:{pid}]",
+        reply_markup=_force_reply("Напишите русское имя"),
+    )
 
 def _ask_team_override(chat_id: int, pid: str, cur_tid: str) -> None:
-    _send_msg(chat_id,
-              f"Укажите <b>teamId</b> для игрока (текущее: <code>{cur_tid}</code>). "
-              f"Ответьте <u>на это сообщение</u> числом.\n"
-              f"[setteam:{pid}]")
+    _send_msg(
+        chat_id,
+        f"Укажите <b>teamId</b> для игрока (текущее: <code>{cur_tid}</code>). "
+        f"Ответьте на это сообщение числом.\n[setteam:{pid}]",
+        reply_markup=_force_reply("Напишите teamId, например 1610612747"),
+    )
 
 def _ask_color(chat_id: int, ctx_id: str) -> Dict[str, Any]:
     kb = {
@@ -372,7 +421,7 @@ async def telegram_webhook(request: Request, secret: str = ""):
     text = (message.get("text") or "").strip()
     reply_to = message.get("reply_to_message") or {}
 
-    # обработка ответов на подсказки: [setname:pid], [setteam:pid], ожидание цвета
+    # ответы на подсказки
     if reply_to:
         rtxt = reply_to.get("text") or ""
         m1 = re.search(r"\[setname:(\d+)\]", rtxt)
@@ -617,7 +666,7 @@ async def _build_and_send_from_ctx(chat_id: int, ctx: Dict[str, Any], custom_hex
         return
 
     try:
-        head_path = ensure_headshot_png(str(p.get("personId")))
+        head_path = _ensure_headshot_path(p)
         from PIL import Image
         head_img = Image.open(head_path).convert("RGBA")
     except Exception as e:
@@ -625,30 +674,26 @@ async def _build_and_send_from_ctx(chat_id: int, ctx: Dict[str, Any], custom_hex
         return
 
     name_ru = _pick_display_name(p)
-
     team_id = str(p.get("teamId") or "0")
     logo_img = _load_team_logo_img(team_id) if kind != "cardbad" else None
-    if custom_hex:
-        colors = (custom_hex, custom_hex, custom_hex)
-    else:
-        colors = _team_colors_for(team_id)
+    colors = (custom_hex, custom_hex, custom_hex) if custom_hex else _team_colors_for(team_id)
 
     if kind == "card":
         png = render_card("single", name_ru, "", logo_img, colors, head_img, stats)
-        _send_photo(chat_id, png); return
+        _send_png_as_document(chat_id, png); return
     if kind == "cardbad":
         png = render_card_bad(name_ru, head_img, stats)
-        _send_photo(chat_id, png); return
+        _send_png_as_document(chat_id, png); return
     if kind == "cards":
         png = render_card_special(name_ru, logo_img, colors, head_img, stats, info)
-        _send_photo(chat_id, png); return
+        _send_png_as_document(chat_id, png); return
     if kind and kind.startswith("carddr"):
         try:
             n = int(kind.replace("carddr",""))
         except Exception:
             n = 3
         png = render_card_drN(n, name_ru, head_img, logo_img, stats)
-        _send_photo(chat_id, png); return
+        _send_png_as_document(chat_id, png); return
 
     _send_msg(chat_id, "Неизвестный контекст.")
 
@@ -659,8 +704,8 @@ async def _build_and_send_card2(chat_id: int,
     p1 = _apply_overrides(p1)
     p2 = _apply_overrides(p2)
 
-    head1 = Image.open(ensure_headshot_png(str(p1.get("personId")))).convert("RGBA")
-    head2 = Image.open(ensure_headshot_png(str(p2.get("personId")))).convert("RGBA")
+    head1 = Image.open(_ensure_headshot_path(p1)).convert("RGBA")
+    head2 = Image.open(_ensure_headshot_path(p2)).convert("RGBA")
 
     name1 = _pick_display_name(p1); name2 = _pick_display_name(p2)
 
@@ -672,13 +717,13 @@ async def _build_and_send_card2(chat_id: int,
 
     png = render_card2(name1, logo1, colors1, head1, stats1,
                        name2, logo2, colors2, head2, stats2)
-    _send_photo(chat_id, png)
+    _send_png_as_document(chat_id, png)
 
 async def _build_and_send_dr(chat_id: int, n: int, p: Dict[str,Any], stats: List[Tuple[str,str]]) -> None:
     from PIL import Image
     p = _apply_overrides(p)
-    head = Image.open(ensure_headshot_png(str(p.get("personId")))).convert("RGBA")
+    head = Image.open(_ensure_headshot_path(p)).convert("RGBA")
     logo = _load_team_logo_img(str(p.get("teamId") or "0"))
     name = _pick_display_name(p)
     png = render_card_drN(n, name, head, logo, stats)
-    _send_photo(chat_id, png)
+    _send_png_as_document(chat_id, png)
