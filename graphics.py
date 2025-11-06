@@ -88,9 +88,33 @@ def _circle_crop_img(img: Image.Image, d: int) -> Image.Image:
     out.paste(im, (0,0), mask)
     return out
 
-def _hex_to_rgb(h: str) -> Tuple[int,int,int]:
-    h = h.strip().lstrip("#")
-    return (int(h[0:2],16), int(h[2:4],16), int(h[4:6],16))
+def _hex_to_rgb(h: str) -> Tuple[int, int, int]:
+    import re
+    # дефолтный «синий на всякий случай»
+    DEFAULT = (0, 122, 204)
+
+    if not isinstance(h, str):
+        return DEFAULT
+
+    s = h.strip()
+
+    # форматы rgb(255,200,0) / rgba(255,200,0,1)
+    m = re.match(r"rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})", s)
+    if m:
+        r = max(0, min(255, int(m.group(1))))
+        g = max(0, min(255, int(m.group(2))))
+        b = max(0, min(255, int(m.group(3))))
+        return (r, g, b)
+
+    # вытащить первый #RRGGBB из строки (работает и для "('#552583', '#FDB927', '#000000')")
+    m = re.search(r'#?([0-9A-Fa-f]{6})', s)
+    if not m:
+        return DEFAULT
+    hex6 = m.group(1)
+    try:
+        return (int(hex6[0:2], 16), int(hex6[2:4], 16), int(hex6[4:6], 16))
+    except Exception:
+        return DEFAULT
 
 def _clamp(x:int)->int: return max(0,min(255,x))
 def _shade(rgb: Tuple[int,int,int], k: float) -> Tuple[int,int,int]:
@@ -222,7 +246,6 @@ def render_card2(
     player2_name: str, team2_logo: Optional[Image.Image], colors2: Tuple[str,str,str], head2: Image.Image, stats2: List[Tuple[str,str]]
 ) -> bytes:
     canvas = Image.new("RGBA", (W,H), (0,0,0,0))
-    # половины
     w_half = W//2
     for side, player_name, team_logo, colors, head_img, stats in [
         ("left",  player1_name, team1_logo, colors1, head1, stats1),
@@ -407,7 +430,7 @@ def _detect_layout_from_guides(guides_path: str) -> Optional[Dict[str,Any]]:
     # stats
     stats_boxes = _all_bboxes_for_color(im, _GUIDE_COLORS["stat"])
     if stats_boxes:
-        stats_boxes.sort(key=lambda b: ( (b[1]//50), b[0] ))  # грубо: по строкам затем по x
+        stats_boxes.sort(key=lambda b: ( (b[1]//50), b[0] ))
         layout["stats"] = [{"x":b[0], "y":b[1], "max_w": b[2]-b[0]+1, "align":"center"} for b in stats_boxes]
     return layout if layout else None
 
@@ -430,16 +453,14 @@ def _load_dr_layout(n: int) -> Tuple[Optional[Image.Image], Optional[Dict[str,An
     layout = _load_json_layout(layout_json)
     if layout: return base_img, layout
 
-    # если JSON нет — пробуем guides
     if os.path.exists(guides_png):
         layout = _detect_layout_from_guides(guides_png)
         if layout: return base_img, layout
 
-    # крайний случай: пробуем autodetect из самого base_png (если дизайнер положил маркеры прямо на него)
     if base_img:
         tmp = os.path.join(TEMPLATES_DIR, f"dr{n}_autodetect.png")
         try:
-            base_img.save(tmp)  # просто для совместимости путей; реально можно использовать base_img напрямую
+            base_img.save(tmp)
             layout = _detect_layout_from_guides(tmp)
         except Exception:
             layout = None
@@ -475,7 +496,6 @@ def _draw_logo(canvas: Image.Image, logo_img: Optional[Image.Image], slot: Dict[
     x = int(slot.get("x", PAD_L + LOGO_OFFSET_X))
     y = int(slot.get("y", H - BAR_H - LOGO_OFFSET_Y))
     logo_raw = logo_img.resize((size, size), Image.LANCZOS)
-    # белый круг со тенью, как в single
     d = size + 16
     shadow = Image.new("RGBA", (d+6, d+6), (0,0,0,0))
     sh_mask = Image.new("L", (d+6, d+6), 0)
@@ -501,8 +521,6 @@ def _draw_stat_cell(canvas: Image.Image, v: str, lab: str, slot: Dict[str,Any]):
     lbl_img = _text_img((lab or "").upper(), f_lbl, (255,255,255,220)) if lab else None
     w = max(val_img.width, lbl_img.width if lbl_img else 0)
     if w > max_w:
-        # ужимаем только значение (и подпись, если надо) бинарным поиском
-        # (для простоты используем _fit_text_to_width)
         val_img, _ = _fit_text_to_width(str(v), F_EXO_PATH, max_w, val_sz, 20)
         if lbl_img:
             lbl_img, _ = _fit_text_to_width((lab or "").upper(), F_SB_PATH, max_w, lbl_sz, 16)
@@ -531,21 +549,16 @@ def render_card_drN(
         canvas.alpha_composite(base_img, (0,0))
 
     if not layout:
-        # без layout — ничего не рисуем; чтобы не падать, просто вернём пустышку с именем
         name_img, _ = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, 1200, 84, 28)
         canvas.alpha_composite(name_img, ((W-name_img.width)//2, (H-name_img.height)//2))
         bio = io.BytesIO(); canvas.save(bio, format="PNG"); return bio.getvalue()
 
-    # имя
     if "name" in layout:
         _draw_name(canvas, player_name.upper(), layout["name"])
-    # голова
     if "head" in layout:
         _draw_head(canvas, head_img, layout["head"])
-    # логотип
     if "logo" in layout:
         _draw_logo(canvas, logo_img, layout["logo"])
-    # стат ячейки
     stat_slots = layout.get("stats") or []
     for i, slot in enumerate(stat_slots):
         v, lab = ("","")
@@ -569,7 +582,6 @@ def render_card_dr(player_name: str,
             canvas.alpha_composite(base, (0,0))
     except Exception:
         pass
-    # просто как раньше: нижняя панель + имя/метрики
     primary = "#1E1E1E"
     left_rgb, right_rgb = (20,20,20), (34,34,34)
     bar_y = H - BAR_H
