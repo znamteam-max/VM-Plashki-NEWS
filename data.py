@@ -236,20 +236,21 @@ def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for p in arr:
             try:
-                out.append({
+                item = {
                     "personId": _safe_str(p.get("personId") or ""),
                     "firstName": _safe_str(p.get("firstName") or "").strip(),
                     "lastName":  _safe_str(p.get("lastName")  or "").strip(),
                     "teamId":    _safe_str(p.get("teamId")    or "0"),
                     "isActive":  bool(p.get("isActive", True)),
-                    # photo опционален — если нет, _apply_overrides подставит шаблон
-                    **({"photo": _safe_str(p.get("photo")).strip()} if p.get("photo") else {})
-                })
+                }
+                if p.get("photo"):
+                    item["photo"] = _safe_str(p.get("photo")).strip()
+                out.append(item)
             except Exception:
                 continue
         return out
 
-        # Вариант 2: legacy data.nba.net
+    # Вариант 2: legacy data.nba.net
     league_std = j.get("league", {}).get("standard") if isinstance(j, dict) else None
     if isinstance(league_std, list):
         out: List[Dict[str, Any]] = []
@@ -266,7 +267,7 @@ def _extract_players(j: Dict[str, Any]) -> List[Dict[str, Any]]:
                 continue
         return out
 
-    # Вариант 3: список уже нормализован
+    # Вариант 3: список уже нормализован (plain list)
     if isinstance(j, list) and j and isinstance(j[0], dict) and "personId" in j[0]:
         return j
 
