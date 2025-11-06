@@ -633,3 +633,10 @@ def render_card_special(
     bio = io.BytesIO()
     canvas.save(bio, format="PNG")
     return bio.getvalue()
+
+# --- Back-compat alias for older code paths ---
+# Старый telegram.py может ожидать функцию render_card_dr(...)
+# Делаем простой прокси на render_card_drN с первым аргументом n.
+def render_card_dr(n, player_name, head_img, logo_img, stats):
+    return render_card_drN(n, player_name, head_img, logo_img, stats)
+
