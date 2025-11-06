@@ -195,53 +195,50 @@ def _load_logo_img(team_id: str) -> Optional[Image.Image]:
     return None
 
 def _load_head_img(person_id: str) -> Image.Image:
-    # 1) безопасный вызов без timeout
+    # 1) пробуем как id
     try:
-        pth = ensure_headshot_png(person_id)  # не передаём timeout
+        pth = ensure_headshot_png(person_id)
         if pth and os.path.exists(pth):
             return Image.open(pth).convert("RGBA")
-    except TypeError:
-        # на всякий случай если сигнатура другая — пробуем ещё раз без аргументов
-        try:
-            pth = ensure_headshot_png(person_id)
-            if pth and os.path.exists(pth):
-                return Image.open(pth).convert("RGBA")
-        except Exception as e:
-            _log("headshot ensure (fallback) err", person_id, e)
     except Exception as e:
         _log("headshot ensure err", person_id, e)
 
-    # 2) варианты, могут быть None — аккуратно
+    # 2) если внутри ensure ожидают dict с personId
+    try:
+        pth = ensure_headshot_png({"personId": person_id})
+        if pth and os.path.exists(pth):
+            return Image.open(pth).convert("RGBA")
+    except Exception as e:
+        _log("headshot ensure (dict) err", person_id, e)
+
+    # 3) локальные варианты (могут вернуть None)
     try:
         variants = open_headshot_variants(person_id) or []
         for p in variants:
-            try:
-                if p and os.path.exists(p):
-                    return Image.open(p).convert("RGBA")
-            except Exception:
-                continue
+            if p and os.path.exists(p):
+                return Image.open(p).convert("RGBA")
     except Exception as e:
         _log("headshot variants err", person_id, e)
 
-    # 3) последний шанс — cdn.nba.com (не кешируем, просто пробуем)
+    # 4) прямой CDN
     try:
         import io
         url = f"https://cdn.nba.com/headshots/nba/latest/1040x760/{person_id}.png"
-        req = UrlRequest(url, headers={"User-Agent":"Mozilla/5.0"}, method="GET")
+        req = UrlRequest(url, headers={"User-Agent": "Mozilla/5.0"}, method="GET")
         with urlopen(req, timeout=8) as r:
             data = r.read()
         return Image.open(io.BytesIO(data)).convert("RGBA")
     except Exception as e:
         _log("headshot cdn err", person_id, e)
 
-    # 4) плейсхолдер, чтобы карточка всё равно собралась
+    # 5) плейсхолдер
     try:
         return Image.open(PLACEHOLDER_HEAD).convert("RGBA")
     except Exception:
         return Image.new("RGBA", (512, 512), (0, 0, 0, 0))
 
 def _status(chat_id: int, text_html: str, reply_to: Optional[int]=None) -> Optional[int]:
-    # посылаем "курсивом" как просили
+    # посылаем "курсивом", как просили
     _tg_send_action(chat_id, "typing")
     r = _tg_send_message_safe(chat_id, f"<i>{text_html}</i>", reply_to_message_id=reply_to, parse_mode="HTML")
     try:
@@ -291,22 +288,51 @@ def _find_best_player(query: str) -> Optional[Dict[str, Any]]:
 def _ensure_colors(team_id: str) -> Tuple[str, str, str]:
     """
     Универсально приводим бренд к (primary, dark, light).
-    Поддерживаем и dict, и tuple/list.
+    Поддерживаем dict, tuple/list и строку (включая строковое представление кортежа или JSON).
     """
     brand = get_team_brand(team_id)
-    # tuple/list -> (p, d, l)
-    if isinstance(brand, (tuple, list)):
-        p = str(brand[0]) if len(brand) > 0 else "#007ACC"
-        d = str(brand[1]) if len(brand) > 1 else p
-        l = str(brand[2]) if len(brand) > 2 else p
+
+    def _from_hex_list(hexes: List[str]) -> Tuple[str, str, str]:
+        p = hexes[0] if len(hexes) > 0 else "#007ACC"
+        d = hexes[1] if len(hexes) > 1 else p
+        l = hexes[2] if len(hexes) > 2 else p
         return (p, d, l)
-    # dict -> берём ключи, подставляем дефолты
+
+    # dict
     if isinstance(brand, dict):
         p = brand.get("primary") or "#007ACC"
         d = brand.get("dark")    or p
         l = brand.get("light")   or p
         return (p, d, l)
-    # ничего не пришло
+
+    # tuple/list
+    if isinstance(brand, (tuple, list)):
+        hexes = [str(x) for x in brand]
+        return _from_hex_list(hexes)
+
+    # строка: пробуем JSON, иначе вытаскиваем все #RRGGBB
+    if isinstance(brand, str):
+        s = brand.strip()
+        # JSON?
+        try:
+            j = json.loads(s)
+            if isinstance(j, dict):
+                p = j.get("primary") or "#007ACC"
+                d = j.get("dark")    or p
+                l = j.get("light")   or p
+                return (p, d, l)
+            if isinstance(j, (list, tuple)):
+                hexes = [str(x) for x in j]
+                return _from_hex_list(hexes)
+        except Exception:
+            pass
+        # Вытянуть все #RRGGBB из строки (включая "('#552583', '#FDB927', '#000000')")
+        import re
+        hexes = re.findall(r'#[0-9A-Fa-f]{6}', s)
+        if hexes:
+            return _from_hex_list(hexes)
+
+    # дефолт
     return ("#007ACC", "#005A99", "#78C3FF")
 
 # ------------------- маршруты -------------------
@@ -351,7 +377,7 @@ async def webhook_query(request: Request, secret: str):
             _tg_send_message_safe(chat_id, f"{disp} (id={p['personId']}, teamId={p.get('teamId','0')})")
             return PlainTextResponse("OK")
 
-        # --- /card (single, автоцвет)
+        # --- /card2 (дуэт)
         if text.startswith("/card2"):
             # /card2 name1 | stats1 | name2 | stats2
             st_id = _status(chat_id, "Уточнения…", reply_to=msg_id)
@@ -465,7 +491,7 @@ async def webhook_query(request: Request, secret: str):
                 _status_edit(chat_id, st_id, f"Ошибка: {e}")
             return PlainTextResponse("OK")
 
-        # /card (single, автоцвет)
+        # /card (single)
         if text.startswith("/card"):
             st_id = _status(chat_id, "Уточнения…", reply_to=msg_id)
             try:
@@ -480,7 +506,6 @@ async def webhook_query(request: Request, secret: str):
                     _status_edit(chat_id, st_id, f"Ошибка: не нашёл {name_q}")
                     return PlainTextResponse("OK")
 
-                # всё есть — готовим
                 _status_edit(chat_id, st_id, "Готовлю плашку…")
                 head = _load_head_img(p["personId"])
                 colors = _ensure_colors(p.get("teamId","0"))
@@ -495,7 +520,7 @@ async def webhook_query(request: Request, secret: str):
                 _status_edit(chat_id, st_id, f"Ошибка: {e}")
             return PlainTextResponse("OK")
 
-        # name/team интерактив (как у вас было)
+        # name/team интерактив
         if text.startswith("/name"):
             q = text.split(" ",1)[1].strip() if " " in text else ""
             if not q:
@@ -505,7 +530,7 @@ async def webhook_query(request: Request, secret: str):
             if not p:
                 _tg_send_message_safe(chat_id, f"Не нашёл игрока: {q}")
                 return PlainTextResponse("OK")
-            msg = _tg_send_message_safe(chat_id, f"Как подписать игрока {display_name_for(p)} на плашке?\nОтветьте на это сообщение русским именем.\n[setname:{p['personId']}]")
+            _tg_send_message_safe(chat_id, f"Как подписать игрока {display_name_for(p)} на плашке?\nОтветьте на это сообщение русским именем.\n[setname:{p['personId']}]")
             return PlainTextResponse("OK")
 
         if text.startswith("/team"):
@@ -547,7 +572,6 @@ async def webhook_query(request: Request, secret: str):
 
     except Exception as e:
         _log("top-level err", traceback.format_exc())
-        # стараемся не молчать:
         try:
             _tg_send_message_safe(chat_id, f"<i>Ошибка:</i> {e}", parse_mode="HTML")
         except:
