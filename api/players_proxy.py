@@ -6,11 +6,10 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from data import (
     get_players, players_count, PLAYERS_SEASON as DATA_SEASON,
-    _http_get_json, ensure_headshot_png  # reuse internal helper safely
+    _http_get_json, ensure_headshot_png
 )
 
 app = FastAPI(title="Players Proxy", version="1.0.0")
-
 NBA_URL = "https://stats.nba.com/stats/commonallplayers"
 
 def _ok(payload: Dict[str, Any], status: int = 200) -> JSONResponse:
@@ -30,20 +29,15 @@ async def health() -> JSONResponse:
 
 @app.get("/api/players_proxy/selftest")
 async def selftest(season: Optional[str] = None) -> JSONResponse:
-    # Проверим, совпадает ли season в env у data.py и тем, что прислали сюда.
     env_season = os.getenv("PLAYERS_SEASON", DATA_SEASON)
-    if season:
-        os.environ["PLAYERS_SEASON"] = season  # временно повлияет на data через импортированные константы только при новом процессе
     try:
         n = players_count(force_refresh=True)
         sample: List[Dict[str, Any]] = get_players()[:3]
-        # Быстрая валидация фото-шимов
         photos = [ensure_headshot_png(p, "260x190") for p in sample]
         return _ok({
             "ok": True,
             "env_season": env_season,
             "query_season": season or None,
-            "effective_season_hint": os.getenv("PLAYERS_SEASON", env_season),
             "count": n,
             "sample_photos": photos
         })
@@ -51,7 +45,6 @@ async def selftest(season: Optional[str] = None) -> JSONResponse:
         return _ok({"ok": False, "error": repr(e)}, status=500)
 
 def _normalize_resultsets(j: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # На случай, если хотим на стороне Vercel выдавать уже нормализованный список
     rs = j.get("resultSets", [{}])[0]
     headers = rs.get("headers", [])
     rows = rs.get("rowSet", [])
@@ -84,21 +77,18 @@ async def proxy(
     season: str = Query(default=os.getenv("PLAYERS_SEASON", DATA_SEASON)),
     format: str = Query(default="normalized")  # normalized | passthrough
 ) -> JSONResponse:
-    # Параметры NBA
     params = {
         "LeagueID": "00",
         "IsOnlyCurrentSeason": "0",
         "Season": season
     }
     try:
-        j = _http_get_json(
-            NBA_URL + "?" + "&".join(f"{k}={v}" for k, v in params.items()),
-            timeout=30, verify_ssl=True
-        )
+        url = NBA_URL + "?" + "&".join(f"{k}={v}" for k, v in params.items())
+        j = _http_get_json(url, timeout=30, verify_ssl=True)
         if format == "passthrough":
             return _ok(j)
         else:
             data = _normalize_resultsets(j)
-            return _ok({"players": data, "season": season})
+            return _ok({"season": season, "players": data})
     except Exception as e:
         return _ok({"ok": False, "error": repr(e)}, status=502)
