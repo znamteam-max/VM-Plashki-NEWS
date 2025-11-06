@@ -21,10 +21,10 @@ from graphics import render_card
 
 app = FastAPI()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN      = os.getenv("BOT_TOKEN", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-ADMIN_IDS = [s.strip() for s in os.getenv("ADMIN_IDS", "").split(",") if s.strip()]
-ASK_COLOR_ALWAYS = os.getenv("ASK_COLOR_ALWAYS", "1") == "1"  # по ТЗ — спрашиваем всегда
+ADMIN_IDS      = [s.strip() for s in os.getenv("ADMIN_IDS", "").split(",") if s.strip()]
+ASK_COLOR_ALWAYS = os.getenv("ASK_COLOR_ALWAYS", "1") == "1"
 
 STATE_PATH = "/tmp/tg_state.json"
 
@@ -181,11 +181,12 @@ def _ask_color(chat_id: int, team_id: str, palette: List[str], ask_text: str, on
     opts = palette[:3] if palette else ["#1D428A", "#FFC72C", "#0B8043"]
     kb = []
     # Авто
-    kb.append([{"text": "Авто", "callback_data": f"{once_key}:{team_id}:AUTO"}])
-    # Поштучно: «■ #HEX сейчас» и «★ #HEX сделать дефолтом»
+    kb.append([{"text": "Авто (из логотипа/пресета)", "callback_data": f"{once_key}:{team_id}:AUTO"}])
+    # Поштучно: добавим русское имя цвета в текст
     for hexv in opts:
-        kb.append([{"text": f"■ {hexv} сейчас", "callback_data": f"{once_key}:{team_id}:{hexv}"}])
-        kb.append([{"text": f"★ {hexv} сделать дефолтом", "callback_data": f"{save_key}:{team_id}:{hexv}"}])
+        cname = color_name_ru(hexv)
+        kb.append([{"text": f"{cname} ({hexv}) — сейчас", "callback_data": f"{once_key}:{team_id}:{hexv}"}])
+        kb.append([{"text": f"★ {cname} ({hexv}) — сделать дефолтом", "callback_data": f"{save_key}:{team_id}:{hexv}"}])
     _tg_send_message_safe(chat_id, ask_text, reply_markup={"inline_keyboard": kb})
 
 def _render_and_send_card(chat_id: int, p: Dict[str,Any], ru_name: str, stats: List[Tuple[str,str]], template: str, primary_override: Optional[str] = None) -> str:
@@ -234,9 +235,10 @@ def _ensure_ru_and_color_then_card(chat_id: int, message_id: int, p: Dict[str,An
     ov = get_overrides().get(pid) or {}
     saved_ru = str(ov.get("ruName") or "").strip()
 
-    (primary, dark, light), logo_path, palette, has_saved_primary = get_team_brand(team_id)
+    (_primary, _dark, _light), _logo_path, palette, _has_saved_primary = get_team_brand(team_id)
 
-    # 1) спросим ru-имя, если ещё нет
+    # 1) уточнения
+    _tg_send_message_safe(chat_id, "<i>Уточнения…</i>")
     if not saved_ru:
         en = display_name_for(p)
         msg = _tg_send_message_safe(
@@ -248,11 +250,10 @@ def _ensure_ru_and_color_then_card(chat_id: int, message_id: int, p: Dict[str,An
             _set_dialog(chat_id, {"mode":"set_ru_then_color", "pid": pid, "stats": stats, "template": template})
             return
         else:
-            saved_ru = en  # fallback — не зависаем
+            saved_ru = en  # fallback
 
-    # 2) про цвет: по ТЗ — спрашиваем КАЖДЫЙ раз
-    ask = "Выберите основной цвет плашки (можно сохранить для команды по умолчанию):"
-    _ask_color(chat_id, team_id, palette, ask_text=ask, once_key="pickcol", save_key="savecol")
+    # 2) выбор цвета — показываем всегда
+    _ask_color(chat_id, team_id, palette, ask_text="Выберите основной цвет плашки:", once_key="pickcol", save_key="savecol")
     _set_dialog(chat_id, {"mode":"wait_color_then_card", "pid": pid, "stats": stats, "template": template, "ru": saved_ru})
     return
 
@@ -304,7 +305,7 @@ async def webhook_query(request: Request):
                 _set_dialog(chat_id, {"mode":"add_custom_pid"})
                 return PlainTextResponse("OK")
 
-            # Выбор цвета один раз
+            # Разовый выбор цвета
             if data.startswith("pickcol:"):
                 _, team_id, hexv = data.split(":")
                 _ = _tg_post_json("answerCallbackQuery", {"callback_query_id": cb["id"]})
@@ -313,11 +314,12 @@ async def webhook_query(request: Request):
                 if mode not in ("wait_color_then_card", "color_only"):
                     return PlainTextResponse("OK")
                 if mode == "color_only":
-                    # просто сохранять не нужно, это разовая установка — покажем подтверждение
+                    # просто подтверждаем выбор
                     if hexv == "AUTO":
                         _tg_send_message_safe(chat_id, "Ок, цвет: Авто (разово).")
                     else:
-                        _tg_send_message_safe(chat_id, f"Ок, цвет разово: {hexv}.")
+                        cname = color_name_ru(hexv)
+                        _tg_send_message_safe(chat_id, f"Ок, цвет разово: {cname} ({hexv}).")
                     _clear_dialog(chat_id)
                     return PlainTextResponse("OK")
                 # карта
@@ -330,20 +332,23 @@ async def webhook_query(request: Request):
                 stats = dlg.get("stats") or []
                 template = dlg.get("template") or "single"
                 primary_override = None if hexv == "AUTO" else hexv
+                # перед рендером — курсив «Готовлю плашку…»
+                _tg_send_message_safe(chat_id, "<i>Готовлю плашку…</i>")
                 _clear_dialog(chat_id)
                 _render_and_send_card(chat_id, p, ru, stats, template, primary_override=primary_override)
                 return PlainTextResponse("OK")
 
-            # Сохранить цвет дефолтом
+            # Сохранить дефолтный цвет
             if data.startswith("savecol:"):
                 _, team_id, hexv = data.split(":")
                 _ = _tg_post_json("answerCallbackQuery", {"callback_query_id": cb["id"]})
-                ok = set_team_primary_color(team_id, hexv)  # hexv может быть AUTO — тогда снимем override
+                ok = set_team_primary_color(team_id, hexv)  # hexv может быть AUTO
                 if ok:
                     if hexv == "AUTO":
                         _tg_send_message_safe(chat_id, f"Сбросил дефолтный цвет для команды {team_id} → Авто.")
                     else:
-                        _tg_send_message_safe(chat_id, f"Сохранил основной цвет <b>{hexv}</b> для команды {team_id}.")
+                        cname = color_name_ru(hexv)
+                        _tg_send_message_safe(chat_id, f"Сохранил основной цвет: {cname} ({hexv}) для команды {team_id}.")
                 else:
                     _tg_send_message_safe(chat_id, "Не удалось сохранить цвет. Формат: #RRGGBB или AUTO.")
                 # если это было в процессе карточки — дорендерим с сохранённым дефолтом
@@ -354,6 +359,7 @@ async def webhook_query(request: Request):
                         ru = dlg.get("ru") or display_name_for(p)
                         stats = dlg.get("stats") or []
                         template = dlg.get("template") or "single"
+                        _tg_send_message_safe(chat_id, "<i>Готовлю плашку…</i>")
                         _clear_dialog(chat_id)
                         _render_and_send_card(chat_id, p, ru, stats, template, primary_override=None)
                     else:
@@ -511,7 +517,7 @@ async def webhook_query(request: Request):
                     return PlainTextResponse("OK")
                 name, stats, template = parsed
                 _tg_send_chat_action(chat_id, "typing")
-                _tg_send_message_safe(chat_id, "Готовлю плашку…")
+                _tg_send_message_safe(chat_id, "<i>Уточнения…</i>")
                 res = find_player_by_name(name)
                 if not res:
                     cand = _best_candidates(name)
