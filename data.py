@@ -1,7 +1,7 @@
 # data.py
 from __future__ import annotations
 
-import os, json, time, ssl, traceback, random
+import os, json, time, ssl, traceback, random, re
 from typing import Any, Dict, List, Tuple, Optional
 from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
 from urllib.request import Request, urlopen
@@ -14,7 +14,7 @@ PLAYERS_SEASON = os.getenv("PLAYERS_SEASON", "2025-26").strip()
 PLAYERS_USE_CUSTOM = os.getenv("PLAYERS_USE_CUSTOM", "1") == "1"
 # Один URL (наследие)
 PLAYERS_CUSTOM_URL = os.getenv("PLAYERS_CUSTOM_URL", "").strip()
-# Пул зеркал — через запятую. Будет использован в порядке перечисления.
+# Пул зеркал — через запятую.
 PLAYERS_CUSTOM_URLS = [
     u.strip() for u in os.getenv("PLAYERS_CUSTOM_URLS", "").split(",") if u.strip()
 ]
@@ -26,9 +26,7 @@ if not PLAYERS_CUSTOM_URL and not PLAYERS_CUSTOM_URLS:
 # Таймауты/ретраи для custom
 CUSTOM_ATTEMPTS = int(os.getenv("PLAYERS_CUSTOM_ATTEMPTS", "3"))
 CUSTOM_BASE_TIMEOUT = int(os.getenv("PLAYERS_CUSTOM_TIMEOUT", "30"))  # сек
-# Множитель экспоненциального бэкоффа
 CUSTOM_BACKOFF_MULT = float(os.getenv("PLAYERS_BACKOFF_MULT", "1.7"))
-# Верхняя граница случайного джиттера между ретраями (сек)
 CUSTOM_JITTER_MAX = float(os.getenv("PLAYERS_JITTER_MAX", "0.8"))
 
 # 2) Legacy (data.nba.net) по умолчанию ВЫКЛ
@@ -44,13 +42,12 @@ PLAYERS_SNAPSHOT_URLS = [u.strip() for u in os.getenv("PLAYERS_SNAPSHOT_URLS", "
 DISABLE_LOCAL_SNAPSHOT = os.getenv("PLAYERS_DISABLE_LOCAL", "0") == "1"
 
 # 5) Прочее
-MIN_EXPECTED = int(os.getenv("PLAYERS_MIN_EXPECTED", "350"))   # минимально «адекватная» выборка
-CACHE_TTL_SEC = int(os.getenv("PLAYERS_CACHE_TTL", "43200"))   # 12h
+MIN_EXPECTED = int(os.getenv("PLAYERS_MIN_EXPECTED", "350"))
+CACHE_TTL_SEC = int(os.getenv("PLAYERS_CACHE_TTL", "43200"))  # 12h
 PHOTO_FMT = os.getenv("PLAYERS_PHOTO_FMT",
     "https://cdn.nba.com/headshots/nba/latest/1040x760/{personId}.png")
 
-# Строгая проверка типа содержимого (application/json). По умолчанию выключено,
-# т.к. прокси иногда отдают text/plain.
+# В ряде прокси CT может быть text/plain — строгую проверку можно оставить выкл.
 REQUIRE_JSON_CT = os.getenv("PLAYERS_REQUIRE_JSON_CT", "0") == "1"
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -99,7 +96,6 @@ def _http_get_json(url: str, timeout: int = 30, verify_ssl: bool = True) -> Any:
     if not verify_ssl:
         ctx = ssl._create_unverified_context()
 
-    # Правдоподобные заголовки; identity — чтобы избежать проблем с чанками/сервером.
     req = Request(url, headers={
         "User-Agent": "Mozilla/5.0 (players-fetch; like Gecko)",
         "Accept": "application/json,text/plain,*/*",
@@ -120,22 +116,20 @@ def _http_get_json(url: str, timeout: int = 30, verify_ssl: bool = True) -> Any:
             ct = resp.headers.get("Content-Type", "")
             clen = len(raw) if raw is not None else 0
 
-            # Иногда приходит HTML (Cloudflare/бан). Отражаем в лог и кидаем исключение.
             if REQUIRE_JSON_CT and ("json" not in ct.lower()):
                 _log(f"non-JSON CT '{ct}' from {url} ({clen} bytes, {elapsed:.2f}s)")
                 raise ValueError(f"Non-JSON Content-Type: {ct}")
 
-            # Быстрый эвристический чек на HTML
+            # Эвристика на HTML/блок-страницы
             if clen > 0 and raw[:1] in (b"<", b"\n") and b"<html" in raw[:512].lower():
                 head = raw[:160].decode("utf-8", errors="ignore")
                 _log(f"html-like response head from {url}: {head!r}")
                 raise ValueError("HTML body received (likely blocked)")
 
     except HTTPError as e:
-        # Прочитаем немного тела для диагностики
         body = b""
         try:
-            body = e.read(256)  # не больше 256 байт
+            body = e.read(256)
         except Exception:
             pass
         head = body.decode("utf-8", errors="ignore")
@@ -144,22 +138,20 @@ def _http_get_json(url: str, timeout: int = 30, verify_ssl: bool = True) -> Any:
     except URLError as e:
         _log(f"URL Error {repr(e)} from {url} in {time.time()-t0:.2f}s")
         raise
-    except TimeoutError as e:
+    except TimeoutError:
         _log(f"Timeout after {timeout}s from {url}")
         raise
     except Exception as e:
         _log(f"_http_get_json error {repr(e)} from {url} in {time.time()-t0:.2f}s")
         raise
 
-    # Парс JSON
     try:
         return json.loads(raw.decode("utf-8"))
     except Exception:
         return json.loads(raw)
 
 def _sleep_with_backoff(i: int) -> None:
-    # экспоненциальный рост + джиттер
-    base = (CUSTOM_BACKOFF_MULT ** max(0, i)) * 0.6  # мягкая кривая
+    base = (CUSTOM_BACKOFF_MULT ** max(0, i)) * 0.6
     jitter = random.random() * CUSTOM_JITTER_MAX
     time.sleep(min(5.0, base + jitter))
 
@@ -171,7 +163,6 @@ def _get_json_with_retries(url: str, attempts: int, base_timeout: int, verify_ss
             return _http_get_json(url, timeout=timeout, verify_ssl=verify_ssl)
         except HTTPError as e:
             last_err = e
-            # 429/5xx — есть смысл ретраить; прочие 4xx — обычно бесполезно (меняем зеркало)
             if e.code in (429, 500, 502, 503, 504):
                 _log(f"retryable HTTP {e.code} on {url}; retry {i+1}/{attempts}")
                 _sleep_with_backoff(i)
@@ -267,14 +258,13 @@ def _fetch_from_custom(url: Optional[str] = None) -> List[Dict[str, Any]]:
     if not PLAYERS_USE_CUSTOM:
         return []
 
-    # Соберём пул кандидатов (уникальные, с season=...)
     candidates: List[str] = []
     if url:
         candidates.append(url.strip())
     if PLAYERS_CUSTOM_URL:
         candidates.append(PLAYERS_CUSTOM_URL.strip())
     candidates.extend(PLAYERS_CUSTOM_URLS)
-    # Уникальность и нормализация season
+
     seen = set()
     normalized: List[str] = []
     for u in candidates:
@@ -295,7 +285,6 @@ def _fetch_from_custom(url: Optional[str] = None) -> List[Dict[str, Any]]:
         except BaseException as e:
             _log(f"custom fetch error ({u}):", repr(e))
             _log(traceback.format_exc())
-            # переключаемся на следующее зеркало
             continue
     return []
 
@@ -311,7 +300,6 @@ def _fetch_from_legacy() -> List[Dict[str, Any]]:
     except BaseException as e:
         msg = repr(e)
         _log("legacy fetch error:", msg)
-        # Попытка http/insecure — только если явно разрешили
         if "CERTIFICATE_VERIFY_FAILED" in msg or isinstance(e, URLError):
             http_url = "http://" + url[len("https://"):] if url.startswith("https://") else url
             try:
@@ -429,27 +417,22 @@ def _build_from_sources() -> Tuple[List[Dict[str, Any]], str]:
     """
     Порядок: custom → remote snapshots → (опционально) legacy → local → лучший partial
     """
-    # 1) custom
     custom = _fetch_from_custom()
     if custom and len(custom) >= MIN_EXPECTED:
         return custom, "custom"
 
-    # 2) удалённые снапшоты
     rem = _fetch_remote_snapshots()
     if rem and len(rem) >= MIN_EXPECTED:
         return rem, "remote_snapshot"
 
-    # 3) legacy — только если явно включён
     leg = _fetch_from_legacy()
     if leg and len(leg) >= MIN_EXPECTED:
         return leg, "legacy"
 
-    # 4) локальный снапшот (может быть мал/устаревшим, но лучше нуля)
     loc = _fetch_local_snapshot()
     if loc and len(loc) > 0:
         return loc, "local"
 
-    # 5) хоть что-то частичное
     best = custom if len(custom) >= len(rem) else rem
     if len(leg) > len(best): best = leg
     if len(loc) > len(best): best = loc
@@ -543,6 +526,48 @@ def find_player_by_name(query: str) -> List[Dict[str, Any]]:
             res.append(p)
     return res
 
+# ===== compatibility shim for older code paths (used by api/telegram.py) =====
+_SIZE_DIR_RE = re.compile(r"(/headshots/nba/latest/)(\d+x\d+)(/)")
+
+def ensure_headshot_png(obj: Any, size: Optional[str] = None, default: str = "") -> str:
+    """
+    Return a PNG headshot URL for a player.
+    - obj: dict {photo, personId} or a personId (str/int).
+    - size: optional "WxH" like "260x190"; if None keeps existing size.
+    - default: fallback URL if personId is missing and no photo is available.
+    """
+    pid: str = ""
+    url: str = ""
+
+    if isinstance(obj, dict):
+        pid = _safe_str(obj.get("personId") or "")
+        url = _safe_str(obj.get("photo") or "")
+    else:
+        pid = _safe_str(obj)
+        url = ""
+
+    if not url and pid:
+        url = PHOTO_FMT.format(personId=pid)
+
+    if not url:
+        return default or ""
+
+    if url.startswith("//"):
+        url = "https:" + url
+
+    base = url.split("?", 1)[0].split("#", 1)[0]
+    if not base.lower().endswith(".png"):
+        if pid:
+            base = f"https://cdn.nba.com/headshots/nba/latest/{size or '1040x760'}/{pid}.png"
+        else:
+            if not base.lower().endswith(".png"):
+                return default or base
+
+    if size:
+        base = _SIZE_DIR_RE.sub(rf"\1{size}\3", base)
+
+    return base
+
 # Совместимость
 def players_count(force_refresh: bool = False) -> int:
     return len(get_players(force_refresh=force_refresh))
@@ -555,17 +580,14 @@ def players_index(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
 
 __all__ = [
     "get_players", "get_players_index", "refresh_players", "drop_players_cache",
-    "find_player_by_name", "players_count", "players", "players_index"
+    "find_player_by_name", "players_count", "players", "players_index",
+    "ensure_headshot_png",
 ]
 
 # ============================= self-test =============================
 if __name__ == "__main__":
     try:
         n = players_count(force_refresh=True)
-        src = "unknown"
-        # Попробуем подсмотреть последний лог source из кеша
-        if _CACHED.get("players"):
-            src = "memory"
         print(f"[players] SELFTEST: count={n}, cache={'hit' if _CACHED.get('players') else 'miss'}")
     except Exception as e:
         print("[players] SELFTEST ERROR:", repr(e))
