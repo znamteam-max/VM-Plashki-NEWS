@@ -195,27 +195,50 @@ def _load_logo_img(team_id: str) -> Optional[Image.Image]:
     return None
 
 def _load_head_img(person_id: str) -> Image.Image:
-    # сначала пробуем нормальные варианты через ваш data.py
+    # 1) безопасный вызов без timeout
     try:
-        pth = ensure_headshot_png(person_id, timeout=12)  # ужимаем таймаут
+        pth = ensure_headshot_png(person_id)  # не передаём timeout
         if pth and os.path.exists(pth):
             return Image.open(pth).convert("RGBA")
+    except TypeError:
+        # на всякий случай если сигнатура другая — пробуем ещё раз без аргументов
+        try:
+            pth = ensure_headshot_png(person_id)
+            if pth and os.path.exists(pth):
+                return Image.open(pth).convert("RGBA")
+        except Exception as e:
+            _log("headshot ensure (fallback) err", person_id, e)
     except Exception as e:
         _log("headshot ensure err", person_id, e)
-    # запасной вариант — любой найденный файл
+
+    # 2) варианты, могут быть None — аккуратно
     try:
-        pths = open_headshot_variants(person_id)
-        for p in pths:
-            if os.path.exists(p):
-                return Image.open(p).convert("RGBA")
+        variants = open_headshot_variants(person_id) or []
+        for p in variants:
+            try:
+                if p and os.path.exists(p):
+                    return Image.open(p).convert("RGBA")
+            except Exception:
+                continue
     except Exception as e:
         _log("headshot variants err", person_id, e)
-    # плейсхолдер
+
+    # 3) последний шанс — cdn.nba.com (не кешируем, просто пробуем)
+    try:
+        import io
+        url = f"https://cdn.nba.com/headshots/nba/latest/1040x760/{person_id}.png"
+        req = UrlRequest(url, headers={"User-Agent":"Mozilla/5.0"}, method="GET")
+        with urlopen(req, timeout=8) as r:
+            data = r.read()
+        return Image.open(io.BytesIO(data)).convert("RGBA")
+    except Exception as e:
+        _log("headshot cdn err", person_id, e)
+
+    # 4) плейсхолдер, чтобы карточка всё равно собралась
     try:
         return Image.open(PLACEHOLDER_HEAD).convert("RGBA")
-    except:
-        # минимальный прозрачный
-        return Image.new("RGBA", (512,512), (0,0,0,0))
+    except Exception:
+        return Image.new("RGBA", (512, 512), (0, 0, 0, 0))
 
 def _status(chat_id: int, text_html: str, reply_to: Optional[int]=None) -> Optional[int]:
     # посылаем "курсивом" как просили
@@ -265,15 +288,26 @@ def _find_best_player(query: str) -> Optional[Dict[str, Any]]:
     cands.sort(key=lambda p: (not p.get("isActive", True), p.get("lastName",""), p.get("firstName","")))
     return cands[0]
 
-def _ensure_colors(team_id: str) -> Tuple[str,str,str]:
+def _ensure_colors(team_id: str) -> Tuple[str, str, str]:
+    """
+    Универсально приводим бренд к (primary, dark, light).
+    Поддерживаем и dict, и tuple/list.
+    """
     brand = get_team_brand(team_id)
-    if not brand:
-        return ("#007ACC", "#005A99", "#78C3FF")  # синий дефолт
-    # brand: {"primary":"#...", "dark":"#...", "light":"#..."}
-    primary = brand.get("primary") or "#007ACC"
-    dark    = brand.get("dark")    or primary
-    light   = brand.get("light")   or primary
-    return (primary, dark, light)
+    # tuple/list -> (p, d, l)
+    if isinstance(brand, (tuple, list)):
+        p = str(brand[0]) if len(brand) > 0 else "#007ACC"
+        d = str(brand[1]) if len(brand) > 1 else p
+        l = str(brand[2]) if len(brand) > 2 else p
+        return (p, d, l)
+    # dict -> берём ключи, подставляем дефолты
+    if isinstance(brand, dict):
+        p = brand.get("primary") or "#007ACC"
+        d = brand.get("dark")    or p
+        l = brand.get("light")   or p
+        return (p, d, l)
+    # ничего не пришло
+    return ("#007ACC", "#005A99", "#78C3FF")
 
 # ------------------- маршруты -------------------
 @app.get("/api/telegram")
