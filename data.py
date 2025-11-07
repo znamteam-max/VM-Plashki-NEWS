@@ -1,4 +1,4 @@
-# data.py — merge normalized+passthrough, search, headshots, team logos, RU-overrides
+# data.py — merge normalized+passthrough, search, headshots, team logos, RU-overrides (with force_refresh)
 from __future__ import annotations
 import os, json, time, io, re, base64, threading
 from typing import Any, Dict, List, Optional, Tuple
@@ -6,14 +6,13 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 from PIL import Image
 
-# опционально используем team_brand для поиска пути логотипа
+# опционально используем team_brand для пути логотипа
 try:
-    from team_brand import get_team_logo_path  # не обязателен, есть наш резервный поиск ниже
+    from team_brand import get_team_logo_path  # optional
 except Exception:
     get_team_logo_path = None  # type: ignore
 
 # -------------------------- ENV --------------------------
-
 ENV = os.environ.get
 PLAYERS_USE_CUSTOM      = (ENV("PLAYERS_USE_CUSTOM", "1") == "1")
 PLAYERS_CUSTOM_URLS_RAW = ENV("PLAYERS_CUSTOM_URLS", "") or ENV("PLAYERS_CUSTOM_URL", "")
@@ -37,14 +36,13 @@ ASSETS_DIR = os.path.join(ROOT_DIR, "assets")
 OV_LOCAL_DEFAULT = os.path.join(ASSETS_DIR, "players_overrides_default.json")
 OV_LOCAL_TMP     = "/tmp/players_overrides.json"
 
-# где искать логотипы локально (как ты и писал: assets/cache — реальные логотипы)
+# где искать логотипы локально
 TEAM_LOGO_DIRS = [
     os.path.join(ASSETS_DIR, "cache"),
     os.path.join(ASSETS_DIR, "teams"),
 ]
 
 # -------------------------- STATE --------------------------
-
 _LOCK = threading.RLock()
 _PLAYERS: List[Dict[str, Any]] = []
 _INDEX_BY_ID: Dict[str, Dict[str, Any]] = {}
@@ -53,7 +51,6 @@ _LAST_SOURCE_URL: str = "none"
 _OVERRIDES: Dict[str, Any] = {}
 
 # -------------------------- UTILS --------------------------
-
 def _log(*a: Any) -> None:
     try: print("[data]", *a, flush=True)
     except: pass
@@ -61,7 +58,13 @@ def _log(*a: Any) -> None:
 def _http_json(url: str, timeout: int = PLAYERS_CUSTOM_TIMEOUT) -> Any:
     req = Request(url, headers={"User-Agent": "VM-Plashki/1.0"})
     with urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+        text = r.read().decode("utf-8", "ignore")
+    try:
+        return json.loads(text)
+    except Exception:
+        # если вдруг вернулся не-JSON — не роняемся
+        _log("json decode error:", url, "payload head:", text[:120])
+        return None
 
 def _http_bytes(url: str, timeout: int = 20) -> Optional[bytes]:
     try:
@@ -89,7 +92,6 @@ def _split_urls(raw: str) -> List[str]:
     return out
 
 # -------------------------- OVERRIDES --------------------------
-
 def _read_json(path: str) -> Any:
     if not os.path.exists(path): return None
     try:
@@ -248,9 +250,10 @@ def overrides_push_to_github(commit_msg: str = "update overrides", author: str =
         return False
 
 # -------------------------- PARSERS --------------------------
-
 def _parse_normalized(payload: Any) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(payload, (list, dict)):
+        return out
     items: List[Dict[str, Any]] = []
     if isinstance(payload, list):
         items = payload
@@ -269,6 +272,8 @@ def _parse_normalized(payload: Any) -> Dict[str, Dict[str, Any]]:
 
 def _parse_passthrough(payload: Any) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(payload, (list, dict)):
+        return out
     items: List[Dict[str, Any]] = []
     if isinstance(payload, list):
         items = payload
@@ -307,7 +312,7 @@ def _merge_players(nz: Dict[str, Dict[str, Any]], pt: Dict[str, Dict[str, Any]])
         if not headshot:
             headshot = f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png"
         person["headshot_url"] = headshot
-        disp = person.get("displayName") or f"{person.get('firstName','').strip()} {person.get('lastName','').strip()}".strip()
+        disp = (person.get("displayName") or f"{person.get('firstName','').strip()} {person.get('lastName','').strip()}").strip()
         person["displayName"] = disp or pid
         # override teamId из overrides (если есть)
         ov_team = overrides_get_team(pid)
@@ -332,6 +337,8 @@ def _fetch_custom_players() -> Tuple[List[Dict[str, Any]], str]:
         for u in urls:
             try:
                 j = _http_json(u, timeout=PLAYERS_CUSTOM_TIMEOUT)
+                if j is None:
+                    continue
                 lo = u.lower()
                 if "format=normalized" in lo or "normalized" in lo:
                     part = _parse_normalized(j)
@@ -358,28 +365,47 @@ def _fetch_custom_players() -> Tuple[List[Dict[str, Any]], str]:
     return players, last_ok
 
 # -------------------------- PUBLIC API --------------------------
-
 def refresh_players() -> Tuple[int, str]:
     """Обновляет пул игроков; возвращает (count, source_url)."""
     global _PLAYERS, _INDEX_BY_ID, _LAST_REFRESH_TS, _LAST_SOURCE_URL
     with _LOCK:
         if PLAYERS_USE_CUSTOM:
             players, src = _fetch_custom_players()
-            _PLAYERS = players
-            _INDEX_BY_ID = {str(p.get("personId")): p for p in _PLAYERS}
+            _PLAYERS = players if isinstance(players, list) else []
+            _INDEX_BY_ID = {str(p.get("personId")): p for p in _PLAYERS if isinstance(p, dict)}
             _LAST_REFRESH_TS = _now()
-            _LAST_SOURCE_URL = src
-            _log("final players count:", len(_PLAYERS), "(source=custom)", "url:", src)
-            return len(_PLAYERS), src
+            _LAST_SOURCE_URL = src if isinstance(src, str) else "custom"
+            _log("final players count:", len(_PLAYERS), "(source=custom)", "url:", _LAST_SOURCE_URL)
+            return len(_PLAYERS), _LAST_SOURCE_URL
         else:
             _PLAYERS, _INDEX_BY_ID = [], {}
             _LAST_REFRESH_TS = _now()
             _LAST_SOURCE_URL = "none"
             return 0, "none"
 
-def get_players() -> List[Dict[str, Any]]:
+def get_players(force_refresh: bool = False) -> List[Dict[str, Any]]:
+    """Вернёт список игроков; при force_refresh=True сделает refresh перед возвратом."""
+    if force_refresh:
+        try:
+            refresh_players()
+        except Exception as e:
+            _log("refresh on get_players failed:", repr(e))
     with _LOCK:
         return list(_PLAYERS)
+
+def ensure_players(min_count: int = 1) -> Tuple[bool, int]:
+    """Гарантирует наличие игроков (минимум min_count). Возвращает (ready, count)."""
+    with _LOCK:
+        cnt = len(_PLAYERS)
+    if cnt >= min_count:
+        return True, cnt
+    try:
+        refresh_players()
+    except Exception as e:
+        _log("ensure failed:", repr(e))
+    with _LOCK:
+        cnt2 = len(_PLAYERS)
+    return (cnt2 >= min_count), cnt2
 
 def players_ready() -> bool:
     with _LOCK:
@@ -388,7 +414,8 @@ def players_ready() -> bool:
 def get_player_by_id(person_id: str) -> Optional[Dict[str, Any]]:
     pid = _norm_id(person_id)
     with _LOCK:
-        return _INDEX_BY_ID.get(pid)
+        p = _INDEX_BY_ID.get(pid)
+    return p if isinstance(p, dict) else None
 
 def _norm(s: str) -> str:
     s = (s or "").strip().lower()
@@ -415,6 +442,8 @@ def find_player_by_name(query: str, limit: int = 10) -> List[Dict[str, Any]]:
         pool = list(_PLAYERS)
     scored: List[Tuple[int, Dict[str, Any]]] = []
     for p in pool:
+        if not isinstance(p, dict):  # защита от случайных типов
+            continue
         score = 0
         for v in _player_name_variants(p):
             if v == q: score = max(score, 3)
@@ -439,7 +468,6 @@ def display_name_for(p: Dict[str, Any]) -> str:
     return full or pid
 
 # -------------------------- IMAGES: HEADSHOTS + TEAM LOGOS --------------------------
-
 _IMG_CACHE_DIR = "/tmp/img_cache"
 os.makedirs(_IMG_CACHE_DIR, exist_ok=True)
 
@@ -526,14 +554,13 @@ def ensure_team_logo_png(team_id: Any, timeout: int = 10) -> Optional[Image.Imag
     """
     Возвращает PIL.Image (RGBA) логотипа *локально*.
     Сначала ищет файл в assets/cache и assets/teams, кэширует копию в /tmp.
-    Никаких сетевых загрузок здесь не делаем (логотипы у тебя локальные).
+    Никаких сетевых загрузок здесь не делаем.
     """
     tid = _norm_id(team_id)
     if not tid or tid == "0":
         return None
 
     cache_path = _img_cache_path(f"logo_{tid}.png")
-    # свежий кэш
     if os.path.exists(cache_path):
         try:
             if _now() - os.path.getmtime(cache_path) <= IMG_CACHE_TTL_SEC:
@@ -553,7 +580,6 @@ def ensure_team_logo_png(team_id: Any, timeout: int = 10) -> Optional[Image.Imag
         return None
 
 # -------------------------- INIT --------------------------
-
 try:
     _load_overrides()
 except Exception as e:
