@@ -1,6 +1,5 @@
-# api/telegram.py — рендер сразу после выбора цвета; ForceReply без «мусора»,
-# нечувствительный поиск (регистр + ё/е), статистика с выражениями (3/5, "3 из 5"),
-# cardS правая панель, card2 рендерится сразу.
+# api/telegram.py — сразу рендер после выбора цвета; ForceReply без мусора, имя жирным;
+# расширенный парсер статов: (3 из 5), "3 из 5", 3/5; добавлены синонимы трёшек.
 from __future__ import annotations
 import os, io, re, json, time, unicodedata, uuid, html
 from typing import Any, Dict, List, Optional, Tuple
@@ -134,7 +133,6 @@ def _tg_send_png_as_document(chat_id: int, png_bytes: bytes, filename: str="card
 PLAYERS_READY = False
 
 def _normalize(s: str) -> str:
-    # регистр + диакритика + ё->е
     s = (s or "").strip().lower()
     s = s.replace("ё", "е")
     s = unicodedata.normalize("NFKD", s)
@@ -143,17 +141,23 @@ def _normalize(s: str) -> str:
     s = "".join(ch for ch in s if ch in keep)
     return " ".join(s.split())
 
+# расширенная карта «трёшек»
 STAT_TOKEN_MAP = {
     "очк":"ОЧКИ","передач":"ПЕРЕДАЧИ","подбор":"ПОДБОРЫ","блок":"БЛОКИ",
-    "стил":"ПЕРЕХВАТЫ","мин":"МИНУТЫ","трёх":"3-ОЧКОВЫЕ","трех":"3-ОЧКОВЫЕ",
-    "фол":"ФОЛЫ","потер":"ПОТЕРИ","дабл":"ДАБЛ-ДАБЛ","трипл":"ТРИПЛ-ДАБЛ",
+    "стил":"ПЕРЕХВАТЫ","мин":"МИНУТЫ","фол":"ФОЛЫ","потер":"ПОТЕРИ",
+    "дабл":"ДАБЛ-ДАБЛ","трипл":"ТРИПЛ-ДАБЛ",
+    # трёхочковые — разные формы
+    "трех": "3-ОЧКОВЫЕ", "трёх": "3-ОЧКОВЫЕ",
+    "треш": "3-ОЧКОВЫЕ", "трешк": "3-ОЧКОВЫЕ", "трешки": "3-ОЧКОВЫЕ",
+    "трёш": "3-ОЧКОВЫЕ", "трёшк": "3-ОЧКОВЫЕ", "трёшки": "3-ОЧКОВЫЕ",
+    "трехочков": "3-ОЧКОВЫЕ", "трёхочков": "3-ОЧКОВЫЕ",
+    "3-очков": "3-ОЧКОВЫЕ", "3 очк": "3-ОЧКОВЫЕ",
 }
 
 def _strip_quotes(s: str) -> str:
     s = s.strip()
     if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
         return s[1:-1].strip()
-    # «»
     if (s.startswith("«") and s.endswith("»")) or (s.startswith("“") and s.endswith("”")):
         return s[1:-1].strip()
     return s
@@ -161,18 +165,20 @@ def _strip_quotes(s: str) -> str:
 def parse_stats_list(raw: str) -> List[Tuple[str,str]]:
     """
     Поддерживает:
-      25 очков, 15 подборов, "3 из 5" трёхочковые
-      3/5 трёхочковые, 3 из 5 трёхочковые
+      25 очков, 15 подборов, "3 из 5" трёшки
+      (3 из 5) трёхочковые
+      3/5 трёшки
     """
     if not raw: return []
     parts = [p.strip() for p in raw.split(",") if p.strip()]
     out: List[Tuple[str,str]] = []
     for p in parts:
         p = _strip_quotes(p)
-        m = re.match(r"^\s*((?:\d+\s*из\s*\d+)|(?:\d+/\d+)|(?:\d+))\s*([^\d,]+)?", p, flags=re.IGNORECASE)
+        # допускаем скобки вокруг значения
+        m = re.match(r"^\s*\(?(?P<val>(?:\d+\s*из\s*\d+)|(?:\d+/\d+)|(?:\d+))\)?\s*(?P<label>[^\d,]+)?", p, flags=re.IGNORECASE)
         if not m: continue
-        val = m.group(1)
-        lbl_raw = (m.group(2) or "").strip().lower().replace("ё","е")
+        val = m.group("val")
+        lbl_raw = (m.group("label") or "").strip().lower().replace("ё","е")
         lbl = "СТАТ"
         for k,v in STAT_TOKEN_MAP.items():
             if k in lbl_raw:
@@ -200,7 +206,6 @@ def _search_players_loose(q: str) -> List[Dict[str,Any]]:
     qn = _normalize(q)
     ps = ensure_players_loaded(False)
     if not ps: return []
-    # сначала data.find_player_by_name (м.б. passthrough-алиасы)
     try:
         if find_player_by_name:
             hits = find_player_by_name(q)
@@ -312,14 +317,12 @@ def _finish_render_from_ctx(chat_id: int):
         _tg_send_message(chat_id, "Игроки не подгружены.")
         return
 
-    # найти игрока по pid
     cand = [p for p in players if str(p.get("personId")) == str(pid)]
     if not cand:
         _tg_send_message(chat_id, "Игрок не найден (pid).")
         return
     p = cand[0]
 
-    # имя RU
     ru_name = None
     try:
         if overrides_get_name_ru: ru_name = overrides_get_name_ru(str(pid))
@@ -327,32 +330,28 @@ def _finish_render_from_ctx(chat_id: int):
     if not ru_name:
         ru_name = display_name_for(p) if display_name_for else (p.get("displayName") or "")
 
-    # head / logo / colors
     head = _ensure_headshot_image(p)
     if not head:
         _tg_send_message(chat_id, "Не удалось получить фото игрока.")
         return
     colors, logo_img = _team_brand_tuple(team_id)
 
-    # рендер по шаблону
     try:
         _tg_send_chat_action(chat_id, "upload_document")
         if template in ("single","card"):
             png = render_card("single", ru_name, "", logo_img, colors, head, stats)
             _tg_send_png_as_document(chat_id, png, filename=f"card_{pid}.png")
             return
-        if template in ("cards","cardspecial","cards_"):  # cardS
+        if template in ("cards","cardspecial","cards_"):
             info = ctx.get("info") or ""
             png = render_card_special(ru_name, logo_img, colors, head, stats, info)
             _tg_send_png_as_document(chat_id, png, filename=f"cardS_{pid}.png")
             return
         if template in ("bad","cardbad"):
-            # BAD: логотип нужен тоже
             png = render_card_bad(ru_name, head, stats, team_logo_img=logo_img)
             _tg_send_png_as_document(chat_id, png, filename=f"card_bad_{pid}.png")
             return
         if template in ("card2","dual"):
-            # второй игрок
             name2 = ctx.get("name2") or ""
             stats2 = ctx.get("stats2") or []
             hits2 = _search_players_loose(name2) if name2 else []
@@ -379,7 +378,6 @@ def _finish_render_from_ctx(chat_id: int):
             _tg_send_png_as_document(chat_id, png, filename=f"card2_{pid}_{pid2}.png")
             return
 
-        # fallback — обычная
         png = render_card("single", ru_name, "", logo_img, colors, head, stats)
         _tg_send_png_as_document(chat_id, png, filename=f"card_{pid}.png")
     except Exception as e:
@@ -462,7 +460,7 @@ async def webhook_query(request: Request):
 
     ensure_players_loaded(False)
 
-    # callback: выбор цвета -> сразу рендер
+    # callback: выбор цвета -> рендер
     cb = update.get("callback_query")
     if cb and cb.get("data","").startswith("color:"):
         data = cb["data"].split(":")
@@ -478,8 +476,8 @@ async def webhook_query(request: Request):
                 _tg_answer_cbq(cb_id, "Цвет: авто")
                 _finish_render_from_ctx(chat_id)
             elif kind == "ask":
-                _tg_answer_cbq(cb_id, "Отправьте HEX в сообщении (например #1D428A) — ответом на следующее")
-                _tg_send_message(chat_id, "Пришлите HEX цвет, например #1D428A — в ответ на это сообщение.")
+                _tg_answer_cbq(cb_id, "Отправьте HEX")
+                _tg_send_message(chat_id, "Пришлите HEX цвет, например #1D428A — ответом на это сообщение.")
                 _save_json(os.path.join(CTX_DIR, f"await_hex_{chat_id}.json"), {"teamId": team_id})
         return PlainTextResponse("OK")
 
@@ -489,7 +487,7 @@ async def webhook_query(request: Request):
     chat_id = chat.get("id")
     text = (msg.get("text") or "").strip()
 
-    # сохранение HEX после "color:ask" и рендер
+    # HEX после запроса
     if text.startswith("#"):
         ctx_hex = _load_json(os.path.join(CTX_DIR, f"await_hex_{chat_id}.json"))
         if ctx_hex and set_team_primary_color:
@@ -501,7 +499,7 @@ async def webhook_query(request: Request):
             _finish_render_from_ctx(chat_id)
             return PlainTextResponse("OK")
 
-    # реплай на ForceReply (русское имя)
+    # ForceReply: русское имя
     rpl = msg.get("reply_to_message")
     if rpl and text:
         rtxt = (rpl.get("text") or "") + " " + (rpl.get("caption") or "")
@@ -519,7 +517,6 @@ async def webhook_query(request: Request):
                 except Exception as e:
                     _tg_send_message(chat_id, f"Не удалось сохранить имя: {repr(e)}")
                     return PlainTextResponse("OK")
-            # BAD — рендер сразу (без выбора цвета)
             if template.lower() in ("bad","cardbad"):
                 players = ensure_players_loaded(False)
                 p = next((pp for pp in players if str(pp.get("personId"))==str(pid)), None)
@@ -536,7 +533,6 @@ async def webhook_query(request: Request):
                 _tg_send_png_as_document(chat_id, png, filename=f"card_bad_{pid}.png")
                 return PlainTextResponse("OK")
             else:
-                # для остальных — выбор цвета
                 _save_json(os.path.join(CTX_DIR, f"last_ctx_{chat_id}.json"), ctx)
                 _ask_color_choice(chat_id, rpl.get("message_id"), ctx, [str(team_id)])
                 return PlainTextResponse("OK")
@@ -578,13 +574,12 @@ async def webhook_query(request: Request):
         pid = str(p.get("personId") or "")
         ru_name = None
         try:
-            if overrides_get_name_ru: ru = overrides_get_name_ru(pid); ru_name = ru
+            if overrides_get_name_ru: ru_name = overrides_get_name_ru(pid)
         except Exception: pass
         if not ru_name:
             ctx_extra = extra or {}
             _ask_russian_name(chat_id, msg.get("message_id"), p, stats, template, ctx_extra)
             return
-        # имя есть — сохраняем ctx и предлагаем цвет
         ctx = {"template": template, "stats": stats, "pid": pid, "teamId": str(p.get("teamId") or "0")}
         if extra: ctx.update(extra)
         _save_json(os.path.join(CTX_DIR, f"last_ctx_{chat_id}.json"), ctx)
