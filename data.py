@@ -1,4 +1,4 @@
-# data.py — merge normalized+passthrough, search, headshots, RU-overrides (с алиасами для telegram.py)
+# data.py — merge normalized+passthrough, search, headshots, team logos, RU-overrides
 from __future__ import annotations
 import os, json, time, io, re, base64, threading
 from typing import Any, Dict, List, Optional, Tuple
@@ -6,12 +6,18 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 from PIL import Image
 
+# опционально используем team_brand для поиска пути логотипа
+try:
+    from team_brand import get_team_logo_path  # не обязателен, есть наш резервный поиск ниже
+except Exception:
+    get_team_logo_path = None  # type: ignore
+
 # -------------------------- ENV --------------------------
 
 ENV = os.environ.get
 PLAYERS_USE_CUSTOM      = (ENV("PLAYERS_USE_CUSTOM", "1") == "1")
 PLAYERS_CUSTOM_URLS_RAW = ENV("PLAYERS_CUSTOM_URLS", "") or ENV("PLAYERS_CUSTOM_URL", "")
-PLAYERS_URL_FALLBACK    = ENV("PLAYERS_URL", "")  # если задан одиночный URL
+PLAYERS_URL_FALLBACK    = ENV("PLAYERS_URL", "")
 PLAYERS_SEASON          = ENV("PLAYERS_SEASON", "2025-26")
 PLAYERS_MIN_EXPECTED    = int(ENV("PLAYERS_MIN_EXPECTED", "350") or 350)
 PLAYERS_CUSTOM_TIMEOUT  = int(ENV("PLAYERS_CUSTOM_TIMEOUT", "25") or 25)
@@ -22,7 +28,7 @@ IMG_CACHE_TTL_SEC       = int(ENV("IMG_CACHE_TTL_SEC", "604800") or 604800)  # �
 
 # GitHub overrides (опционально)
 OV_GH_TOKEN  = (ENV("OVERRIDES_GH_TOKEN") or "").strip()
-OV_GH_REPO   = (ENV("OVERRIDES_GH_REPO")  or "").strip()          # RNGN/vm-plashki-news
+OV_GH_REPO   = (ENV("OVERRIDES_GH_REPO")  or "").strip()
 OV_GH_BRANCH = (ENV("OVERRIDES_GH_BRANCH") or "main").strip()
 OV_GH_PATH   = (ENV("OVERRIDES_GH_PATH")   or "assets/players_overrides.json").strip()
 
@@ -30,6 +36,12 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(ROOT_DIR, "assets")
 OV_LOCAL_DEFAULT = os.path.join(ASSETS_DIR, "players_overrides_default.json")
 OV_LOCAL_TMP     = "/tmp/players_overrides.json"
+
+# где искать логотипы локально (как ты и писал: assets/cache — реальные логотипы)
+TEAM_LOGO_DIRS = [
+    os.path.join(ASSETS_DIR, "cache"),
+    os.path.join(ASSETS_DIR, "teams"),
+]
 
 # -------------------------- STATE --------------------------
 
@@ -153,7 +165,7 @@ def overrides_set_name_ru(person_id: str, ru_name: str) -> bool:
         _log("override set ru_name error:", e)
         return False
 
-# Алиас под старое имя, которое зовёт telegram.py
+# алиас под старые импорты
 def overrides_save_name_ru(person_id: str, ru_name: str) -> bool:
     return overrides_set_name_ru(person_id, ru_name)
 
@@ -180,16 +192,15 @@ def overrides_set_team(person_id: str, team_id: str) -> bool:
         _log("override set team error:", e)
         return False
 
-# Алиас под старое имя
+# алиас под старые импорты
 def overrides_save_team(person_id: str, team_id: str) -> bool:
     return overrides_set_team(person_id, team_id)
 
 def overrides_push_to_github(commit_msg: str = "update overrides", author: str = "bot <bot@example.com>") -> bool:
-    """Опционально пушит /tmp overrides в GitHub, если заданы OV_GH_* переменные."""
     if not (OV_GH_TOKEN and OV_GH_REPO and OV_GH_PATH):
         return False
     try:
-        # 1) получить текущий sha файла
+        # получить текущий sha
         req = Request(
             f"https://api.github.com/repos/{OV_GH_REPO}/contents/{OV_GH_PATH}?ref={OV_GH_BRANCH}",
             headers={
@@ -202,17 +213,19 @@ def overrides_push_to_github(commit_msg: str = "update overrides", author: str =
             meta = json.loads(r.read().decode("utf-8"))
         sha = meta.get("sha") if isinstance(meta, dict) else None
 
-        # 2) контент
+        # новый контент
         raw = json.dumps(_OVERRIDES, ensure_ascii=False, indent=2).encode("utf-8")
         content_b64 = base64.b64encode(raw).decode("utf-8")
 
-        # 3) PUT
         payload = json.dumps({
             "message": commit_msg,
             "content": content_b64,
             "branch": OV_GH_BRANCH,
             **({"sha": sha} if sha else {}),
-            "committer": {"name": author.split("<")[0].strip(), "email": (author.split("<")[-1].strip(" >") if "<" in author else "bot@example.com")},
+            "committer": {
+                "name": author.split("<")[0].strip(),
+                "email": (author.split("<")[-1].strip(" >") if "<" in author else "bot@example.com")
+            },
         }).encode("utf-8")
 
         put = Request(
@@ -237,10 +250,6 @@ def overrides_push_to_github(commit_msg: str = "update overrides", author: str =
 # -------------------------- PARSERS --------------------------
 
 def _parse_normalized(payload: Any) -> Dict[str, Dict[str, Any]]:
-    """
-    Ожидается [{ "id":"201142", "photo":"https://..." }, ...] либо {"players":[...]}
-    Возвращает dict[id] = {personId, headshot_url}
-    """
     out: Dict[str, Dict[str, Any]] = {}
     items: List[Dict[str, Any]] = []
     if isinstance(payload, list):
@@ -259,9 +268,6 @@ def _parse_normalized(payload: Any) -> Dict[str, Dict[str, Any]]:
     return out
 
 def _parse_passthrough(payload: Any) -> Dict[str, Dict[str, Any]]:
-    """
-    Ожидается [{personId, firstName, lastName, teamId, isActive, photo}, ...] либо {"players":[...]}
-    """
     out: Dict[str, Dict[str, Any]] = {}
     items: List[Dict[str, Any]] = []
     if isinstance(payload, list):
@@ -303,7 +309,7 @@ def _merge_players(nz: Dict[str, Dict[str, Any]], pt: Dict[str, Dict[str, Any]])
         person["headshot_url"] = headshot
         disp = person.get("displayName") or f"{person.get('firstName','').strip()} {person.get('lastName','').strip()}".strip()
         person["displayName"] = disp or pid
-        # оверрайд teamId
+        # override teamId из overrides (если есть)
         ov_team = overrides_get_team(pid)
         if ov_team:
             person["teamId"] = ov_team
@@ -328,13 +334,13 @@ def _fetch_custom_players() -> Tuple[List[Dict[str, Any]], str]:
                 j = _http_json(u, timeout=PLAYERS_CUSTOM_TIMEOUT)
                 lo = u.lower()
                 if "format=normalized" in lo or "normalized" in lo:
-                    part = _parse_normalized(j); 
+                    part = _parse_normalized(j)
                     if part: normalized_acc.update(part); last_ok = u
                 elif "format=passthrough" in lo or "passthrough" in lo:
-                    part = _parse_passthrough(j); 
+                    part = _parse_passthrough(j)
                     if part: passthrough_acc.update(part); last_ok = u
                 else:
-                    # попытка угадать формат
+                    # попытка угадать
                     pt = _parse_passthrough(j)
                     nz = _parse_normalized(j)
                     if pt: passthrough_acc.update(pt); last_ok = u
@@ -351,7 +357,7 @@ def _fetch_custom_players() -> Tuple[List[Dict[str, Any]], str]:
     players = _merge_players(normalized_acc, passthrough_acc)
     return players, last_ok
 
-# -------------------------- PUBLIC API (бот ждёт эти имена) --------------------------
+# -------------------------- PUBLIC API --------------------------
 
 def refresh_players() -> Tuple[int, str]:
     """Обновляет пул игроков; возвращает (count, source_url)."""
@@ -432,7 +438,7 @@ def display_name_for(p: Dict[str, Any]) -> str:
     full = f"{first} {last}".strip()
     return full or pid
 
-# -------------------------- HEADSHOTS --------------------------
+# -------------------------- IMAGES: HEADSHOTS + TEAM LOGOS --------------------------
 
 _IMG_CACHE_DIR = "/tmp/img_cache"
 os.makedirs(_IMG_CACHE_DIR, exist_ok=True)
@@ -488,6 +494,63 @@ def ensure_headshot_png(player_or_id: Any, timeout: int = 20) -> Optional[Image.
             except Exception: pass
             return im
     return None
+
+def _find_logo_file(team_id: str) -> Optional[str]:
+    tid = _norm_id(team_id)
+    # 1) если есть team_brand.get_team_logo_path — используем
+    if callable(get_team_logo_path):
+        try:
+            p = get_team_logo_path(tid)
+            if p and os.path.exists(p):
+                return p
+        except Exception:
+            pass
+    # 2) прямой поиск по папкам
+    for d in TEAM_LOGO_DIRS:
+        p = os.path.join(d, f"{tid}.png")
+        if os.path.exists(p): return p
+    for d in TEAM_LOGO_DIRS:
+        try:
+            for fn in os.listdir(d):
+                if fn.lower().endswith(".png") and tid in fn:
+                    return os.path.join(d, fn)
+        except FileNotFoundError:
+            continue
+    # 3) generic
+    for d in TEAM_LOGO_DIRS:
+        gp = os.path.join(d, "generic.png")
+        if os.path.exists(gp): return gp
+    return None
+
+def ensure_team_logo_png(team_id: Any, timeout: int = 10) -> Optional[Image.Image]:
+    """
+    Возвращает PIL.Image (RGBA) логотипа *локально*.
+    Сначала ищет файл в assets/cache и assets/teams, кэширует копию в /tmp.
+    Никаких сетевых загрузок здесь не делаем (логотипы у тебя локальные).
+    """
+    tid = _norm_id(team_id)
+    if not tid or tid == "0":
+        return None
+
+    cache_path = _img_cache_path(f"logo_{tid}.png")
+    # свежий кэш
+    if os.path.exists(cache_path):
+        try:
+            if _now() - os.path.getmtime(cache_path) <= IMG_CACHE_TTL_SEC:
+                return Image.open(cache_path).convert("RGBA")
+        except Exception:
+            pass
+
+    src = _find_logo_file(tid)
+    if not src:
+        return None
+    try:
+        im = Image.open(src).convert("RGBA")
+        try: im.save(cache_path, "PNG")
+        except Exception: pass
+        return im
+    except Exception:
+        return None
 
 # -------------------------- INIT --------------------------
 
