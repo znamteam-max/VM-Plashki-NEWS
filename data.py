@@ -1,7 +1,7 @@
 # data.py
 from __future__ import annotations
-import os, io, json, time, base64, unicodedata, mimetypes, re
-from typing import Any, Dict, List, Optional, Tuple
+import os, io, json, base64, unicodedata
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 from urllib.request import Request as UrlRequest, urlopen as http_urlopen
 from urllib.error import HTTPError, URLError
 
@@ -57,8 +57,8 @@ def _http_get(url: str, timeout: int = TIMEOUT) -> Optional[bytes]:
         return None
 
 def _try_fetch(url: str) -> Optional[Any]:
-    last_err = None
-    for i in range(max(1, ATTEMPTS)):
+    last_err: Optional[Exception] = None
+    for _ in range(max(1, ATTEMPTS)):
         raw = _http_get(url, timeout=TIMEOUT)
         if not raw:
             continue
@@ -88,7 +88,7 @@ def display_name_for(p: Dict[str, Any]) -> str:
     return (first + " " + last).strip()
 
 # ------------------ PLAYERS CACHE ------------------
-_PLAYERS: List[Dict[str, Any]] = []  # объединённый пул
+_PLAYERS: List[Dict[str, Any]] = []  # объединённый пул (мердж PT+NORM)
 
 def _index_by_pid(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
@@ -125,106 +125,188 @@ def _classify_urls() -> Tuple[List[str], List[str]]:
     _log("norm_urls:", norm)
     return pt, norm
 
+# ------------------ GENERIC EXTRACT HELPERS ------------------
+def _row_from_headers(headers: List[str], row: List[Any]) -> Dict[str, Any]:
+    hmap = {h.upper(): i for i, h in enumerate(headers or [])}
+    def at(key: str) -> Any:
+        i = hmap.get(key)
+        return row[i] if (i is not None and 0 <= i < len(row)) else None
+
+    pid  = at("PERSON_ID") or at("PLAYER_ID") or at("ID")
+    first= at("FIRST_NAME") or ""
+    last = at("LAST_NAME")  or ""
+    dn   = at("DISPLAY_FIRST_LAST") or at("PLAYER") or ""
+    team = at("TEAM_ID") or at("TEAMID") or at("TEAM") or "0"
+
+    # Подчистим
+    try: team = str(int(team))
+    except: team = str(team or "0")
+
+    # Если имени нет – попытаться разобрать DISPLAY_FIRST_LAST
+    if (not first or not last) and isinstance(dn, str) and dn.strip():
+        parts = dn.strip().split()
+        if len(parts) >= 2:
+            first = first or parts[0]
+            last  = last  or " ".join(parts[1:])
+
+    return {
+        "personId": str(pid or "").strip(),
+        "firstName": (first or "").strip(),
+        "lastName":  (last or "").strip(),
+        "displayName": (str(dn or "").strip() or f"{first} {last}".strip()),
+        "teamId": team,
+    }
+
+def _iter_records(obj: Any) -> Iterable[Dict[str, Any]]:
+    """
+    Универсальный итератор по «похожим на игрока» объектам.
+    Возвращает уже нормализованные словари с personId/first/last/displayName/teamId.
+    Поддерживает:
+      - простые списки словарей
+      - {"league":{"standard":[...]}}
+      - {"players":[...]}, {"athletes":[...]} и др.
+      - {"headers":[...], "rowSet":[...]}
+      - {"resultSets":[{headers,rowSet}, ...]} / {"resultSet":{headers,rowSet}}
+      - произвольные словари с values=list
+    """
+    # Вариант: уже список словарей
+    if isinstance(obj, list):
+        for r in obj:
+            if isinstance(r, dict):
+                yield _coerce_player_dict(r)
+        return
+
+    if not isinstance(obj, dict):
+        return
+
+    # headers + rowSet
+    hdrs = obj.get("headers")
+    rows = obj.get("rowSet") or obj.get("rows")
+    if isinstance(hdrs, list) and isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, list):
+                rec = _row_from_headers(hdrs, row)
+                if rec.get("personId"):
+                    yield rec
+
+    # resultSets / resultSet
+    rs = obj.get("resultSets") or obj.get("resultSet")
+    if isinstance(rs, list):
+        for block in rs:
+            if isinstance(block, dict):
+                h2 = block.get("headers")
+                r2 = block.get("rowSet") or block.get("rows")
+                if isinstance(h2, list) and isinstance(r2, list):
+                    for row in r2:
+                        if isinstance(row, list):
+                            rec = _row_from_headers(h2, row)
+                            if rec.get("personId"):
+                                yield rec
+    elif isinstance(rs, dict):
+        h2 = rs.get("headers")
+        r2 = rs.get("rowSet") or rs.get("rows")
+        if isinstance(h2, list) and isinstance(r2, list):
+            for row in r2:
+                if isinstance(row, list):
+                    rec = _row_from_headers(h2, row)
+                    if rec.get("personId"):
+                        yield rec
+
+    # лига
+    league = obj.get("league")
+    if isinstance(league, dict):
+        for key in ("standard","vegas","africa","sacramento"):
+            v = league.get(key)
+            if isinstance(v, list):
+                for r in v:
+                    if isinstance(r, dict):
+                        yield _coerce_player_dict(r)
+
+    # заведомые ключи
+    for key in ("players","athletes","items","data","result","roster"):
+        v = obj.get(key)
+        if isinstance(v, list):
+            for r in v:
+                if isinstance(r, dict):
+                    yield _coerce_player_dict(r)
+        elif isinstance(v, dict):
+            # иногда data:{headers,rowSet} или data:{items:[...] }
+            for rec in _iter_records(v):
+                yield rec
+
+    # общий перебор словаря — ищем любые list[dict]
+    for v in obj.values():
+        if isinstance(v, list):
+            for r in v:
+                if isinstance(r, dict):
+                    yield _coerce_player_dict(r)
+
+def _coerce_player_dict(r: Dict[str, Any]) -> Dict[str, Any]:
+    pid  = r.get("personId") or r.get("id") or r.get("playerId") or r.get("PLAYER_ID") or r.get("PERSON_ID")
+    first= r.get("firstName") or r.get("firstname") or r.get("FIRST_NAME")
+    last = r.get("lastName")  or r.get("lastname")  or r.get("LAST_NAME")
+    dn   = r.get("displayName") or r.get("name") or r.get("fullName") or r.get("DISPLAY_FIRST_LAST")
+    team = r.get("teamId") or r.get("team_id") or r.get("TEAM_ID") or r.get("team") or "0"
+
+    # team может быть dict
+    if isinstance(team, dict):
+        team = team.get("id") or team.get("teamId") or "0"
+
+    # подчистим
+    try: team = str(int(team))
+    except: team = str(team or "0")
+
+    # DN из first/last
+    if not dn:
+        dn = f"{first or ''} {last or ''}".strip()
+
+    return {
+        "personId": str(pid or "").strip(),
+        "firstName": (first or "").strip(),
+        "lastName":  (last or "").strip(),
+        "displayName": (dn or "").strip(),
+        "teamId": team,
+        # перекинем возможные поля с урлами головы (пусть останутся для подсказки)
+        "headshotURL": r.get("headshot") or r.get("img") or r.get("HEADSHOT") or None,
+    }
+
 # ------------------ EXTRACTORS ------------------
 def _extract_normalized(j: Any) -> List[Dict[str, Any]]:
-    """
-    Стандартизируем под формат: personId, firstName, lastName, displayName, teamId
-    normalized может НЕ содержать имен — тогда оставим пустыми, headshot дотащим по pid.
-    """
     rows: List[Dict[str, Any]] = []
-    if isinstance(j, list):
-        src = j
-    elif isinstance(j, dict):
-        # возможные корни
-        for key in ("players","data","items","result"):
-            if isinstance(j.get(key), list):
-                src = j[key]
-                break
-        else:
-            src = []
-    else:
-        src = []
-
-    for r in src:
-        pid = str(r.get("personId") or r.get("id") or "").strip()
-        if not pid: 
-            continue
-        first = (r.get("firstName") or "").strip()
-        last  = (r.get("lastName") or "").strip()
-        dn    = (r.get("displayName") or "").strip() or (first + " " + last).strip()
-        team  = r.get("teamId")
-        try: team = str(int(team))
-        except: team = str(team or "0")
-
-        rows.append({
-            "personId": pid,
-            "firstName": first,
-            "lastName": last,
-            "displayName": dn,
-            "teamId": team,
-            # подсказочный URL головы если есть
-            "headshotURL": r.get("headshot") or r.get("img") or f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png",
-        })
+    if j is None:
+        return rows
+    # normalized обычно уже плоский список; но прогоним универсальный итератор
+    for rec in _iter_records(j):
+        # у normalized часто нет имён — оставим как есть, headshot подсказка важна
+        if rec.get("personId"):
+            # гарантируем headshot fallback
+            if not rec.get("headshotURL"):
+                pid = rec["personId"]
+                rec["headshotURL"] = f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png"
+            rows.append(rec)
     return rows
 
 def _extract_passthrough(j: Any) -> List[Dict[str, Any]]:
-    """
-    Любой богатый источник (ESPN/stats) — важны personId, имя, команда.
-    """
     rows: List[Dict[str, Any]] = []
-
-    def push(pid, first, last, dn, team):
-        if not pid: 
-            return
-        try: team = str(int(team))
-        except: team = str(team or "0")
-        rows.append({
-            "personId": str(pid),
-            "firstName": (first or "").strip(),
-            "lastName": (last or "").strip(),
-            "displayName": (dn or "").strip() or (f"{first} {last}".strip()),
-            "teamId": team,
-        })
-
-    if isinstance(j, list):
-        src = j
-    elif isinstance(j, dict):
-        for key in ("players","athletes","data","items","result","roster"):
-            v = j.get(key)
-            if isinstance(v, list):
-                src = v
-                break
-        else:
-            src = []
-    else:
-        src = []
-
-    for r in src:
-        pid  = r.get("personId") or r.get("id") or r.get("playerId")
-        first= r.get("firstName") or r.get("firstname") or r.get("first_name")
-        last = r.get("lastName")  or r.get("lastname")  or r.get("last_name")
-        dn   = r.get("displayName") or r.get("name") or r.get("fullName")
-        team = r.get("teamId") or r.get("team_id") or r.get("team") or "0"
-        # иногда team — dict
-        if isinstance(team, dict):
-            team = team.get("id") or team.get("teamId") or "0"
-        push(pid, first, last, dn, team)
-
+    if j is None:
+        return rows
+    for rec in _iter_records(j):
+        if rec.get("personId"):
+            rows.append(rec)
     return rows
 
 # ------------------ MERGE ------------------
 def _merge_pt_norm(pt: List[Dict[str, Any]], norm: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Приоритет: имена/команды — из PT, headshot/стабильные pid — из NORM.
+    Приоритет: имена/команды — из PT, headshot — из NORM.
     """
     ix_norm = _index_by_pid(norm)
     out: List[Dict[str, Any]] = []
     seen: set[str] = set()
 
-    # Сначала те, кто есть в passthrough — богаче именами
     for p in pt:
         pid = str(p.get("personId") or "")
-        if not pid: 
+        if not pid:
             continue
         base = dict(p)
         if pid in ix_norm:
@@ -232,9 +314,8 @@ def _merge_pt_norm(pt: List[Dict[str, Any]], norm: List[Dict[str, Any]]) -> List
         out.append(base)
         seen.add(pid)
 
-    # Затем «чистые» normalized, которых не было в pt
     for pid, n in ix_norm.items():
-        if pid in seen: 
+        if pid in seen:
             continue
         out.append(dict(n))
     return out
@@ -246,11 +327,9 @@ def _merge_into_cache(rows: List[Dict[str, Any]]) -> None:
     changed = False
     for r in rows:
         pid = str(r.get("personId") or "")
-        if not pid: 
-            continue
+        if not pid: continue
         if pid in ix:
             dst = ix[pid]
-            # обновляем только полезное
             for k in ("displayName","firstName","lastName","teamId","headshotURL"):
                 v = r.get(k)
                 if v:
@@ -264,7 +343,7 @@ def _merge_into_cache(rows: List[Dict[str, Any]]) -> None:
 # ------------------ REFRESH / ACCESSORS ------------------
 def refresh_players() -> Tuple[int, str]:
     """
-    Возвращает (count, src_text). src_text: "custom" | "merged(pt+norm)" | "norm" | "pt" | "none"
+    Возвращает (count, src_text). src_text: "merged(pt+norm)" | "pt" | "norm" | "none"
     """
     global _PLAYERS
     pt_urls, norm_urls = _classify_urls()
@@ -274,7 +353,7 @@ def refresh_players() -> Tuple[int, str]:
     for u in pt_urls:
         j = _try_fetch(u)
         cnt = 0
-        if j:
+        if j is not None:
             pt_rows = _extract_passthrough(j)
             cnt = len(pt_rows)
         _log("pt parsed:", cnt, "from", u)
@@ -285,15 +364,18 @@ def refresh_players() -> Tuple[int, str]:
     if not pt_rows and PLAYERS_JSON_URL:
         _log("fallback PLAYERS_JSON_URL:", PLAYERS_JSON_URL)
         j = _try_fetch(PLAYERS_JSON_URL)
-        if j:
-            pt_rows = _extract_passthrough(j) or _extract_normalized(j)
+        if j is not None:
+            # пробуем как PT, затем как NORM
+            pt_rows = _extract_passthrough(j)
+            if not pt_rows:
+                pt_rows = _extract_normalized(j)
         _log("PLAYERS_JSON_URL parsed:", len(pt_rows))
 
     # 3) DEFAULT_PT fallback
     if not pt_rows and DEFAULT_PT:
         _log("fallback DEFAULT_PT:", DEFAULT_PT)
         j = _try_fetch(DEFAULT_PT)
-        if j:
+        if j is not None:
             pt_rows = _extract_passthrough(j)
         _log("DEFAULT_PT parsed:", len(pt_rows))
 
@@ -302,7 +384,7 @@ def refresh_players() -> Tuple[int, str]:
     for u in norm_urls:
         j = _try_fetch(u)
         cnt = 0
-        if j:
+        if j is not None:
             norm_rows = _extract_normalized(j)
             cnt = len(norm_rows)
         _log("norm parsed:", cnt, "from", u)
@@ -310,21 +392,19 @@ def refresh_players() -> Tuple[int, str]:
             break
 
     # 5) Сшиваем
-    final_rows: List[Dict[str, Any]] = []
-    src_label = "none"
     if pt_rows and norm_rows:
-        final_rows = _merge_pt_norm(pt_rows, norm_rows)
+        _PLAYERS = _merge_pt_norm(pt_rows, norm_rows)
         src_label = "merged(pt+norm)"
     elif pt_rows:
-        final_rows = pt_rows
+        _PLAYERS = pt_rows
         src_label = "pt"
     elif norm_rows:
-        final_rows = norm_rows
+        _PLAYERS = norm_rows
         src_label = "norm"
     else:
-        final_rows = []
+        _PLAYERS = []
+        src_label = "none"
 
-    _PLAYERS = final_rows
     _log(f"final players count: {len(_PLAYERS)} (source={src_label})")
     return len(_PLAYERS), src_label
 
@@ -336,13 +416,16 @@ def get_players(force_refresh: bool = False) -> List[Dict[str, Any]]:
 
 # ------------------ SEARCH ------------------
 def _online_find_in_passthrough(q: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    При пустом локальном кеше имён идём прямо в PT-URL и парсим «по месту».
+    """
     qn = _normalize_name(q)
     if not qn: return []
     pt_urls, _ = _classify_urls()
     results: List[Dict[str, Any]] = []
     for u in pt_urls:
         j = _try_fetch(u)
-        if not j: 
+        if not j:
             continue
         rows = _extract_passthrough(j)
         for r in rows:
@@ -356,14 +439,13 @@ def _online_find_in_passthrough(q: str, limit: int = 10) -> List[Dict[str, Any]]
     return results
 
 def find_player_by_name(q: str) -> List[Dict[str, Any]]:
-    if not q: 
+    if not q:
         return []
     qn = _normalize_name(q)
     rows = get_players(False)
     hits: List[Dict[str, Any]] = []
     for r in rows:
-        hay = display_name_for(r)
-        if qn and qn in _normalize_name(hay):
+        if qn and qn in _normalize_name(display_name_for(r)):
             hits.append(r)
             if len(hits) >= 10:
                 break
@@ -390,7 +472,6 @@ def ensure_headshot_png(player: Any) -> Optional[bytes]:
     if not pid:
         return None
 
-    # 1) /tmp cache
     tmp_path = HEADSHOT_TMP_FMT.format(pid=pid)
     if os.path.exists(tmp_path):
         try:
@@ -399,28 +480,21 @@ def ensure_headshot_png(player: Any) -> Optional[bytes]:
         except: 
             pass
 
-    # 2) try hinted url
     def _download(u: str) -> Optional[bytes]:
         if not u: return None
         try:
             req = UrlRequest(u, headers={"User-Agent":"vm-plashki/1.0"})
             with http_urlopen(req, timeout=TIMEOUT) as r:
                 data = r.read()
-            # проверим что это картинка
-            try:
-                im = Image.open(io.BytesIO(data)).convert("RGBA")
-                bio = io.BytesIO()
-                im.save(bio, format="PNG")
-                out = bio.getvalue()
-                with open(tmp_path, "wb") as f:
-                    f.write(out)
-                return out
-            except Exception:
-                return None
+            im = Image.open(io.BytesIO(data)).convert("RGBA")
+            bio = io.BytesIO(); im.save(bio, format="PNG")
+            out = bio.getvalue()
+            with open(tmp_path, "wb") as f:
+                f.write(out)
+            return out
         except Exception:
             return None
 
-    # URL-кандидаты
     url_candidates: List[str] = []
     if url_hint:
         url_candidates.append(url_hint)
@@ -429,29 +503,21 @@ def ensure_headshot_png(player: Any) -> Optional[bytes]:
         f"https://cdn.nba.com/headshots/nba/latest/260x190/{pid}.png",
         f"https://nba-players-proxy.znamteam-903.workers.dev/img?u={pid}",
     ]
-
     for u in url_candidates:
         data = _download(u)
         if data:
             return data
-
     return None
 
 def ensure_team_logo_png(team_id: Any) -> Optional[str]:
-    """
-    Возвращает путь к локальному PNG логотипа команды, если найден.
-    """
     tid = str(team_id or "0")
-    # прямые пути
     for d in (LOGO_DIR_CACHED, LOGO_DIR_TEAMS):
         p1 = os.path.join(d, f"{tid}.png")
         if os.path.exists(p1):
             return p1
-        # допускаем имена формата logo_{teamId}.png
         p2 = os.path.join(d, f"logo_{tid}.png")
         if os.path.exists(p2):
             return p2
-        # перебор «на всякий»
         try:
             for fn in os.listdir(d):
                 if not fn.lower().endswith(".png"): 
@@ -460,14 +526,13 @@ def ensure_team_logo_png(team_id: Any) -> Optional[str]:
                     return os.path.join(d, fn)
         except FileNotFoundError:
             pass
-    # generic
     gen = os.path.join(LOGO_DIR_TEAMS, "generic.png")
     if os.path.exists(gen):
         return gen
     return None
 
 # ------------------ OVERRIDES (RU NAMES) ------------------
-_OV_CACHE: Dict[str, str] = None  # type: ignore
+_OV_CACHE: Optional[Dict[str, str]] = None
 
 def _ov_load_local() -> Dict[str, str]:
     try:
@@ -538,13 +603,13 @@ def _ov_load() -> Dict[str, str]:
     gh = _gh_get_file()
     if gh:
         _sha, gd = gh
-        # GH — источник истины
         d = gd
     _OV_CACHE = d
     return d
 
 def _ov_flush(d: Dict[str, str]) -> None:
-    _OV_CACHE = d  # noqa: F841
+    global _OV_CACHE
+    _OV_CACHE = d
     _ov_save_local(d)
     gh = _gh_get_file()
     prev_sha = gh[0] if gh else None
