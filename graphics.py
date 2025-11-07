@@ -1,5 +1,6 @@
-# graphics.py — компактные плашки, уменьшенные шрифты, BAD с какашкой, card2-логотип сдвинут,
-# cardS (special) — левая панель динамическая, справа узкая панель с текстом и ⭐
+# graphics.py — компактные плашки, BAD с логотипом и динамической шириной,
+# card2 логотип сдвинут выше/левее на 20px, cardS с правой панелью и ⭐,
+# статистика принимает числа и короткие выражения (3/5, 3 из 5)
 from __future__ import annotations
 from typing import List, Tuple, Optional, Dict, Any
 from PIL import Image, ImageDraw, ImageFont
@@ -8,7 +9,7 @@ import io, os, json, re
 # Холст
 W, H = 1920, 1080
 
-# Панель — стала ниже
+# Панель — ниже
 BAR_H          = 220
 PAD_L          = 56
 PAD_R          = 56
@@ -24,7 +25,7 @@ NAME_PAD_BOTTOM = 5
 BLOCK_PAD_TOP   = 3
 BLOCK_PAD_BOTTOM= 5
 
-# Головы/лого — SINGLE теперь как DUO
+# Головы/лого
 HEAD_SIZE   = 300
 DUO_HEAD    = 300
 LOGO_D      = 140
@@ -32,7 +33,7 @@ LOGO_SIZE   = 124
 LOGO_OFFSET_X = 18
 LOGO_OFFSET_Y = 210
 
-# Шрифты — чуть меньше
+# Шрифты
 F_BOLD_PATH = "assets/fonts/Montserrat-Bold.ttf"
 F_SB_PATH   = "assets/fonts/Montserrat-SemiBold.ttf"
 F_EXO_PATH  = "assets/fonts/Exo2-Bold.ttf"
@@ -132,7 +133,7 @@ def _metric_line(stats: List[Tuple[str,str]], f_val, f_lbl, color=(255,255,255,2
                  hgap=BLOCK_HGAP, vgap=INNER_VGAP) -> Image.Image:
     blocks, total_w, max_h = [], 0, 0
     for v, lab in stats:
-        v = str(v)  # теперь поддерживает '3/5', '3 из 5', любые короткие выражения
+        v = str(v)  # поддерживает '3/5', '3 из 5', "3 из 5"
         lab = (lab or "").upper().strip()
         val_img = _text_img(v, f_val, color)
         lbl_img = _text_img(lab, f_lbl, color) if lab else Image.new("RGBA", (1,1), (0,0,0,0))
@@ -242,7 +243,7 @@ def render_card2(
     w_half = W//2
     for side, player_name, team_logo, colors, head_img, stats in [
         ("left",  player1_name, team1_logo, colors1, head1, stats1),
-        ("right", player2_name, team2_logo, colors2, head2, stats2),
+        ("right", player2_name, team_logo := team2_logo if player_name==player2_name else team_logo, colors if player_name!=player2_name else colors2, head2 if player_name==player2_name else head_img, stats2 if player_name==player2_name else stats)
     ]:
         primary = colors[0]
         rgb = _hex_to_rgb(primary)
@@ -268,7 +269,7 @@ def render_card2(
             ImageDraw.Draw(mask).ellipse((0,0,LOGO_D,LOGO_D), fill=255)
             logo_circle.putalpha(mask)
             logo_circle.alpha_composite(logo_raw, ((LOGO_D-LOGO_SIZE)//2, (LOGO_D-LOGO_SIZE)//2))
-            # Сдвиг: выше и левее на 20px
+            # Сдвиг выше/левее на 20 px
             logo_x = head_x + LOGO_OFFSET_X - 20
             logo_y = head_y + LOGO_OFFSET_Y - 20
             canvas.alpha_composite(shadow, (logo_x-3, logo_y-3))
@@ -276,7 +277,7 @@ def render_card2(
 
         name_area_x = head_x + DUO_HEAD + 24
         max_w = x0 + w_half - name_area_x - 24
-        name_img, f_name = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, max_w, BASE_NAME, 22)
+        name_img, _ = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, max_w, BASE_NAME, 22)
         f_val = _load_font(F_EXO_PATH, BASE_VAL)
         f_lbl = _load_font(F_SB_PATH,  BASE_LBL)
         stats_line = _metric_line(stats, f_val, f_lbl)
@@ -295,8 +296,11 @@ def render_card2(
     canvas.save(bio, format="PNG")
     return bio.getvalue()
 
-# ---------- BAD ----------
-def render_card_bad(player_name: str, head_img: Image.Image, stats: List[Tuple[str,str]]) -> bytes:
+# ---------- BAD (динамическая ширина + логотип) ----------
+def render_card_bad(player_name: str,
+                    head_img: Image.Image,
+                    stats: List[Tuple[str,str]],
+                    team_logo_img: Optional[Image.Image]=None) -> bytes:
     primary = "#6D4C41"  # коричневый
     rgb = _hex_to_rgb(primary)
     left_rgb, right_rgb = _shade(rgb, 0.7), rgb
@@ -304,36 +308,63 @@ def render_card_bad(player_name: str, head_img: Image.Image, stats: List[Tuple[s
     canvas = Image.new("RGBA", (W,H), (0,0,0,0))
     head = _circle_crop_img(head_img, HEAD_SIZE)
     bar_y = H - BAR_H
-    panel = _rounded_horizontal_gradient(W, BAR_H, 22, left_rgb, right_rgb)
-    canvas.alpha_composite(panel, (0, bar_y))
-
-    head_x = PAD_L
-    head_y = bar_y - head.height//3
-    canvas.alpha_composite(head, (head_x, head_y))
 
     name_area_x = PAD_L + HEAD_SIZE + 32
     max_w = W - name_area_x - PAD_R
     name_img, _ = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, max_w, BASE_NAME, 24)
     name_img = _pad_v(name_img, NAME_PAD_TOP, NAME_PAD_BOTTOM)
 
-    # имя + какашка
-    canvas.alpha_composite(name_img, (name_area_x, bar_y + TOP_IN))
-    try:
-        poop = Image.open(POOP_ICON).convert("RGBA").resize((52,52), Image.LANCZOS)
-        px = name_area_x + name_img.width + 10
-        py = bar_y + TOP_IN - 2
-        canvas.alpha_composite(poop, (px, py))
-    except Exception:
-        pass
-
     f_val = _load_font(F_EXO_PATH, BASE_VAL)
     f_lbl = _load_font(F_SB_PATH,  BASE_LBL)
     stats_line = _metric_line(stats, f_val, f_lbl)
+
     avail_h = BAR_H - TOP_IN - name_img.height - NAME_STATS_GAP - BOT_IN
     if stats_line.height > avail_h:
         k = max(0.2, avail_h / stats_line.height)
         stats_line = stats_line.resize((max(1,int(stats_line.width*k)), max(1,int(stats_line.height*k))), Image.LANCZOS)
-    canvas.alpha_composite(stats_line, (name_area_x, bar_y + TOP_IN + name_img.height + NAME_STATS_GAP))
+
+    content_right = max(name_area_x + name_img.width, name_area_x + stats_line.width)
+    bar_w = min(W, content_right + PAD_R)
+
+    panel = _rounded_horizontal_gradient(bar_w, BAR_H, 22, left_rgb, right_rgb)
+    canvas.alpha_composite(panel, (0, bar_y))
+
+    head_x = PAD_L
+    head_y = bar_y - head.height//3
+    canvas.alpha_composite(head, (head_x, head_y))
+
+    # Лого (если передано)
+    if team_logo_img:
+        logo_raw = team_logo_img.resize((LOGO_SIZE, LOGO_SIZE), Image.LANCZOS)
+        shadow = Image.new("RGBA", (LOGO_D+6, LOGO_D+6), (0,0,0,0))
+        sh_mask = Image.new("L", (LOGO_D+6, LOGO_D+6), 0)
+        ImageDraw.Draw(sh_mask).ellipse((3,3,LOGO_D+3,LOGO_D+3), fill=90)
+        shadow.putalpha(sh_mask)
+        logo_circle = Image.new("RGBA", (LOGO_D, LOGO_D), (255,255,255,255))
+        mask = Image.new("L", (LOGO_D, LOGO_D), 0)
+        ImageDraw.Draw(mask).ellipse((0,0,LOGO_D,LOGO_D), fill=255)
+        logo_circle.putalpha(mask)
+        logo_circle.alpha_composite(logo_raw, ((LOGO_D-LOGO_SIZE)//2, (LOGO_D-LOGO_SIZE)//2))
+        logo_x = head_x + LOGO_OFFSET_X
+        logo_y = head_y + LOGO_OFFSET_Y
+        canvas.alpha_composite(shadow, (logo_x-3, logo_y-3))
+        canvas.alpha_composite(logo_circle, (logo_x, logo_y))
+
+    name_x = name_area_x
+    name_y = bar_y + TOP_IN
+    canvas.alpha_composite(name_img, (name_x, name_y))
+
+    # 💩 после имени
+    try:
+        poop = Image.open(POOP_ICON).convert("RGBA").resize((52,52), Image.LANCZOS)
+        px = name_x + name_img.width + 10
+        py = name_y - 2
+        canvas.alpha_composite(poop, (px, py))
+    except Exception:
+        pass
+
+    stats_y = name_y + name_img.height + NAME_STATS_GAP
+    canvas.alpha_composite(stats_line, (name_x, stats_y))
 
     bio = io.BytesIO()
     canvas.save(bio, format="PNG")
@@ -606,13 +637,13 @@ def render_card_special(
         stats_line = stats_line.resize((max(1,int(stats_line.width*k)), max(1,int(stats_line.height*k))), Image.LANCZOS)
     stats_y = name_y + name_img.height + NAME_STATS_GAP
 
-    # динамическая ширина ЛЕВОЙ панели (как у обычной card)
+    # динамическая ширина ЛЕВОЙ панели
     content_right = max(name_area_x + name_img.width, name_area_x + stats_line.width)
     bar_w_main = min(W - PAD_R, content_right + PAD_R)
     left_panel = _rounded_horizontal_gradient(bar_w_main, BAR_H, 22, left_rgb, right_rgb)
     canvas.alpha_composite(left_panel, (0, bar_y))
 
-    # лого в кружке (если есть)
+    # лого в кружке
     if team_logo_img:
         logo_raw = team_logo_img.resize((LOGO_SIZE, LOGO_SIZE), Image.LANCZOS)
         shadow = Image.new("RGBA", (LOGO_D+6, LOGO_D+6), (0,0,0,0))
@@ -629,11 +660,11 @@ def render_card_special(
         canvas.alpha_composite(shadow, (logo_x-3, logo_y-3))
         canvas.alpha_composite(logo_circle, (logo_x, logo_y))
 
-    # имя/статы на левом блоке
+    # имя/статы слева
     canvas.alpha_composite(name_img, (name_area_x, name_y))
     canvas.alpha_composite(stats_line, (name_area_x, stats_y))
 
-    # ПРАВАЯ узкая панель: отступ 10px, ширина по содержимому (но не > 600 и не упираемся в край)
+    # ПРАВАЯ панель с ⭐
     gap = 10
     max_right_total = W - (bar_w_main + gap) - PAD_R
     max_right_total = max(0, max_right_total)
@@ -642,18 +673,14 @@ def render_card_special(
             star = Image.open(STAR_ICON).convert("RGBA").resize((36,36), Image.LANCZOS)
         except Exception:
             star = None
-        # Текст с обтеканием
         f_info = _load_font(F_SB_PATH, 44)
-        # ограничим макс. ширину — не больше 600 и не больше доступного остатка
         max_info_w = min(600, max_right_total)
         wrapped = _wrap_text_to_width(info_text, f_info, max_info_w - 32 - (36 + 10 if star else 0))
-        # реальная ширина панели по содержимому
         info_w = min(max_info_w, 16 + (star.width + 10 if star else 0) + wrapped.width + 16)
         info_panel = _rounded_horizontal_gradient(info_w, BAR_H, 22, left_rgb, right_rgb)
         info_x = bar_w_main + gap
         info_y = bar_y
         canvas.alpha_composite(info_panel, (info_x, info_y))
-        # контент: ⭐ + текст
         cur_x = info_x + 16
         cur_y = info_y + TOP_IN
         if star:
@@ -665,6 +692,6 @@ def render_card_special(
     canvas.save(bio, format="PNG")
     return bio.getvalue()
 
-# --- Back-compat alias for older code paths ---
+# --- Back-compat alias ---
 def render_card_dr(n, player_name, head_img, logo_img, stats):
     return render_card_drN(n, player_name, head_img, logo_img, stats)
