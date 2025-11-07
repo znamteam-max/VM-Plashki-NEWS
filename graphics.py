@@ -43,10 +43,8 @@ BASE_LBL  = 24
 POOP_ICON = "assets/icons/poop.png"
 
 def _load_font(path: str, size: int):
-    try:
-        return ImageFont.truetype(path, size)
-    except Exception:
-        return ImageFont.load_default()
+    try: return ImageFont.truetype(path, size)
+    except Exception: return ImageFont.load_default()
 
 def _text_img(text: str, font: ImageFont.FreeTypeFont, fill=(255,255,255,255)) -> Image.Image:
     probe = Image.new("RGBA", (1,1))
@@ -58,8 +56,7 @@ def _text_img(text: str, font: ImageFont.FreeTypeFont, fill=(255,255,255,255)) -
     return img
 
 def _pad_v(img: Image.Image, top: int, bottom: int) -> Image.Image:
-    if top<=0 and bottom<=0:
-        return img
+    if top<=0 and bottom<=0: return img
     out = Image.new("RGBA", (img.width, img.height+max(0,top)+max(0,bottom)), (0,0,0,0))
     out.alpha_composite(img, (0, max(0,top)))
     return out
@@ -74,8 +71,7 @@ def _fit_text_to_width(text: str, font_path: str, max_w: int, max_size: int, min
         f = _load_font(font_path, mid)
         l,t,r,b = d.textbbox((0,0), text, font=f)
         if r-l <= max_w:
-            best = f
-            lo = mid+1
+            best = f; lo = mid+1
         else:
             hi = mid-1
     return _text_img(text, best), best
@@ -94,32 +90,25 @@ def _circle_crop_img(img: Image.Image, d: int) -> Image.Image:
 
 def _hex_to_rgb(h: str) -> Tuple[int, int, int]:
     DEFAULT = (0, 122, 204)
-    if not isinstance(h, str):
-        return DEFAULT
+    if not isinstance(h, str): return DEFAULT
     s = h.strip()
-    # rgb(...) поддержка
     m = re.match(r"rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})", s)
     if m:
         r = max(0, min(255, int(m.group(1))))
         g = max(0, min(255, int(m.group(2))))
         b = max(0, min(255, int(m.group(3))))
         return (r, g, b)
-    # #RRGGBB
     m = re.search(r'#?([0-9A-Fa-f]{6})', s)
-    if not m:
-        return DEFAULT
+    if not m: return DEFAULT
     hex6 = m.group(1)
     try:
         return (int(hex6[0:2], 16), int(hex6[2:4], 16), int(hex6[4:6], 16))
     except Exception:
         return DEFAULT
 
-def _clamp(x:int)->int:
-    return max(0,min(255,x))
-
+def _clamp(x:int)->int: return max(0,min(255,x))
 def _shade(rgb: Tuple[int,int,int], k: float) -> Tuple[int,int,int]:
-    r,g,b = rgb
-    return (_clamp(int(r*k)), _clamp(int(g*k)), _clamp(int(b*k)))
+    r,g,b = rgb; return (_clamp(int(r*k)), _clamp(int(g*k)), _clamp(int(b*k)))
 
 def _rounded_horizontal_gradient(width:int, height:int, radius:int,
                                  left_rgb:Tuple[int,int,int], right_rgb:Tuple[int,int,int]) -> Image.Image:
@@ -141,8 +130,7 @@ def _metric_line(stats: List[Tuple[str,str]], f_val, f_lbl, color=(255,255,255,2
                  hgap=BLOCK_HGAP, vgap=INNER_VGAP) -> Image.Image:
     blocks, total_w, max_h = [], 0, 0
     for v, lab in stats:
-        v = str(v)
-        lab = (lab or "").upper().strip()
+        v = str(v); lab = (lab or "").upper().strip()
         val_img = _text_img(v, f_val, color)
         lbl_img = _text_img(lab, f_lbl, color) if lab else Image.new("RGBA", (1,1), (0,0,0,0))
         w = max(val_img.width, lbl_img.width)
@@ -216,8 +204,9 @@ def render_card(template: str,
         ImageDraw.Draw(mask).ellipse((0,0,LOGO_D,LOGO_D), fill=255)
         logo_circle.putalpha(mask)
         logo_circle.alpha_composite(logo_raw, ((LOGO_D-LOGO_SIZE)//2, (LOGO_D-LOGO_SIZE)//2))
-        logo_x = head_x + LOGO_OFFSET_X
-        logo_y = head_y + LOGO_OFFSET_Y
+        # Сдвиг: выше и левее на 20px
+        logo_x = head_x + LOGO_OFFSET_X - 20
+        logo_y = head_y + LOGO_OFFSET_Y - 20
         canvas.alpha_composite(shadow, (logo_x-3, logo_y-3))
         canvas.alpha_composite(logo_circle, (logo_x, logo_y))
 
@@ -277,7 +266,7 @@ def render_card2(
             ImageDraw.Draw(mask).ellipse((0,0,LOGO_D,LOGO_D), fill=255)
             logo_circle.putalpha(mask)
             logo_circle.alpha_composite(logo_raw, ((LOGO_D-LOGO_SIZE)//2, (LOGO_D-LOGO_SIZE)//2))
-            # Сдвиг: выше и левее на 20px
+            # Сдвиг: выше и левее на 20px (уже был)
             logo_x = head_x + LOGO_OFFSET_X - 20
             logo_y = head_y + LOGO_OFFSET_Y - 20
             canvas.alpha_composite(shadow, (logo_x-3, logo_y-3))
@@ -285,7 +274,7 @@ def render_card2(
 
         name_area_x = head_x + DUO_HEAD + 24
         max_w = x0 + w_half - name_area_x - 24
-        name_img, _ = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, max_w, BASE_NAME, 22)
+        name_img, f_name = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, max_w, BASE_NAME, 22)
         f_val = _load_font(F_EXO_PATH, BASE_VAL)
         f_lbl = _load_font(F_SB_PATH,  BASE_LBL)
         stats_line = _metric_line(stats, f_val, f_lbl)
@@ -382,8 +371,7 @@ def _all_bboxes_for_color(img: Image.Image, target: Tuple[int,int,int,int]) -> L
     boxes: List[Tuple[int,int,int,int]] = []
     for y in range(h):
         for x in range(w):
-            if vis[y][x]:
-                continue
+            if vis[y][x]: continue
             r,g,b,a = px[x,y]
             if r==tr and g==tg and b==tb and a>=200:
                 q=[(x,y)]
@@ -405,8 +393,7 @@ def _all_bboxes_for_color(img: Image.Image, target: Tuple[int,int,int,int]) -> L
     return boxes
 
 def _load_json_layout(path: str) -> Optional[Dict[str,Any]]:
-    if not os.path.exists(path):
-        return None
+    if not os.path.exists(path): return None
     try:
         with open(path,"r",encoding="utf-8") as f:
             j = json.load(f)
@@ -437,31 +424,26 @@ def _detect_layout_from_guides(guides_path: str) -> Optional[Dict[str,Any]]:
         layout["logo"] = {"x": x0, "y": y0, "size": size}
     stats_boxes = _all_bboxes_for_color(im, _GUIDE_COLORS["stat"])
     if stats_boxes:
-        stats_boxes.sort(key=lambda b: ((b[1]//50), b[0]))
+        stats_boxes.sort(key=lambda b: ( (b[1]//50), b[0] ))
         layout["stats"] = [{"x":b[0], "y":b[1], "max_w": b[2]-b[0]+1, "align":"center"} for b in stats_boxes]
     return layout if layout else None
 
 def _load_dr_layout(n: int) -> Tuple[Optional[Image.Image], Optional[Dict[str,Any]]]:
-    base_dir = os.getenv("DR_TEMPLATES_DIR", "assets/templates")
-    base_png = os.path.join(base_dir, f"dr{n}.png")
-    guides_png = os.path.join(base_dir, f"dr{n}_guides.png")
-    layout_json = os.path.join(base_dir, f"dr{n}.json")
+    base_png = os.path.join(os.getenv("DR_TEMPLATES_DIR", "assets/templates"), f"dr{n}.png")
+    guides_png = os.path.join(os.getenv("DR_TEMPLATES_DIR", "assets/templates"), f"dr{n}_guides.png")
+    layout_json = os.path.join(os.getenv("DR_TEMPLATES_DIR", "assets/templates"), f"dr{n}.json")
 
     base_img = None
     if os.path.exists(base_png):
-        try:
-            base_img = Image.open(base_png).convert("RGBA").resize((W,H), Image.LANCZOS)
-        except Exception:
-            base_img = None
+        try: base_img = Image.open(base_png).convert("RGBA").resize((W,H), Image.LANCZOS)
+        except Exception: base_img = None
 
     layout = _load_json_layout(layout_json)
-    if layout:
-        return base_img, layout
+    if layout: return base_img, layout
 
     if os.path.exists(guides_png):
         layout = _detect_layout_from_guides(guides_png)
-        if layout:
-            return base_img, layout
+        if layout: return base_img, layout
 
     return base_img, None
 
@@ -484,8 +466,7 @@ def _draw_head(canvas: Image.Image, head_img: Image.Image, slot: Dict[str,Any]):
     canvas.alpha_composite(head, (cx - d//2, cy - d//2))
 
 def _draw_logo(canvas: Image.Image, logo_img: Optional[Image.Image], slot: Dict[str,Any]):
-    if not logo_img:
-        return
+    if not logo_img: return
     size = int(slot.get("size", LOGO_SIZE))
     x = int(slot.get("x", PAD_L + LOGO_OFFSET_X))
     y = int(slot.get("y", H - BAR_H - LOGO_OFFSET_Y))
@@ -526,10 +507,8 @@ def _draw_stat_cell(canvas: Image.Image, v: str, lab: str, slot: Dict[str,Any]):
         img.alpha_composite(lbl_img, ((w - lbl_img.width)//2, val_img.height + (INNER_VGAP//2)))
 
     x = int(slot.get("x", 0)); y = int(slot.get("y", 0))
-    if align == "center":
-        x = x + (max_w - img.width)//2
-    elif align == "right":
-        x = x + (max_w - img.width)
+    if align == "center": x = x + (max_w - img.width)//2
+    elif align == "right": x = x + (max_w - img.width)
     canvas.alpha_composite(img, (x, y))
 
 def render_card_drN(
@@ -620,8 +599,9 @@ def render_card_special(
         ImageDraw.Draw(mask).ellipse((0,0,LOGO_D,LOGO_D), fill=255)
         logo_circle.putalpha(mask)
         logo_circle.alpha_composite(logo_raw, ((LOGO_D-LOGO_SIZE)//2, (LOGO_D-LOGO_SIZE)//2))
-        logo_x = head_x + LOGO_OFFSET_X
-        logo_y = head_y + LOGO_OFFSET_Y
+        # Сдвиг: выше и левее на 20px
+        logo_x = head_x + LOGO_OFFSET_X - 20
+        logo_y = head_y + LOGO_OFFSET_Y - 20
         canvas.alpha_composite(shadow, (logo_x-3, logo_y-3))
         canvas.alpha_composite(logo_circle, (logo_x, logo_y))
 
@@ -656,25 +636,6 @@ def render_card_special(
     canvas.save(bio, format="PNG")
     return bio.getvalue()
 
-# --- Back-compat helpers ---
-def render_card_dr(*args, **kwargs):
-    """
-    Совместимо с двумя стилями:
-
-    1) render_card_dr(n, player_name, head_img, logo_img, stats)
-    2) render_card_dr(player_name, head_img, logo_img, stats) -> n = len(stats) (clamped 3..5)
-    """
-    if not args:
-        raise TypeError("render_card_dr: missing arguments")
-    # стиль 1: первый аргумент — int
-    if isinstance(args[0], int):
-        if len(args) < 5:
-            raise TypeError("render_card_dr(n, player_name, head_img, logo_img, stats) requires 5 args")
-        n, player_name, head_img, logo_img, stats = args[0], args[1], args[2], args[3], args[4]
-    else:
-        # стиль 2: без n
-        if len(args) < 4:
-            raise TypeError("render_card_dr(player_name, head_img, logo_img, stats) requires 4 args")
-        player_name, head_img, logo_img, stats = args[0], args[1], args[2], args[3]
-        n = max(3, min(5, len(stats) if isinstance(stats, list) else 3))
+# --- Back-compat alias for older code paths ---
+def render_card_dr(n, player_name, head_img, logo_img, stats):
     return render_card_drN(n, player_name, head_img, logo_img, stats)
