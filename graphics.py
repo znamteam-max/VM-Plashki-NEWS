@@ -1,4 +1,5 @@
-# graphics.py — компактные плашки, уменьшенные шрифты, BAD с какашкой, card2-логотип сдвинут
+# graphics.py — компактные плашки, уменьшенные шрифты, BAD с какашкой, card2-логотип сдвинут,
+# cardS (special) — левая панель динамическая, справа узкая панель с текстом и ⭐
 from __future__ import annotations
 from typing import List, Tuple, Optional, Dict, Any
 from PIL import Image, ImageDraw, ImageFont
@@ -41,6 +42,7 @@ BASE_VAL  = 46
 BASE_LBL  = 24
 
 POOP_ICON = "assets/icons/poop.png"
+STAR_ICON = "assets/icons/star.png"
 
 def _load_font(path: str, size: int):
     try: return ImageFont.truetype(path, size)
@@ -130,7 +132,8 @@ def _metric_line(stats: List[Tuple[str,str]], f_val, f_lbl, color=(255,255,255,2
                  hgap=BLOCK_HGAP, vgap=INNER_VGAP) -> Image.Image:
     blocks, total_w, max_h = [], 0, 0
     for v, lab in stats:
-        v = str(v); lab = (lab or "").upper().strip()
+        v = str(v)  # теперь поддерживает '3/5', '3 из 5', любые короткие выражения
+        lab = (lab or "").upper().strip()
         val_img = _text_img(v, f_val, color)
         lbl_img = _text_img(lab, f_lbl, color) if lab else Image.new("RGBA", (1,1), (0,0,0,0))
         w = max(val_img.width, lbl_img.width)
@@ -204,9 +207,8 @@ def render_card(template: str,
         ImageDraw.Draw(mask).ellipse((0,0,LOGO_D,LOGO_D), fill=255)
         logo_circle.putalpha(mask)
         logo_circle.alpha_composite(logo_raw, ((LOGO_D-LOGO_SIZE)//2, (LOGO_D-LOGO_SIZE)//2))
-        # Сдвиг: выше и левее на 20px
-        logo_x = head_x + LOGO_OFFSET_X - 20
-        logo_y = head_y + LOGO_OFFSET_Y - 20
+        logo_x = head_x + LOGO_OFFSET_X
+        logo_y = head_y + LOGO_OFFSET_Y
         canvas.alpha_composite(shadow, (logo_x-3, logo_y-3))
         canvas.alpha_composite(logo_circle, (logo_x, logo_y))
 
@@ -216,7 +218,7 @@ def render_card(template: str,
 
     if template == "impact":
         try:
-            star_img = Image.open("assets/icons/star.png").convert("RGBA").resize((52,52), Image.LANCZOS)
+            star_img = Image.open(STAR_ICON).convert("RGBA").resize((52,52), Image.LANCZOS)
             canvas.alpha_composite(star_img, (name_x + name_img.width + 12, name_y - 2))
             tag_img, _ = _fit_text_to_width("ДЕЛАЕТ РАЗНИЦУ", F_SB_PATH, 240, 36, 20)
             canvas.alpha_composite(tag_img, (name_x + name_img.width + 12 + 52 + 8, name_y + 2))
@@ -266,7 +268,7 @@ def render_card2(
             ImageDraw.Draw(mask).ellipse((0,0,LOGO_D,LOGO_D), fill=255)
             logo_circle.putalpha(mask)
             logo_circle.alpha_composite(logo_raw, ((LOGO_D-LOGO_SIZE)//2, (LOGO_D-LOGO_SIZE)//2))
-            # Сдвиг: выше и левее на 20px (уже был)
+            # Сдвиг: выше и левее на 20px
             logo_x = head_x + LOGO_OFFSET_X - 20
             logo_y = head_y + LOGO_OFFSET_Y - 20
             canvas.alpha_composite(shadow, (logo_x-3, logo_y-3))
@@ -492,11 +494,12 @@ def _draw_stat_cell(canvas: Image.Image, v: str, lab: str, slot: Dict[str,Any]):
     f_val = _load_font(F_EXO_PATH, val_sz)
     f_lbl = _load_font(F_SB_PATH,  lbl_sz)
 
-    val_img = _text_img(str(v), f_val, (255,255,255,255))
+    v = str(v)
+    val_img = _text_img(v, f_val, (255,255,255,255))
     lbl_img = _text_img((lab or "").upper(), f_lbl, (255,255,255,220)) if lab else None
     w = max(val_img.width, lbl_img.width if lbl_img else 0)
     if w > max_w:
-        val_img, _ = _fit_text_to_width(str(v), F_EXO_PATH, max_w, val_sz, 18)
+        val_img, _ = _fit_text_to_width(v, F_EXO_PATH, max_w, val_sz, 18)
         if lbl_img:
             lbl_img, _ = _fit_text_to_width((lab or "").upper(), F_SB_PATH, max_w, lbl_sz, 14)
         w = max(val_img.width, lbl_img.width if lbl_img else 0)
@@ -545,7 +548,7 @@ def render_card_drN(
     canvas.save(bio, format="PNG")
     return bio.getvalue()
 
-# ---------- SPECIAL ----------
+# ---------- SPECIAL (cardS) ----------
 def _wrap_text_to_width(text: str, font: ImageFont.FreeTypeFont, max_w: int) -> Image.Image:
     words = text.split()
     lines: List[str] = []
@@ -580,14 +583,36 @@ def render_card_special(
 
     canvas = Image.new("RGBA", (W,H), (0,0,0,0))
     bar_y = H - BAR_H
-    panel = _rounded_horizontal_gradient(W, BAR_H, 22, left_rgb, right_rgb)
-    canvas.alpha_composite(panel, (0, bar_y))
 
+    # head
     head = _circle_crop_img(head_img, HEAD_SIZE)
     head_x = PAD_L
     head_y = bar_y - head.height//3
     canvas.alpha_composite(head, (head_x, head_y))
 
+    # name
+    name_area_x = PAD_L + HEAD_SIZE + 32
+    name_img, _ = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, W - name_area_x - PAD_R, BASE_NAME, 24)
+    name_img = _pad_v(name_img, NAME_PAD_TOP, NAME_PAD_BOTTOM)
+    name_y = bar_y + TOP_IN
+
+    # stats
+    f_val = _load_font(F_EXO_PATH, BASE_VAL)
+    f_lbl = _load_font(F_SB_PATH,  BASE_LBL)
+    stats_line = _metric_line(stats, f_val, f_lbl)
+    avail_h = BAR_H - TOP_IN - name_img.height - NAME_STATS_GAP - BOT_IN
+    if stats_line.height > avail_h:
+        k = avail_h / stats_line.height
+        stats_line = stats_line.resize((max(1,int(stats_line.width*k)), max(1,int(stats_line.height*k))), Image.LANCZOS)
+    stats_y = name_y + name_img.height + NAME_STATS_GAP
+
+    # динамическая ширина ЛЕВОЙ панели (как у обычной card)
+    content_right = max(name_area_x + name_img.width, name_area_x + stats_line.width)
+    bar_w_main = min(W - PAD_R, content_right + PAD_R)
+    left_panel = _rounded_horizontal_gradient(bar_w_main, BAR_H, 22, left_rgb, right_rgb)
+    canvas.alpha_composite(left_panel, (0, bar_y))
+
+    # лого в кружке (если есть)
     if team_logo_img:
         logo_raw = team_logo_img.resize((LOGO_SIZE, LOGO_SIZE), Image.LANCZOS)
         shadow = Image.new("RGBA", (LOGO_D+6, LOGO_D+6), (0,0,0,0))
@@ -599,38 +624,42 @@ def render_card_special(
         ImageDraw.Draw(mask).ellipse((0,0,LOGO_D,LOGO_D), fill=255)
         logo_circle.putalpha(mask)
         logo_circle.alpha_composite(logo_raw, ((LOGO_D-LOGO_SIZE)//2, (LOGO_D-LOGO_SIZE)//2))
-        # Сдвиг: выше и левее на 20px
-        logo_x = head_x + LOGO_OFFSET_X - 20
-        logo_y = head_y + LOGO_OFFSET_Y - 20
+        logo_x = head_x + LOGO_OFFSET_X
+        logo_y = head_y + LOGO_OFFSET_Y
         canvas.alpha_composite(shadow, (logo_x-3, logo_y-3))
         canvas.alpha_composite(logo_circle, (logo_x, logo_y))
 
-    name_area_x = PAD_L + HEAD_SIZE + 32
-    name_img, _ = _fit_text_to_width(player_name.upper(), F_BOLD_PATH, W - name_area_x - PAD_R - 520 - 10, BASE_NAME, 24)
-    name_img = _pad_v(name_img, NAME_PAD_TOP, NAME_PAD_BOTTOM)
-    name_y = bar_y + TOP_IN
+    # имя/статы на левом блоке
     canvas.alpha_composite(name_img, (name_area_x, name_y))
-
-    f_val = _load_font(F_EXO_PATH, BASE_VAL)
-    f_lbl = _load_font(F_SB_PATH,  BASE_LBL)
-    stats_line = _metric_line(stats, f_val, f_lbl)
-    avail_h = BAR_H - TOP_IN - name_img.height - NAME_STATS_GAP - BOT_IN
-    if stats_line.height > avail_h:
-        k = avail_h / stats_line.height
-        stats_line = stats_line.resize((max(1,int(stats_line.width*k)), max(1,int(stats_line.height*k))), Image.LANCZOS)
-    stats_y = name_y + name_img.height + NAME_STATS_GAP
     canvas.alpha_composite(stats_line, (name_area_x, stats_y))
 
-    info_w = 520
-    info_x = W - PAD_R - info_w
-    info_y = bar_y
-    info_panel = _rounded_horizontal_gradient(info_w, BAR_H, 22, left_rgb, right_rgb)
-    canvas.alpha_composite(info_panel, (info_x, info_y))
-
-    # размер текста близок к цифрам статистики
-    f_info = _load_font(F_SB_PATH, 44)
-    wrapped = _wrap_text_to_width(info_text, f_info, info_w - 32)
-    canvas.alpha_composite(wrapped, (info_x + 16, info_y + TOP_IN))
+    # ПРАВАЯ узкая панель: отступ 10px, ширина по содержимому (но не > 600 и не упираемся в край)
+    gap = 10
+    max_right_total = W - (bar_w_main + gap) - PAD_R
+    max_right_total = max(0, max_right_total)
+    if max_right_total > 0 and info_text:
+        try:
+            star = Image.open(STAR_ICON).convert("RGBA").resize((36,36), Image.LANCZOS)
+        except Exception:
+            star = None
+        # Текст с обтеканием
+        f_info = _load_font(F_SB_PATH, 44)
+        # ограничим макс. ширину — не больше 600 и не больше доступного остатка
+        max_info_w = min(600, max_right_total)
+        wrapped = _wrap_text_to_width(info_text, f_info, max_info_w - 32 - (36 + 10 if star else 0))
+        # реальная ширина панели по содержимому
+        info_w = min(max_info_w, 16 + (star.width + 10 if star else 0) + wrapped.width + 16)
+        info_panel = _rounded_horizontal_gradient(info_w, BAR_H, 22, left_rgb, right_rgb)
+        info_x = bar_w_main + gap
+        info_y = bar_y
+        canvas.alpha_composite(info_panel, (info_x, info_y))
+        # контент: ⭐ + текст
+        cur_x = info_x + 16
+        cur_y = info_y + TOP_IN
+        if star:
+            canvas.alpha_composite(star, (cur_x, cur_y))
+            cur_x += star.width + 10
+        canvas.alpha_composite(wrapped, (cur_x, cur_y))
 
     bio = io.BytesIO()
     canvas.save(bio, format="PNG")
