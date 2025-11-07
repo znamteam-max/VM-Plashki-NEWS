@@ -55,8 +55,17 @@ def _hex(c: Tuple[int,int,int]) -> str:
     )
 
 def _hex_to_rgb(h: str) -> Tuple[int,int,int]:
-    h = h.strip().lstrip("#")
-    return (int(h[0:2],16), int(h[2:4],16), int(h[4:6],16))
+    """
+    Безопасный парсер HEX. На некорректном вводе возвращает дефолт (0,122,204),
+    чтобы не падать в рендерингах.
+    """
+    try:
+        s = str(h).strip().lstrip("#")
+        if len(s) == 6:
+            return (int(s[0:2],16), int(s[2:4],16), int(s[4:6],16))
+    except Exception:
+        pass
+    return (0, 122, 204)
 
 def _shade(rgb: Tuple[int,int,int], k: float) -> Tuple[int,int,int]:
     r,g,b = rgb
@@ -139,11 +148,10 @@ def _merge_unique_hex(primary: List[str], extra: List[str], limit: int = 3) -> L
     def add(hexv: str):
         if not hexv or not hexv.startswith("#") or len(hexv) != 7: return
         try:
-            rgb = _hex_to_rgb(hexv)
+            _ = _hex_to_rgb(hexv)
         except: return
         for h in out:
-            rgb2 = _hex_to_rgb(h)
-            if not _distinct(rgb, rgb2, thr=36):
+            if not _distinct(_hex_to_rgb(hexv), _hex_to_rgb(h), thr=36):
                 return
         out.append(hexv)
     for h in primary: add(h)
@@ -175,6 +183,10 @@ def list_palette_for_team(team_id: str) -> List[str]:
     return final[:3] if final else universal[:3]
 
 def get_team_brand(team_id: str) -> Tuple[Tuple[str,str,str], Optional[str], List[str], bool]:
+    """
+    Возвращает:
+      ((primary, dark, light), logo_path, palette_candidates, has_saved_primary)
+    """
     team_id = str(team_id or "0")
     logo_path = get_team_logo_path(team_id)
     palette_candidates = list_palette_for_team(team_id)
@@ -231,3 +243,28 @@ def color_name_ru(hex_color: str) -> str:
         return "красный"
     except:
         return "цвет"
+
+# --- Алиасы/обёртки для совместимости с telegram.py ---
+
+def team_colors_for(team_id: str) -> Tuple[str,str,str]:
+    """
+    Лёгкая обёртка над get_team_brand: возвращает только (primary, dark, light).
+    """
+    (primary, dark, light), _, _, _ = get_team_brand(team_id)
+    return (primary, dark, light)
+
+def color_name_for(hex_color: str) -> str:
+    """
+    Алиас, который ожидает telegram.py.
+    """
+    return color_name_ru(hex_color)
+
+__all__ = [
+    "get_team_brand",
+    "list_palette_for_team",
+    "get_team_logo_path",
+    "set_team_primary_color",
+    "team_colors_for",
+    "color_name_for",
+    "color_name_ru",
+]
