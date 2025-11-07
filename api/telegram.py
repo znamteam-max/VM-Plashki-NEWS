@@ -342,27 +342,33 @@ async def telegram_get(request: Request):
             },
             "api_origin": API_ORIGIN or None,
         })
-    elif action == "refresh":
+        
+  elif action == "refresh":
+    # безопасное обновление пула игроков
+    try:
+        from data import refresh_players, get_players  # берем функции как есть
+        cnt, src = refresh_players()                  # <-- (int, str)
+        # ещё раз читаем список, чтобы не зависеть от внутреннего состояния
         try:
-            cnt, info = refresh_players() if refresh_players else (0, {"error": "no refresh_players"})
-            return JSONResponse({"ok": True if cnt else False, "refreshed": True, "players_indexed": cnt, "source": (info or {}).get("source"), "source_url": (info or {}).get("url")})
-        except Exception as e:
-            return JSONResponse({"ok": False, "refreshed": False, "error": repr(e)})
-    elif action == "players_count":
-        ps = ensure_players_loaded(False)
-        return JSONResponse({"ok": True, "count": len(ps)})
-    elif action == "test_find":
-        q = (request.query_params.get("q") or "").strip()
-        ps = ensure_players_loaded(False)
-        hits = search_players_loose(q) if q else []
+            players_now = get_players(force_refresh=False)
+            cnt_now = len(players_now) if isinstance(players_now, list) else int(cnt)
+        except Exception:
+            cnt_now = int(cnt)
+
         return JSONResponse({
             "ok": True,
-            "q": q,
-            "players_ready": bool(ps),
-            "hits": [{"id": h.get("personId"), "name": h.get("displayName"), "teamId": h.get("teamId")} for h in hits[:5]]
+            "refreshed": True,
+            "players_indexed": int(cnt_now),
+            "source": ("custom" if (isinstance(src, str) and src != "none") else "none"),
+            "source_url": (src if isinstance(src, str) and src else None),
         })
-    else:
-        return JSONResponse({"ok": True, "route": "telegram-get", "boot_error": None if not any([_data_err, _brand_err, _graphics_err]) else {"data": _data_err, "brand": _brand_err, "graphics": _graphics_err}})
+    except Exception as e:
+        # ничего не предполагаем про типы; просто честно отдаём ошибку
+        return JSONResponse({
+            "ok": False,
+            "refreshed": False,
+            "error": repr(e),
+        }, status_code=500)
 
 HELP_TEXT = (
     "Привет! Я онлайн 🤖\n\n"
