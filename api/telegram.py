@@ -5,7 +5,7 @@
 # PNG отсылается как документ (прозрачность сохраняется).
 
 from __future__ import annotations
-import os, io, re, json, time, unicodedata, uuid, mimetypes
+import os, io, re, json, time, unicodedata, uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Request
@@ -26,8 +26,8 @@ def _log(*a):
     except:
         pass
 
-# --- Безопасный импорт зависимостей (диагностика не падала на бою) ---
-def _safe_import(modname: str, names: List[str]) -> Tuple[Optional[Any], List[Any], Optional[str]]:
+# --- Безопасный импорт зависимостей ---
+def _safe_import(modname: str, names: List[str]):
     try:
         m = __import__(modname, fromlist=names)
         out = [getattr(m, n) for n in names]
@@ -36,31 +36,70 @@ def _safe_import(modname: str, names: List[str]) -> Tuple[Optional[Any], List[An
         return None, [], f"{e.__class__.__name__}: {e}"
 
 # data
-_data_mod, _data_objs, _data_err = _safe_import("data", [
-    "get_players", "refresh_players", "find_player_by_name",
-    "display_name_for", "overrides_save_name_ru", "overrides_get_name_ru",
-    "ensure_headshot_png", "ensure_team_logo_png"
-])
-if _data_err and DEBUG: _log("[boot] data import error:", _data_err)
-(get_players, refresh_players, find_player_by_name,
- display_name_for, overrides_save_name_ru, overrides_get_name_ru,
- ensure_headshot_png, ensure_team_logo_png) = ([_ for _ in _data_objs] + [None]*8)[:8]
+_data_mod, _data_objs, _data_err = _safe_import(
+    "data",
+    [
+        "get_players",
+        "refresh_players",
+        "find_player_by_name",
+        "display_name_for",
+        "overrides_save_name_ru",
+        "overrides_get_name_ru",
+        "ensure_headshot_png",
+        "ensure_team_logo_png",
+    ],
+)
+if _data_err and DEBUG:
+    _log("[boot] data import error:", _data_err)
+
+get_players = refresh_players = find_player_by_name = None
+display_name_for = overrides_save_name_ru = overrides_get_name_ru = None
+ensure_headshot_png = ensure_team_logo_png = None
+if not _data_err:
+    (
+        get_players,
+        refresh_players,
+        find_player_by_name,
+        display_name_for,
+        overrides_save_name_ru,
+        overrides_get_name_ru,
+        ensure_headshot_png,
+        ensure_team_logo_png,
+    ) = _data_objs
 
 # team_brand
-_brand_mod, _brand_objs, _brand_err = _safe_import("team_brand", [
-    "get_team_brand", "color_name_ru", "set_team_primary_color"
-])
-if _brand_err and DEBUG: _log("[boot] team_brand import error:", _brand_err)
-(get_team_brand, color_name_ru, set_team_primary_color) = ([_ for _ in _brand_objs] + [None]*3)[:3]
+_brand_mod, _brand_objs, _brand_err = _safe_import(
+    "team_brand", ["get_team_brand", "color_name_ru", "set_team_primary_color"]
+)
+if _brand_err and DEBUG:
+    _log("[boot] team_brand import error:", _brand_err)
+get_team_brand = color_name_ru = set_team_primary_color = None
+if not _brand_err:
+    (get_team_brand, color_name_ru, set_team_primary_color) = _brand_objs
 
 # graphics
-_graphics_mod, _graphics_objs, _graphics_err = _safe_import("graphics", [
-    "render_card", "render_card2", "render_card_bad",
-    "render_card_special", "render_card_drN"
-])
-if _graphics_err and DEBUG: _log("[boot] graphics import error:", _graphics_err)
-(render_card, render_card2, render_card_bad,
- render_card_special, render_card_drN) = ([_ for _ in _graphics_objs] + [None]*5)[:5]
+_graphics_mod, _graphics_objs, _graphics_err = _safe_import(
+    "graphics",
+    [
+        "render_card",
+        "render_card2",
+        "render_card_bad",
+        "render_card_special",
+        "render_card_drN",
+    ],
+)
+if _graphics_err and DEBUG:
+    _log("[boot] graphics import error:", _graphics_err)
+render_card = render_card2 = render_card_bad = None
+render_card_special = render_card_drN = None
+if not _graphics_err:
+    (
+        render_card,
+        render_card2,
+        render_card_bad,
+        render_card_special,
+        render_card_drN,
+    ) = _graphics_objs
 
 app = FastAPI()
 
@@ -82,16 +121,24 @@ def _tg_post(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         return _http_json(_tg_url(method), payload)
     except HTTPError as e:
-        if DEBUG: _log("[tg] HTTPError", method, e)
+        if DEBUG:
+            _log("[tg] HTTPError", method, e)
         return {"ok": False, "error": f"HTTPError {e.code}"}
     except URLError as e:
-        if DEBUG: _log("[tg] URLError", method, e)
+        if DEBUG:
+            _log("[tg] URLError", method, e)
         return {"ok": False, "error": "URLError"}
     except Exception as e:
-        if DEBUG: _log("[tg] send error:", repr(e))
+        if DEBUG:
+            _log("[tg] send error:", repr(e))
         return {"ok": False, "error": repr(e)}
 
-def _tg_send_message(chat_id: int, text: str, reply_to: Optional[int] = None, parse_mode: Optional[str] = None):
+def _tg_send_message(
+    chat_id: int,
+    text: str,
+    reply_to: Optional[int] = None,
+    parse_mode: Optional[str] = None,
+):
     payload = {"chat_id": chat_id, "text": text}
     if reply_to:
         payload["reply_to_message_id"] = reply_to
@@ -106,7 +153,9 @@ def _tg_send_chat_action(chat_id: int, action: str = "typing"):
 def _multipart_boundary() -> str:
     return "----WebKitFormBoundary" + uuid.uuid4().hex
 
-def _encode_multipart(fields: Dict[str, str], files: Dict[str, Tuple[str, bytes, str]]) -> Tuple[bytes, str]:
+def _encode_multipart(
+    fields: Dict[str, str], files: Dict[str, Tuple[str, bytes, str]]
+) -> Tuple[bytes, str]:
     boundary = _multipart_boundary()
     CRLF = b"\r\n"
     lines: List[bytes] = []
@@ -128,7 +177,9 @@ def _encode_multipart(fields: Dict[str, str], files: Dict[str, Tuple[str, bytes,
     ctype = f"multipart/form-data; boundary={boundary}"
     return body, ctype
 
-def _tg_send_png_as_document(chat_id: int, png_bytes: bytes, filename: str = "card.png", caption: Optional[str] = None):
+def _tg_send_png_as_document(
+    chat_id: int, png_bytes: bytes, filename: str = "card.png", caption: Optional[str] = None
+):
     url = _tg_url("sendDocument")
     fields = {"chat_id": str(chat_id)}
     if caption:
@@ -144,7 +195,8 @@ def _tg_send_png_as_document(chat_id: int, png_bytes: bytes, filename: str = "ca
             except Exception:
                 return {"ok": False, "raw": raw}
     except Exception as e:
-        if DEBUG: _log("[tg] sendDocument error:", repr(e))
+        if DEBUG:
+            _log("[tg] sendDocument error:", repr(e))
         return {"ok": False, "error": repr(e)}
 
 # --- Вспомогательные утилиты домена ---
@@ -163,15 +215,38 @@ def ensure_players_loaded(force: bool = False) -> List[Dict[str, Any]]:
     Гарантированная подгрузка игроков в память (через data.get_players / refresh_players).
     """
     global PLAYERS_READY
-    ps = []
+    ps: List[Dict[str, Any]] = []
     try:
-        ps = get_players(force_refresh=bool(force)) if get_players else []
+        if get_players:
+            # get_players(force_refresh=...) может не принимать именованный аргумент в старых версиях
+            try:
+                ps = get_players(force_refresh=bool(force))  # type: ignore
+            except TypeError:
+                ps = get_players()  # type: ignore
+
         if not ps or len(ps) < 100:
             _log("[players] empty -> refresh()")
             if refresh_players:
-                cnt, info = refresh_players()
-                _log("[players] refresh:", {"count": cnt, **(info or {})})
-                ps = get_players(force_refresh=False) if get_players else []
+                res = refresh_players()  # ожидаем (count, source_url) ИЛИ (count, info_dict)
+                # просто логируем человеко-понятно
+                cnt = None
+                src = None
+                if isinstance(res, (list, tuple)) and len(res) >= 1:
+                    try:
+                        cnt = int(res[0])
+                    except Exception:
+                        cnt = None
+                    if len(res) > 1:
+                        src = res[1]
+                _log("[players] refresh:", {"count": cnt, "src": src})
+
+                # перечитываем
+                if get_players:
+                    try:
+                        ps = get_players(force_refresh=False)  # type: ignore
+                    except TypeError:
+                        ps = get_players()  # type: ignore
+
         PLAYERS_READY = bool(ps and len(ps) >= 100)
         _log(f"[players] ready={PLAYERS_READY} count={len(ps) if ps else 0}")
     except Exception as e:
@@ -278,34 +353,22 @@ def _ensure_headshot_image(p: Dict[str, Any]):
         _log("[tg] headshot ensure err", p.get("personId"), repr(e))
         return None
 
-def _ensure_team_logo_image(team_id: str):
-    from PIL import Image
-    try:
-        path = ensure_team_logo_png(team_id) if ensure_team_logo_png else None
-        if path and os.path.exists(path):
-            return Image.open(path).convert("RGBA")
-        # team_brand.get_team_brand тоже вернёт путь
-        brand = get_team_brand(team_id) if get_team_brand else None
-        if brand:
-            _, logo_path, _, _ = brand
-            if logo_path and os.path.exists(logo_path):
-                return Image.open(logo_path).convert("RGBA")
-        return None
-    except Exception as e:
-        _log("[tg] team logo ensure err", team_id, repr(e))
-        return None
-
 def _team_brand_tuple(team_id: str) -> Tuple[Tuple[str, str, str], Optional[Any], List[str], bool]:
     """
     Обёртка вокруг team_brand.get_team_brand: вернёт цвета, PIL-логотип, список предложенных цветов, признак сохранённого цвета.
     """
     try:
-        colors, logo_path, palette, saved = get_team_brand(team_id) if get_team_brand else (("#007ACC", "#005C99", "#007ACC"), None, [], False)
+        colors = ("#007ACC", "#005C99", "#007ACC")
         logo_img = None
-        if logo_path and os.path.exists(logo_path):
-            from PIL import Image
-            logo_img = Image.open(logo_path).convert("RGBA")
-        return colors, logo_img, palette, saved
+        palette: List[str] = []
+        saved = False
+        if get_team_brand:
+            ctuple, logo_path, palette, saved = get_team_brand(team_id)
+            colors = ctuple or colors
+            if logo_path and os.path.exists(logo_path):
+                from PIL import Image
+                logo_img = Image.open(logo_path).convert("RGBA")
+        return colors, logo_img, palette or [], bool(saved)
     except Exception as e:
         _log("[tg] team_brand err", team_id, repr(e))
         return (("#007ACC", "#005C99", "#007ACC"), None, [], False)
@@ -324,51 +387,85 @@ async def telegram_get(request: Request):
     if bad:
         return bad
     action = (request.query_params.get("action") or "").strip()
-    if action == "diag":
-        return JSONResponse({
-            "ok": True,
-            "py": ".".join(map(str, __import__("sys").version_info[:3])),
-            "platform": __import__("platform").system().lower(),
-            "has_bot_token": bool(BOT_TOKEN),
-            "modules": {
-                "data": "ok" if _data_err is None else "error",
-                "graphics": "ok" if _graphics_err is None else "error",
-                "team_brand": "ok" if _brand_err is None else "error",
-            },
-            "errors": {
-                "data": _data_err,
-                "graphics": _graphics_err,
-                "team_brand": _brand_err,
-            },
-            "api_origin": API_ORIGIN or None,
-        })
-        
-  elif action == "refresh":
-    # безопасное обновление пула игроков
-    try:
-        from data import refresh_players, get_players  # берем функции как есть
-        cnt, src = refresh_players()                  # <-- (int, str)
-        # ещё раз читаем список, чтобы не зависеть от внутреннего состояния
-        try:
-            players_now = get_players(force_refresh=False)
-            cnt_now = len(players_now) if isinstance(players_now, list) else int(cnt)
-        except Exception:
-            cnt_now = int(cnt)
 
-        return JSONResponse({
-            "ok": True,
-            "refreshed": True,
-            "players_indexed": int(cnt_now),
-            "source": ("custom" if (isinstance(src, str) and src != "none") else "none"),
-            "source_url": (src if isinstance(src, str) and src else None),
-        })
-    except Exception as e:
-        # ничего не предполагаем про типы; просто честно отдаём ошибку
-        return JSONResponse({
-            "ok": False,
-            "refreshed": False,
-            "error": repr(e),
-        }, status_code=500)
+    if action == "diag":
+        return JSONResponse(
+            {
+                "ok": True,
+                "py": ".".join(map(str, __import__("sys").version_info[:3])),
+                "platform": __import__("platform").system().lower(),
+                "has_bot_token": bool(BOT_TOKEN),
+                "modules": {
+                    "data": "ok" if _data_err is None else "error",
+                    "graphics": "ok" if _graphics_err is None else "error",
+                    "team_brand": "ok" if _brand_err is None else "error",
+                },
+                "errors": {
+                    "data": _data_err,
+                    "graphics": _graphics_err,
+                    "team_brand": _brand_err,
+                },
+                "api_origin": API_ORIGIN or None,
+            }
+        )
+
+    elif action == "refresh":
+        # безопасное обновление пула игроков
+        try:
+            from data import refresh_players, get_players  # берем функции как есть
+            res = refresh_players()
+            # читаем кортеж гибко
+            cnt = 0
+            src = None
+            if isinstance(res, (list, tuple)):
+                if len(res) >= 1:
+                    try:
+                        cnt = int(res[0])
+                    except Exception:
+                        cnt = 0
+                if len(res) >= 2:
+                    src = res[1]
+            # перечитываем пул
+            try:
+                players_now = get_players(force_refresh=False)  # type: ignore
+            except TypeError:
+                players_now = get_players()  # type: ignore
+            cnt_now = len(players_now) if isinstance(players_now, list) else cnt
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "refreshed": True,
+                    "players_indexed": int(cnt_now),
+                    "source": ("custom" if (isinstance(src, str) and src and src != "none") else "none"),
+                    "source_url": (src if isinstance(src, str) and src else None),
+                }
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"ok": False, "refreshed": False, "error": repr(e)}, status_code=500
+            )
+
+    elif action == "test_find":
+        q = (request.query_params.get("q") or "").strip()
+        hits = search_players_loose(q) if q else []
+        return JSONResponse(
+            {
+                "ok": True,
+                "q": q,
+                "players_ready": PLAYERS_READY,
+                "hits": [
+                    {
+                        "displayName": h.get("displayName"),
+                        "personId": h.get("personId"),
+                        "teamId": h.get("teamId"),
+                    }
+                    for h in hits[:10]
+                ],
+            }
+        )
+
+    # дефолт — просто пинг роутера
+    return JSONResponse({"ok": True, "route": "telegram-get"})
 
 HELP_TEXT = (
     "Привет! Я онлайн 🤖\n\n"
@@ -393,10 +490,13 @@ async def webhook_query(request: Request):
     try:
         body = await request.body()
         raw = body.decode("utf-8", "ignore")
-        if DEBUG: _log("[tg]", rid, "POST", request.url, "\nbody:", raw)
+        if DEBUG:
+            _log("[tg]", rid, "POST", str(request.url))
+            _log("[tg] body:", raw)
         update = json.loads(raw)
     except Exception as e:
-        if DEBUG: _log("[tg]", rid, "json error:", repr(e))
+        if DEBUG:
+            _log("[tg]", rid, "json error:", repr(e))
         return PlainTextResponse("OK")
 
     # прогреем игроков
@@ -441,7 +541,9 @@ async def webhook_query(request: Request):
             return PlainTextResponse("OK")
         lines = []
         for h in hits[:5]:
-            lines.append(f"{h.get('displayName')} (id={h.get('personId')}, teamId={h.get('teamId')})")
+            lines.append(
+                f"{h.get('displayName')} (id={h.get('personId')}, teamId={h.get('teamId')})"
+            )
         _tg_send_message(chat_id, "\n".join(lines))
         return PlainTextResponse("OK")
 
@@ -449,11 +551,13 @@ async def webhook_query(request: Request):
         # формат: /card <имя> | <статы>
         try:
             args = text[len("/card"):].strip()
-            # сплит по | : имя | статы
             parts = [p.strip() for p in args.split("|")]
             if len(parts) < 2:
-                _tg_send_message(chat_id, "Формат: /card <имя> | <метрики через запятую>")
+                _tg_send_message(
+                    chat_id, "Формат: /card <имя> | <метрики через запятую>"
+                )
                 return PlainTextResponse("OK")
+
             name_q = parts[0]
             stats_raw = parts[1]
             stats = parse_stats_list(stats_raw)
@@ -466,9 +570,15 @@ async def webhook_query(request: Request):
                 _tg_send_message(chat_id, f"Не нашёл игрока: {name_q}")
                 return PlainTextResponse("OK")
             if len(hits) > 1:
-                # предложим топ-4
-                menu = "\n".join([f"{i+1}. {h.get('displayName')} (id={h.get('personId')})" for i, h in enumerate(hits[:4])])
-                _tg_send_message(chat_id, "Нашёл несколько вариантов:\n" + menu + "\nУточните запрос.")
+                menu = "\n".join(
+                    [
+                        f"{i+1}. {h.get('displayName')} (id={h.get('personId')})"
+                        for i, h in enumerate(hits[:4])
+                    ]
+                )
+                _tg_send_message(
+                    chat_id, "Нашёл несколько вариантов:\n" + menu + "\nУточните запрос."
+                )
                 return PlainTextResponse("OK")
 
             p = hits[0]
@@ -482,30 +592,25 @@ async def webhook_query(request: Request):
                 pass
 
             if not ru_name:
-                # спрашиваем имя
-                sent = _tg_send_message(
+                _tg_send_message(
                     chat_id,
-                    f"Как подписать игрока {p.get('displayName')} на плашке?\nОтветьте на это сообщение русским именем.\n[setname:{pid}]"
+                    f"Как подписать игрока {p.get('displayName')} на плашке?\n"
+                    f"Ответьте на это сообщение русским именем.\n[setname:{pid}]",
                 )
                 return PlainTextResponse("OK")
 
-            # готовим плашку
             _tg_send_message(chat_id, "_Готовлю плашку…_", parse_mode="Markdown")
             _tg_send_chat_action(chat_id, "upload_document")
 
-            # бренд (цвета + логотип)
             team_id = str(p.get("teamId") or "0")
             colors, logo_img, _, _ = _team_brand_tuple(team_id)
 
-            # headshot
             head_img = _ensure_headshot_image(p)
             if head_img is None:
                 _tg_send_message(chat_id, "Не удалось получить фото игрока.")
                 return PlainTextResponse("OK")
 
-            # рендер PNG
             png = render_card("single", ru_name, "", logo_img, colors, head_img, stats)
-            # отправка как документ (с прозрачностью)
             fname = f"card_{pid}.png"
             _tg_send_png_as_document(chat_id, png, filename=fname)
 
