@@ -1,6 +1,9 @@
 # graphics.py — плашки: card, card2, cardBAD, cardS, drN
-# Правки: центрирование name+stats как группы; единый размер в card2; общий масштаб stats в card2;
-# cardS — правый текст поверх всех слоёв; cardBAD — 💩 больше и ниже; логотипы сдвинуты на -30px/-30px.
+# Обновления:
+# • card2: максимальный ОДИНАКОВЫЙ шрифт имени для обоих игроков; общий масштаб статов; слои верные.
+# • cardS: правый текст подгоняется по ширине и высоте (не обрезается), рендерится поверх всех слоёв.
+# • cardBAD: иконка 💩 выровнена по нижней границе имени; стала крупнее; логотип команды со сдвигом.
+# • Везде: имя и строка статов центрируются как единая группа.
 
 from __future__ import annotations
 from typing import List, Tuple, Optional, Dict, Any
@@ -33,7 +36,7 @@ LOGO_D      = 140
 LOGO_SIZE   = 124
 LOGO_OFFSET_X = 18
 LOGO_OFFSET_Y = 210
-# Доп. сдвиг лого: 30px вверх и влево
+# Сдвиг лого команды: 30px вверх и влево
 LOGO_SHIFT_X = -30
 LOGO_SHIFT_Y = -30
 
@@ -87,7 +90,7 @@ def _fit_text_to_width(text: str, font_path: str, max_w: int, max_size: int, min
     return best_img, best_font
 
 def _best_pair_font_size(text1: str, text2: str, font_path: str, max_w1: int, max_w2: int, max_size: int, min_size: int=22) -> int:
-    # Общий размер, который поместится у ОБОИХ
+    # Максимальный общий размер, который поместится у ОБОИХ
     lo, hi = min_size, max_size
     probe = Image.new("RGBA", (1,1)); d = ImageDraw.Draw(probe)
     ok_size = min_size
@@ -174,7 +177,7 @@ def _metric_line(stats: List[Tuple[str,str]], f_val, f_lbl, color=(255,255,255,2
     return line
 
 def _center_pair_x(base_left: int, img_a: Image.Image, img_b: Image.Image) -> Tuple[int,int,int]:
-    """Вернёт (group_w, x_name, x_stats) при центрировании на общий центр группы от base_left."""
+    # Вернёт (group_w, x_name, x_stats) при центрировании как общей группы от base_left
     group_w = max(img_a.width, img_b.width)
     cx = base_left + group_w // 2
     xa = cx - img_a.width // 2
@@ -214,21 +217,17 @@ def render_card(template: str,
         stats_line = stats_line.resize((max(1,int(stats_line.width*k)), max(1,int(stats_line.height*k))), Image.LANCZOS)
 
     bar_y = H - BAR_H
-    # ширина панели — по максимальной из пары (центрирование группы)
     group_w, name_x, stats_x = _center_pair_x(name_area_x, name_img, stats_line)
-    content_right = max(name_area_x + group_w, PAD_L + HEAD_SIZE + 32)  # чтобы не схлопывалось
+    content_right = max(name_area_x + group_w, PAD_L + HEAD_SIZE + 32)
     bar_w = min(W, content_right + PAD_R)
 
-    # панели
     panel = _rounded_horizontal_gradient(bar_w, BAR_H, 22, left_rgb, right_rgb)
     canvas.alpha_composite(panel, (0, bar_y))
 
-    # head
     head_x = PAD_L
     head_y = bar_y - head.height//3
     canvas.alpha_composite(head, (head_x, head_y))
 
-    # лого
     if team_logo_img:
         logo_raw = team_logo_img.resize((LOGO_SIZE, LOGO_SIZE), Image.LANCZOS)
         d = LOGO_D
@@ -246,7 +245,6 @@ def render_card(template: str,
         canvas.alpha_composite(shadow, (logo_x-3, logo_y-3))
         canvas.alpha_composite(logo_circle, (logo_x, logo_y))
 
-    # центрированные имя/статы
     name_y = bar_y + TOP_IN
     stats_y = name_y + name_img.height + NAME_STATS_GAP
     canvas.alpha_composite(name_img, (name_x, name_y))
@@ -265,18 +263,21 @@ def render_card2(
     bar_y = H - BAR_H
     w_half = W//2
 
-    # Общая высота строк и одинаковые шрифты
+    # Максимальный общий размер имени
     name_area_x1 = 0 + 32 + DUO_HEAD + 24
     name_area_x2 = w_half + 32 + DUO_HEAD + 24
     max_w1 = w_half - name_area_x1 - 24
     max_w2 = w_half - name_area_x2 - 24
-    common_name_size = _best_pair_font_size(player1_name.upper(), player2_name.upper(), F_BOLD_PATH, max_w1, max_w2, BASE_NAME, 22)
+    common_name_size = _best_pair_font_size(
+        player1_name.upper(), player2_name.upper(),
+        F_BOLD_PATH, max_w1, max_w2,
+        max_size=96, min_size=22
+    )
     f_name_common = _load_font(F_BOLD_PATH, common_name_size)
 
     f_val = _load_font(F_EXO_PATH, BASE_VAL)
     f_lbl = _load_font(F_SB_PATH,  BASE_LBL)
 
-    # Сформируем заранее элементы для обеих сторон
     def _side_pre(player_name, head_img, stats):
         head = _circle_crop_img(head_img, DUO_HEAD)
         name_img = _text_img(player_name.upper(), f_name_common)
@@ -287,7 +288,7 @@ def render_card2(
     headL, nameL, statsL = _side_pre(player1_name, head1, stats1)
     headR, nameR, statsR = _side_pre(player2_name, head2, stats2)
 
-    # Масштаб stats одинаковым коэффициентом
+    # Одинаковый масштаб строк статов
     avail_h = BAR_H - TOP_IN - max(nameL.height, nameR.height) - NAME_STATS_GAP - BOT_IN
     if avail_h < 1: avail_h = 1
     kL = min(1.0, avail_h / max(1, statsL.height))
@@ -303,16 +304,13 @@ def render_card2(
         rgb = _hex_to_rgb(primary)
         left_rgb, right_rgb = _shade(rgb, 0.65), rgb
 
-        # панель
         panel = _rounded_horizontal_gradient(w_half, BAR_H, 22, left_rgb, right_rgb)
         canvas.alpha_composite(panel, (x0, bar_y))
 
-        # head
         head_x = x0 + 32
         head_y = bar_y - head.height//3
         canvas.alpha_composite(head, (head_x, head_y))
 
-        # лого
         if team_logo:
             logo_raw = team_logo.resize((LOGO_SIZE, LOGO_SIZE), Image.LANCZOS)
             d = LOGO_D
@@ -330,7 +328,6 @@ def render_card2(
             canvas.alpha_composite(shadow, (logo_x-3, logo_y-3))
             canvas.alpha_composite(circle, (logo_x, logo_y))
 
-        # центрирование name+stats как группы
         base_left = x0 + 32 + DUO_HEAD + 24
         group_w, name_x, stats_x = _center_pair_x(base_left, name_img, stats_line)
         name_y = bar_y + TOP_IN
@@ -372,9 +369,8 @@ def render_card_bad(player_name: str,
         k = avail_h / stats_line.height
         stats_line = stats_line.resize((max(1,int(stats_line.width*k)), max(1,int(stats_line.height*k))), Image.LANCZOS)
 
-    # ширина панели по группе + запас под 💩
     group_w, name_x, stats_x = _center_pair_x(name_area_x, name_img, stats_line)
-    poop_w = 64 + 16
+    poop_w = 72 + 16
     content_right = max(name_area_x + group_w + poop_w, PAD_L + HEAD_SIZE + 32)
     bar_w = min(W, content_right + PAD_R)
 
@@ -405,11 +401,11 @@ def render_card_bad(player_name: str,
     name_y = bar_y + TOP_IN
     stats_y = name_y + name_img.height + NAME_STATS_GAP
     canvas.alpha_composite(name_img, (name_x, name_y))
-    # 💩 — больше и ниже
+    # 💩 — крупнее, по нижней границе имени
     try:
-        poop = Image.open(POOP_ICON).convert("RGBA").resize((64,64), Image.LANCZOS)
+        poop = Image.open(POOP_ICON).convert("RGBA").resize((72,72), Image.LANCZOS)
         px = name_x + name_img.width + 12
-        py = name_y + 16  # ниже на ~18px
+        py = name_y + name_img.height - poop.height  # нижние границы совпадают
         canvas.alpha_composite(poop, (px, py))
     except Exception:
         pass
@@ -419,7 +415,7 @@ def render_card_bad(player_name: str,
     canvas.save(bio, format="PNG")
     return bio.getvalue()
 
-# ---------- DRN (без логических правок) ----------
+# ---------- DRN (как было) ----------
 _GUIDE_COLORS = {
     "name": (255,255,0,255),
     "head": (255,0,255,255),
@@ -632,7 +628,7 @@ def render_card_drN(
     return bio.getvalue()
 
 # ---------- SPECIAL (cardS) ----------
-def _wrap_text_to_width(text: str, font: ImageFont.FreeTypeFont, max_w: int) -> Image.Image:
+def _wrap_text_to_width_with_font(text: str, font: ImageFont.FreeTypeFont, max_w: int, spacing: int = 4) -> Image.Image:
     words = text.split()
     lines: List[str] = []
     cur = ""
@@ -647,10 +643,20 @@ def _wrap_text_to_width(text: str, font: ImageFont.FreeTypeFont, max_w: int) -> 
             else:   lines.append(w); cur = ""
     if cur: lines.append(cur)
     txt = "\n".join(lines)
-    l,tb,r,b = d.multiline_textbbox((0,0), txt, font=font, spacing=4)
+    l,tb,r,b = d.multiline_textbbox((0,0), txt, font=font, spacing=spacing)
     img = Image.new("RGBA", (max(1,r-l), max(1,b-tb)), (0,0,0,0))
-    ImageDraw.Draw(img).multiline_text((0,0), txt, font=font, spacing=4, fill=(255,255,255,255))
+    ImageDraw.Draw(img).multiline_text((0,0), txt, font=font, spacing=spacing, fill=(255,255,255,255))
     return img
+
+def _fit_multiline_to_box(text: str, font_path: str, max_w: int, max_h: int, max_size: int, min_size: int=18, spacing: int=4) -> Image.Image:
+    size = max_size
+    while size >= min_size:
+        f = _load_font(font_path, size)
+        img = _wrap_text_to_width_with_font(text, f, max_w, spacing=spacing)
+        if img.height <= max_h:
+            return img
+        size -= 1
+    return _wrap_text_to_width_with_font(text, _load_font(font_path, min_size), max_w, spacing=spacing)
 
 def render_card_special(
     player_name: str,
@@ -685,39 +691,45 @@ def render_card_special(
         k = avail_h / stats_line.height
         stats_line = stats_line.resize((max(1,int(stats_line.width*k)), max(1,int(stats_line.height*k))), Image.LANCZOS)
 
-    # Центрирование группы слева
+    # Левая панель динамической ширины
     group_w, name_x, stats_x = _center_pair_x(name_area_x, name_img, stats_line)
     content_right = max(name_area_x + group_w, PAD_L + HEAD_SIZE + 32)
     bar_w_main = min(W - PAD_R, content_right + PAD_R)
 
-    # Правая панель (половина доступной ширины)
+    # Правая панель — ровно половина оставшегося места
     gap = 10
     max_right_total = max(0, W - (bar_w_main + gap) - PAD_R)
     right_target = max_right_total // 2
 
-    # Рисуем панели
+    # Панели
     left_panel = _rounded_horizontal_gradient(bar_w_main, BAR_H, 22, left_rgb, right_rgb)
     canvas.alpha_composite(left_panel, (0, bar_y))
-    info_panel = None; info_pos = (0,0); wrapped = None; info_star = None
+
+    info_pos = None
+    info_star = None
+    wrapped = None
     if right_target > 0 and info_text:
         info_panel = _rounded_horizontal_gradient(right_target, BAR_H, 22, left_rgb, right_rgb)
         info_x = bar_w_main + gap
         info_y = bar_y
         canvas.alpha_composite(info_panel, (info_x, info_y))
-        # подготовим контент, но выведем ПОСЛЕ всех слоёв:
+
+        # Внутренние отступы и расчёт бокса
+        inner_pad = 16
+        star_w = 0
         try:
             info_star = Image.open(STAR_ICON).convert("RGBA").resize((36,36), Image.LANCZOS)
+            star_w = info_star.width + 10
         except Exception:
             info_star = None
-        f_info = _load_font(F_SB_PATH, 44)
-        inner_pad = 16
-        star_w = (info_star.width + 10) if info_star else 0
-        text_max = max(40, right_target - inner_pad*2 - star_w)
-        wrapped = _wrap_text_to_width(info_text, f_info, text_max)
-        # координаты отрисовки контента запомним
+            star_w = 0
+
+        max_text_w = max(40, right_target - inner_pad*2 - star_w)
+        max_text_h = BAR_H - TOP_IN - BOT_IN
+        wrapped = _fit_multiline_to_box(info_text, F_SB_PATH, max_text_w, max_text_h, max_size=44, min_size=18, spacing=4)
         info_pos = (info_x + inner_pad, info_y + TOP_IN, star_w)
 
-    # Графические слои сверху панелей
+    # Графические слои
     canvas.alpha_composite(head, (head_x, head_y))
     if team_logo_img:
         logo_raw = team_logo_img.resize((LOGO_SIZE, LOGO_SIZE), Image.LANCZOS)
@@ -736,14 +748,13 @@ def render_card_special(
         canvas.alpha_composite(shadow, (logo_x-3, logo_y-3))
         canvas.alpha_composite(logo_circle, (logo_x, logo_y))
 
-    # Текст слева
     name_y = bar_y + TOP_IN
     stats_y = name_y + name_img.height + NAME_STATS_GAP
     canvas.alpha_composite(name_img, (name_x, name_y))
     canvas.alpha_composite(stats_line, (stats_x, stats_y))
 
-    # И наконец — ПРАВЫЙ текст ПОВЕРХ ВСЕГО
-    if wrapped is not None:
+    # Правый текст — в самом верху слоёв
+    if wrapped is not None and info_pos is not None:
         ix, iy, star_w = info_pos
         cur_x = ix
         if info_star:
