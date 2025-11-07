@@ -1,5 +1,4 @@
 # data.py — поиск по PASSTHROUGH (имена/команды), normalized только для headshot
-
 from __future__ import annotations
 import os, io, json, time, re
 from typing import Any, Dict, List, Tuple, Optional
@@ -17,11 +16,11 @@ TIMEOUT           = int(os.getenv("PLAYERS_CUSTOM_TIMEOUT", "30"))
 ATTEMPTS          = int(os.getenv("PLAYERS_CUSTOM_ATTEMPTS", "3"))
 ACTIVE_ONLY       = os.getenv("PLAYERS_ACTIVE_ONLY", "true").lower() in ("1","true","yes")
 MIN_EXPECTED      = int(os.getenv("PLAYERS_MIN_EXPECTED", "350"))
-PLAYERS_JSON_URL  = os.getenv("PLAYERS_JSON_URL", "").strip()  # опциональный бэкап со списком игроков (с именами)
+PLAYERS_JSON_URL  = os.getenv("PLAYERS_JSON_URL", "").strip()  # опциональный бэкап (HTTP)
 
 IMAGE_PROXY_URLS  = [u.strip() for u in os.getenv("IMAGE_PROXY_URLS","").split(",") if u.strip()]
 
-# overrides имён (локально + опционально GitHub)
+# overrides имён
 OV_GH_TOKEN  = os.getenv("OVERRIDES_GH_TOKEN","").strip()
 OV_GH_REPO   = os.getenv("OVERRIDES_GH_REPO","").strip()          # "owner/repo"
 OV_GH_BRANCH = os.getenv("OVERRIDES_GH_BRANCH","main").strip()
@@ -29,23 +28,22 @@ OV_GH_PATH   = os.getenv("OVERRIDES_GH_PATH","assets/players_overrides.json").st
 
 NAMES_LOCAL_PATH = "/tmp/names_ru.json"
 
-# Лого команд локальные
+# Лого команд
 ROOT_DIR   = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(ROOT_DIR, "assets")
 LOGO_DIRS  = [os.path.join(ASSETS_DIR, "cache"), os.path.join(ASSETS_DIR, "teams")]
 
-# Значения по умолчанию для прямых урлов
 DEFAULT_PT   = f"https://nba-players-proxy.znamteam-903.workers.dev/players?season={ENV_SEASON}&format=passthrough"
 DEFAULT_NORM = f"https://nba-players-proxy.znamteam-903.workers.dev/players?season={ENV_SEASON}&format=normalized"
 
 # =========================
 # Состояние
 # =========================
-_PLAYERS: List[Dict[str, Any]] = []     # итоговый список (имена из passthrough; headshot добавлен из normalized при наличии)
+_PLAYERS: List[Dict[str, Any]] = []
 _LAST_SOURCE: str = "none"
 _LAST_REFRESH_AT: float = 0.0
 
-_NAMES_RU: Dict[str, str] = {}          # personId -> "Имя Фамилия" (override)
+_NAMES_RU: Dict[str, str] = {}  # personId -> "Имя Фамилия"
 
 def _log(*a):
     try: print("[data]", *a, flush=True)
@@ -63,11 +61,13 @@ def _http_json(url: str, timeout: int = TIMEOUT) -> Any:
 
 def _try_fetch(url: str) -> Any:
     last = None
-    for _ in range(ATTEMPTS):
+    for i in range(ATTEMPTS):
         try:
-            return _http_json(url, timeout=TIMEOUT)
+            j = _http_json(url, timeout=TIMEOUT)
+            return j
         except Exception as e:
             last = e
+            _log("fetch attempt", i+1, "failed:", url, repr(e))
     if last: _log("fetch err:", url, repr(last))
     return None
 
@@ -86,10 +86,6 @@ def _s(x: Any) -> str:
         return ""
 
 def _classify_urls() -> Tuple[List[str], List[str]]:
-    """
-    Разбираем ENV на два массива: passthrough_urls и normalized_urls.
-    Если нашли только normalized — добавим кандидат с заменой format=normalized -> format=passthrough.
-    """
     urls: List[str] = []
     if ENV_URLS:
         urls += [u.strip() for u in ENV_URLS.split(",") if u.strip()]
@@ -106,22 +102,20 @@ def _classify_urls() -> Tuple[List[str], List[str]]:
         elif "format=normalized" in lu or "normalized" in lu:
             norm.append(u)
         else:
-            # неизвестно — считаем как passthrough
             pt.append(u)
 
-    # если нет pt, но есть norm — попробуем сгенерировать pt-кандидаты
     if not pt and norm:
+        # генерим pt-кандидаты из normalized
         for u in norm:
             if "format=normalized" in u:
                 pt.append(u.replace("format=normalized", "format=passthrough"))
             elif "normalized" in u:
                 pt.append(u.replace("normalized", "passthrough"))
-        # если и это не получилось — просто добавим дефолт
-        if not pt:
-            pt = [DEFAULT_PT]
-
     if not pt:   pt = [DEFAULT_PT]
     if not norm: norm = [DEFAULT_NORM]
+
+    _log("pt_urls:", pt)
+    _log("norm_urls:", norm)
     return pt, norm
 
 def _extract_passthrough(obj: Any) -> List[Dict[str, Any]]:
@@ -164,10 +158,6 @@ def _index_by_pid(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return m
 
 def _merge_passthrough_with_normalized(base_names: List[Dict[str, Any]], norm_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Поиск, имена, команды — только из base_names (passthrough).
-    normalized добавляет лишь headshot по совпадающему personId.
-    """
     if not base_names and not norm_rows: return []
     names_ix = _index_by_pid(base_names)
     norm_ix  = _index_by_pid(norm_rows)
@@ -178,64 +168,97 @@ def _merge_passthrough_with_normalized(base_names: List[Dict[str, Any]], norm_ro
         if n and n.get("headshot"):
             r["headshot"] = _s(n.get("headshot"))
         merged.append(r)
-    # Фильтр активных
     if ACTIVE_ONLY:
         merged = [p for p in merged if p.get("isActive", True)]
     return merged
+
+# ===== локальный бэкап (без сети) =====
+def _load_local_players_json() -> List[Dict[str, Any]]:
+    candidates = [
+        os.path.join(ROOT_DIR, "public", "players.json"),
+        os.path.join(ROOT_DIR, "players.json"),
+        os.path.join(ASSETS_DIR, "players.json"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    j = json.load(f)
+                rows = _extract_passthrough(j if isinstance(j, list) else {"players": j})
+                if rows:
+                    _log("local players.json used:", p, "count:", len(rows))
+                    return rows
+            except Exception as e:
+                _log("local players.json read err:", p, repr(e))
+    return []
 
 # =========================
 # Публичные API
 # =========================
 def refresh_players() -> Tuple[int, str]:
     """
-    Тянем PASSTHROUGH как основной слой (имена/команды).
-    NORMALIZED (если доступен) — только для headshot.
-    Возвращаем (кол-во, строковый source).
+    PASSTHROUGH — основной слой (имена/команды).
+    NORMALIZED — только headshot.
+    Жёсткие логи по каждому источнику + локальный бэкап.
     """
     global _PLAYERS, _LAST_SOURCE, _LAST_REFRESH_AT
 
     pt_urls, norm_urls = _classify_urls()
     src_used = "none"
 
-    # 1) Грузим PASSTHROUGH (обязательный для поиска)
+    # 1) PASSTHROUGH
     pt_rows: List[Dict[str, Any]] = []
     for u in pt_urls:
+        _log("try pt:", u)
         j = _try_fetch(u)
-        if not j: 
+        if not j:
+            _log("pt fetch empty:", u)
             continue
         rows = _extract_passthrough(j)
+        _log("pt parsed:", len(rows), "from", u)
         if rows:
             pt_rows = rows
             src_used = "passthrough"
-            # приоритет — как только нашли нормальный массив, дальше нормализованный используем только как дополнение
             if len(rows) >= MIN_EXPECTED:
                 break
 
-    # Фолбэк: PLAYERS_JSON_URL (если PASSTHROUGH совсем не отдал имена)
+    # 1b) HTTP-бэкап
     if not pt_rows and PLAYERS_JSON_URL:
+        _log("fallback PLAYERS_JSON_URL:", PLAYERS_JSON_URL)
         j = _try_fetch(PLAYERS_JSON_URL)
-        if isinstance(j, list) and j:
-            # ожидаем схему, совместимую с _extract_passthrough
-            pt_rows = _extract_passthrough({"players": j})
-            if pt_rows:
-                src_used = "players_json"
+        rows = _extract_passthrough(j)
+        _log("PLAYERS_JSON_URL parsed:", len(rows))
+        if rows:
+            pt_rows = rows
+            src_used = "players_json"
 
-    # Если всё равно пусто — последний фолбэк: DEFAULT_PT
+    # 1c) ЛОКАЛЬНЫЙ бэкап
     if not pt_rows:
-        j = _try_fetch(DEFAULT_PT)
-        if j:
-            rows = _extract_passthrough(j)
-            if rows:
-                pt_rows = rows
-                src_used = "passthrough(default)"
+        loc = _load_local_players_json()
+        if loc:
+            pt_rows = loc
+            src_used = "players_local"
 
-    # 2) NORMALIZED — только для headshot (не влияет на поиск)
+    # 1d) абсолютно последний шанс — DEFAULT_PT
+    if not pt_rows:
+        _log("fallback DEFAULT_PT:", DEFAULT_PT)
+        j = _try_fetch(DEFAULT_PT)
+        rows = _extract_passthrough(j)
+        _log("DEFAULT_PT parsed:", len(rows))
+        if rows:
+            pt_rows = rows
+            src_used = "passthrough(default)"
+
+    # 2) NORMALIZED — только headshot
     norm_rows: List[Dict[str, Any]] = []
     for u in norm_urls:
+        _log("try norm:", u)
         j = _try_fetch(u)
         if not j:
+            _log("norm fetch empty:", u)
             continue
         rows = _extract_normalized(j)
+        _log("norm parsed:", len(rows), "from", u)
         if rows and len(rows) >= MIN_EXPECTED:
             norm_rows = rows
             break
@@ -251,19 +274,12 @@ def refresh_players() -> Tuple[int, str]:
     return (len(_PLAYERS), _LAST_SOURCE)
 
 def get_players(force_refresh: Optional[bool] = None) -> List[Dict[str, Any]]:
-    """
-    Возвращает кэш игроков. Если пусто — дергает refresh_players().
-    Аргумент force_refresh поддержан для совместимости.
-    """
     global _PLAYERS
     if not _PLAYERS or (force_refresh is True and (time.time() - _LAST_REFRESH_AT > 60)):
         refresh_players()
     return _PLAYERS
 
 def find_player_by_name(q: str) -> List[Dict[str, Any]]:
-    """
-    Поиск ТОЛЬКО по слою PASSTHROUGH (имена/команды уже в _PLAYERS).
-    """
     if not q: return []
     qq = q.strip().lower()
     ps = get_players()
@@ -276,7 +292,6 @@ def find_player_by_name(q: str) -> List[Dict[str, Any]]:
             out.append(p)
             if len(out) >= 10:
                 break
-    # Доп. попытка раздельным поиском
     if not out and " " in qq:
         parts = [t for t in re.split(r"\s+", qq) if t]
         for p in ps:
@@ -379,27 +394,18 @@ def _fallback_headshot_urls(person_id: str) -> List[str]:
     return urls
 
 def ensure_headshot_png(p: Dict[str, Any]) -> Optional[bytes]:
-    """
-    Возвращает PNG (bytes) с портретом игрока.
-    headshot в p -> IMAGE_PROXY_URLS -> CDN фоллбеки.
-    """
     pid = str(p.get("personId") or "")
-    # явная ссылка
     for key in ("headshot","img","image","photo","u"):
         url = p.get(key)
         if isinstance(url, str) and url.startswith(("http://","https://")):
             raw = _fetch_image(url)
             if raw: return raw
-    # фоллбеки
     for url in _fallback_headshot_urls(pid):
         raw = _fetch_image(url)
         if raw: return raw
     return None
 
 def ensure_team_logo_png(team_id: str) -> Optional[str]:
-    """
-    Возвращает путь к PNG логотипу команды, если он есть в assets/cache или assets/teams.
-    """
     tid = str(team_id or "0")
     for d in LOGO_DIRS:
         p = os.path.join(d, f"{tid}.png")
