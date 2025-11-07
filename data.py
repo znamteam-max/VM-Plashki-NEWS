@@ -1,423 +1,396 @@
-# data.py — надёжная загрузка/кеш игроков, фоллбэки, головы/логотипы
+# data.py — источники игроков + кэш + headshots
 from __future__ import annotations
-import os, io, json, time, re, threading, tempfile
+import os, json, time, re, io
 from typing import Any, Dict, List, Tuple, Optional
 from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
-from PIL import Image
+from urllib.parse import quote, urlencode
 
-# -------------------- ENV / Константы --------------------
-ENV = os.environ.get
+# ---------- ENV ----------
+SEASON              = os.getenv("PLAYERS_SEASON", "").strip() or "2025-26"
+USE_CUSTOM          = os.getenv("PLAYERS_USE_CUSTOM", "1").strip() == "1"
+CUSTOM_URLS_RAW     = os.getenv("PLAYERS_CUSTOM_URLS", "").strip()
+CUSTOM_URL_RAW      = os.getenv("PLAYERS_CUSTOM_URL", "").strip()
+FALLBACK_URL        = os.getenv("PLAYERS_URL", "").strip()
+IMAGE_PROXY_URLS    = [u.strip() for u in os.getenv("IMAGE_PROXY_URLS", "").split(",") if u.strip()]
+CUSTOM_TIMEOUT      = int(os.getenv("PLAYERS_CUSTOM_TIMEOUT", "20"))
+CUSTOM_ATTEMPTS     = int(os.getenv("PLAYERS_CUSTOM_ATTEMPTS", "3"))
+CACHE_TTL           = int(os.getenv("PLAYERS_CACHE_TTL", os.getenv("CACHE_TTL_SEC", "43200")))  # сек
+MIN_EXPECTED        = int(os.getenv("PLAYERS_MIN_EXPECTED", "350"))
+DISABLE_LOCAL       = os.getenv("PLAYERS_DISABLE_LOCAL", "0").strip() == "1"
+INSECURE_SSL        = os.getenv("PLAYERS_INSECURE_SSL", "0").strip() == "1"  # не используется, но оставим для совместимости
 
-PLAYERS_USE_CUSTOM     = (ENV("PLAYERS_USE_CUSTOM", "1").strip() == "1")
-PLAYERS_CUSTOM_URLS    = [u.strip() for u in ENV("PLAYERS_CUSTOM_URLS", "").split(",") if u.strip()]
-# Поддержим старый одиночный ключ тоже (добавим его в список):
-if ENV("PLAYERS_CUSTOM_URL", "").strip():
-    PLAYERS_CUSTOM_URLS.extend([u.strip() for u in ENV("PLAYERS_CUSTOM_URL", "").split(",") if u.strip()])
-
-PLAYERS_URL_FALLBACK   = ENV("PLAYERS_URL", "").strip()  # на всякий случай
-PLAYERS_JSON_PUBLIC    = ENV("PLAYERS_JSON_URL", "").strip()  # например, https://<host>/players.json
-
-PLAYERS_MIN_EXPECTED   = int(ENV("PLAYERS_MIN_EXPECTED", "350"))
-PLAYERS_REFRESH_SECONDS= int(ENV("PLAYERS_REFRESH_SECONDS", "21600"))  # 6 часов по умолчанию
-PLAYERS_CUSTOM_TIMEOUT = int(ENV("PLAYERS_CUSTOM_TIMEOUT", "20"))
-PLAYERS_CUSTOM_ATTEMPTS= int(ENV("PLAYERS_CUSTOM_ATTEMPTS", "3"))
-PLAYERS_SEASON         = ENV("PLAYERS_SEASON", "2025-26")
-
-IMAGE_PROXY_URLS       = [u.strip() for u in ENV("IMAGE_PROXY_URLS", "").split(",") if u.strip()]
-
-CACHE_TTL_SEC          = int(ENV("CACHE_TTL_SEC", "43200"))
-IMG_CACHE_TTL_SEC      = int(ENV("IMG_CACHE_TTL_SEC", "604800"))  # неделя
-
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+# ---------- PATHS ----------
+ROOT_DIR   = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(ROOT_DIR, "assets")
-PUBLIC_DIR = os.path.join(ROOT_DIR, "public")  # вдруг положишь players.json сюда
-TMP_DIR   = "/tmp"
+TMP_DIR    = "/tmp"
+PLAYERS_CACHE_PATH = os.path.join(TMP_DIR, "players_cache.json")
 
-PLAYERS_CACHE_PATH     = os.path.join(TMP_DIR, "players_cache.json")
-IDX_CACHE_PATH         = os.path.join(TMP_DIR, "players_index.json")
+# ---------- STATE ----------
+_PLAYERS: List[Dict[str, Any]] = []
+_LAST_REFRESH_INFO: Dict[str, Any] = {}
 
-HEAD_CACHE_PATH        = os.path.join(TMP_DIR, "headshots")
-os.makedirs(HEAD_CACHE_PATH, exist_ok=True)
-
-# -------------------- Глобальное состояние --------------------
-_state_lock = threading.Lock()
-_state: Dict[str, Any] = {
-    "players": [],            # унифицированные игроки
-    "index": {},              # индекс для поиска
-    "last_source": None,
-    "last_url": None,
-    "last_ts": 0.0,
-}
-
+# ---------- LOG ----------
 def _log(*a: Any) -> None:
-    try:
-        print("[players]", *a, flush=True)
-    except:
-        pass
+    try: print("[players]", *a, flush=True)
+    except: pass
 
-# -------------------- HTTP helpers --------------------
-def _http_get_json(url: str, timeout: int) -> Any:
-    req = Request(url, headers={"User-Agent": "vm-plashki/1.0"})
+# ---------- HTTP ----------
+_UA = "vm-plashki-news/1.0 (+https://vercel.app)"
+def _http_get(url: str, timeout: int = CUSTOM_TIMEOUT) -> bytes:
+    req = Request(url, headers={"User-Agent": _UA, "Accept": "application/json"})
     with urlopen(req, timeout=timeout) as r:
-        data = r.read()
+        return r.read()
+
+def _http_get_img(url: str, timeout: int = 15) -> bytes:
+    req = Request(url, headers={"User-Agent": _UA, "Accept": "image/png,image/*;q=0.9,*/*;q=0.8"})
+    with urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+# ---------- UTILS ----------
+def _now() -> int:
+    return int(time.time())
+
+def _save_json(path: str, data: Any) -> None:
     try:
-        return json.loads(data.decode("utf-8", "ignore"))
-    except Exception as e:
-        _log("json parse error for", url, e)
-        return None
-
-# -------------------- Нормализация форматов --------------------
-def _normalize_from_list(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    passthrough-подобный список: [{personId, firstName, lastName, teamId, isActive, photo?}, ...]
-    Приводим к единому виду.
-    """
-    out: List[Dict[str, Any]] = []
-    for it in items or []:
-        pid = str(it.get("personId") or it.get("id") or it.get("playerId") or "").strip()
-        if not pid:
-            continue
-        fn = (it.get("firstName") or it.get("first_name") or "").strip()
-        ln = (it.get("lastName")  or it.get("last_name")  or "").strip()
-        tid = str(it.get("teamId") or it.get("team_id") or it.get("team") or "0").strip()
-        active = bool(it.get("isActive") or it.get("active") or False)
-        photo = it.get("photo") or it.get("headshot") or ""
-        # cdn по id (на всякий случай)
-        if not photo and pid.isdigit():
-            photo = f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png"
-
-        out.append({
-            "personId": pid,
-            "firstName": fn,
-            "lastName": ln,
-            "teamId": tid,
-            "isActive": active,
-            "photo": photo,
-            "fullName": (fn + " " + ln).strip(),
-        })
-    return out
-
-def _normalize_from_dict(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    normalized-вариант может быть в разных обёртках: {"players": [...]}, {"data":[...]} и т.д.
-    Пробуем самые типовые ключи.
-    """
-    for key in ("players", "data", "result", "items"):
-        if isinstance(obj.get(key), list):
-            return _normalize_from_list(obj[key])
-    # бывает, что сам obj — это список игроков, но прилетел как dict-обёртка
-    return []
-
-def _unify_players(payload: Any) -> List[Dict[str, Any]]:
-    if isinstance(payload, list):
-        return _normalize_from_list(payload)
-    if isinstance(payload, dict):
-        return _normalize_from_dict(payload)
-    return []
-
-# -------------------- Кеш --------------------
-def _atomic_write_json(path: str, data: Any) -> None:
-    try:
-        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp_", suffix=".json")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp_path, path)
     except Exception as e:
-        _log("atomic write error:", e)
+        _log("cache save error:", e)
 
 def _load_json(path: str) -> Any:
-    if not os.path.exists(path):
-        return None
+    if not os.path.exists(path): return None
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        _log("cache load error:", e)
         return None
 
-# -------------------- Загрузка игроков со стеком фоллбэков --------------------
-def _fetch_from_custom(timeout: int) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """
-    Пробуем последовательно все URL из PLAYERS_CUSTOM_URLS.
-    Возвращаем (players, used_url) или ([], None) если ни один не сработал.
-    """
-    if not PLAYERS_CUSTOM_URLS:
-        return [], None
+def _norm_name(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-zа-яё0-9\-'\s]+", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-    for attempt in range(1, PLAYERS_CUSTOM_ATTEMPTS + 1):
-        for u in PLAYERS_CUSTOM_URLS:
-            try:
-                payload = _http_get_json(u, timeout=timeout)
-                players = _unify_players(payload)
-                _log(f"custom parsed {len(players)} from {u}")
-                if len(players) >= PLAYERS_MIN_EXPECTED:
-                    return players, u
-            except HTTPError as e:
-                _log("custom get error:", e)
-            except URLError as e:
-                _log("custom get error:", e)
-            except OSError as e:
-                # Частая ошибка: OSError(16, 'Device or resource busy') — считаем транзиентной
-                _log("custom get error:", e)
-        time.sleep(0.25)  # маленький бэк-офф между попытками
-    return [], None
-
-def _fetch_from_public() -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """
-    Если в проекте лежит public/players.json — используем.
-    Или есть внешний URL в PLAYERS_JSON_URL.
-    """
-    # локальный public
-    local_path = os.path.join(PUBLIC_DIR, "players.json")
-    if os.path.exists(local_path):
-        obj = _load_json(local_path)
-        players = _unify_players(obj)
-        if len(players) >= PLAYERS_MIN_EXPECTED:
-            return players, local_path
-
-    # внешний URL
-    if PLAYERS_JSON_PUBLIC:
-        try:
-            obj = _http_get_json(PLAYERS_JSON_PUBLIC, timeout=10)
-            players = _unify_players(obj)
-            if len(players) >= PLAYERS_MIN_EXPECTED:
-                return players, PLAYERS_JSON_PUBLIC
-        except Exception as e:
-            _log("public json load error:", e)
-
-    return [], None
-
-def _load_cache_if_fresh(max_age_sec: int = PLAYERS_REFRESH_SECONDS) -> Tuple[List[Dict[str, Any]], Optional[str], float]:
-    obj = _load_json(PLAYERS_CACHE_PATH)
-    if not isinstance(obj, dict):
-        return [], None, 0.0
-    players = _unify_players(obj.get("players"))
-    ts = float(obj.get("ts") or 0.0)
-    src = obj.get("source")
-    if players and (time.time() - ts) <= max_age_sec:
-        return players, src, ts
-    return [], src, ts
-
-def _save_cache(players: List[Dict[str, Any]], source: str) -> None:
-    data = {"players": players, "ts": time.time(), "source": source}
-    _atomic_write_json(PLAYERS_CACHE_PATH, data)
-
-# -------------------- Индекс/поиск --------------------
-def _build_index(players: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Простой индекс: по полной строке и по токенам фамилии/имени.
-    """
-    idx = {"by_id": {}, "by_token": {}}
-    def put_token(tok: str, pid: str):
-        if not tok: return
-        tok = tok.lower()
-        idx["by_token"].setdefault(tok, []).append(pid)
-
-    for p in players:
-        pid = str(p.get("personId") or "").strip()
-        if not pid: 
-            continue
-        idx["by_id"][pid] = p
-        fn = (p.get("firstName") or "").strip()
-        ln = (p.get("lastName")  or "").strip()
-        full = (fn + " " + ln).strip()
-
-        # базовые токены
-        for t in (fn, ln, full, pid):
-            if t: put_token(t)
-
-        # упрощённые токены: без апострофов/диакритик — только базовая чистка
-        simple_full = re.sub(r"[^a-zA-Z0-9]+", "", full.lower())
-        if simple_full:
-            put_token(simple_full)
-
-    return idx
-
-def _ensure_loaded_locked(refresh: bool = False) -> None:
-    """
-    Загружает игроков по стеку источников. Не перетирает рабочий список,
-    если новый источник отдал мусор (len < PLAYERS_MIN_EXPECTED) или ошибка сети.
-    """
-    # 1) если кеш свежий и refresh=False — просто читаем кеш
-    if not refresh:
-        cached, cached_src, cached_ts = _load_cache_if_fresh(PLAYERS_REFRESH_SECONDS)
-        if cached:
-            _state["players"] = cached
-            _state["index"] = _build_index(cached)
-            _state["last_source"] = "cache"
-            _state["last_url"] = cached_src
-            _state["last_ts"] = cached_ts
-            _log(f"cache hit: {len(cached)} players (src={cached_src})")
-            return
-
-    # 2) пробуем custom-URL (passthrough/normalized)
-    players, used = ([], None)
-    if PLAYERS_USE_CUSTOM:
-        players, used = _fetch_from_custom(timeout=PLAYERS_CUSTOM_TIMEOUT)
-
-    # 3) если не вышло — public/players.json
-    if len(players) < PLAYERS_MIN_EXPECTED:
-        pub, pub_src = _fetch_from_public()
-        if len(pub) >= PLAYERS_MIN_EXPECTED:
-            players, used = pub, pub_src
-
-    # 4) если совсем пусто — пробуем устаревший кеш (лучше старое, чем 0)
-    if len(players) < PLAYERS_MIN_EXPECTED:
-        old_obj = _load_json(PLAYERS_CACHE_PATH)
-        if isinstance(old_obj, dict):
-            old_players = _unify_players(old_obj.get("players"))
-            if len(old_players) >= PLAYERS_MIN_EXPECTED:
-                _state["players"] = old_players
-                _state["index"]   = _build_index(old_players)
-                _state["last_source"] = old_obj.get("source") or "cache(old)"
-                _state["last_url"]    = old_obj.get("source")
-                _state["last_ts"]     = float(old_obj.get("ts") or time.time())
-                _log(f"fallback to stale cache: {len(old_players)} players")
-                return
-
-    # 5) если получили валидный список — сохраняем и индексируем
-    if len(players) >= PLAYERS_MIN_EXPECTED:
-        _state["players"] = players
-        _state["index"]   = _build_index(players)
-        _state["last_source"] = "custom" if used else "public"
-        _state["last_url"]    = used
-        _state["last_ts"]     = time.time()
-        _save_cache(players, _state["last_url"] or _state["last_source"])
-        _log(f"players ready: {len(players)} (source={_state['last_source']} url={_state['last_url']})")
-        return
-
-    # 6) вообще ничего не получилось — НЕ ПЕРЕТИРАЕМ текущее состояние
-    _log("all sources failed; keeping previous in-memory players ("
-         f"{len(_state.get('players') or [])})")
-
-def ensure_players(refresh: bool = False) -> int:
-    with _state_lock:
-        _ensure_loaded_locked(refresh=refresh)
-        return len(_state.get("players") or [])
-
-def players_count() -> int:
-    return len(_state.get("players") or [])
-
-def players_search(q: str, limit: int = 10) -> List[Dict[str, Any]]:
-    q = (q or "").strip()
-    if not q:
-        return []
-    players = _state.get("players") or []
-    idx = _state.get("index") or {}
-    by_token = idx.get("by_token") or {}
-    by_id = idx.get("by_id") or {}
-
-    # прямое совпадение по токенам
-    hits: List[str] = []
-    qtok = q.lower()
-    if qtok in by_token:
-        hits.extend(by_token[qtok])
-
-    # упрощённый токен
-    simp = re.sub(r"[^a-zA-Z0-9]+", "", qtok)
-    if simp and simp in by_token:
-        hits.extend(by_token[simp])
-
-    # contains по полному имени
-    if len(hits) < limit:
-        qnorm = q.lower()
-        for p in players:
-            fullname = (p.get("fullName") or "").lower()
-            if qnorm in fullname:
-                pid = str(p.get("personId"))
-                if pid not in hits:
-                    hits.append(pid)
-                if len(hits) >= limit:
-                    break
-
-    # собираем ответ
-    out: List[Dict[str, Any]] = []
-    for pid in hits:
-        if pid in by_id:
-            out.append(by_id[pid])
-            if len(out) >= limit:
-                break
+# ---------- URL CANDIDATES ----------
+def _candidate_sources() -> List[str]:
+    cands: List[str] = []
+    if USE_CUSTOM:
+        if CUSTOM_URLS_RAW:
+            # может быть список URL с разными форматами
+            cands.extend([u.strip() for u in CUSTOM_URLS_RAW.split(",") if u.strip()])
+        if CUSTOM_URL_RAW:
+            cands.extend([u.strip() for u in CUSTOM_URL_RAW.split(",") if u.strip()])
+    if FALLBACK_URL:
+        cands.append(FALLBACK_URL)
+    # уникализируем порядок
+    seen = set()
+    out: List[str] = []
+    for u in cands:
+        if u not in seen:
+            out.append(u); seen.add(u)
     return out
 
-def get_player_by_query(q: str) -> Optional[Dict[str, Any]]:
-    res = players_search(q, limit=1)
-    return res[0] if res else None
+# ---------- PARSERS ----------
+def _extract_team_id(p: Dict[str, Any]) -> str:
+    # разные форматы
+    tid = p.get("teamId")
+    if isinstance(tid, (int, float)): return str(int(tid))
+    if isinstance(tid, str) and tid.strip(): return tid.strip()
+    team = p.get("team") or {}
+    if isinstance(team, dict):
+        t2 = team.get("teamId") or team.get("id")
+        if isinstance(t2, (int, float)): return str(int(t2))
+        if isinstance(t2, str) and t2.strip(): return t2.strip()
+    return "0"
 
-# -------------------- Головы/логотипы --------------------
-def _is_fresh(path: str, ttl_sec: int) -> bool:
-    try:
-        st = os.stat(path)
-        return (time.time() - st.st_mtime) <= ttl_sec
-    except Exception:
-        return False
-
-def _download_to(path: str, url: str, timeout: int = 15) -> bool:
-    try:
-        req = Request(url, headers={"User-Agent": "vm-plashki/1.0"})
-        with urlopen(req, timeout=timeout) as r:
-            data = r.read()
-        # атомарная запись
-        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp_", suffix=".png")
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        os.replace(tmp_path, path)
-        return True
-    except Exception as e:
-        _log("img get error", url, e)
-        return False
-
-def ensure_headshot_png(player_or_id: Any, timeout: int = 20, **kwargs) -> Optional[str]:
-    """
-    Возвращает локальный путь к PNG с головой игрока.
-    Принимает либо дикт игрока, либо personId (str/int), либо URL.
-    """
-    # если прилетел URL напрямую
-    if isinstance(player_or_id, str) and player_or_id.startswith(("http://", "https://")):
-        pid = re.findall(r"/(\d+)\.png", player_or_id)
-        pid = pid[0] if pid else "custom"
-        dst = os.path.join(HEAD_CACHE_PATH, f"head_{pid}.png")
-        if _is_fresh(dst, IMG_CACHE_TTL_SEC):
-            return dst
-        return dst if _download_to(dst, player_or_id, timeout=timeout) else None
-
-    # если прилетел dict игрока
-    if isinstance(player_or_id, dict):
-        pid = str(player_or_id.get("personId") or "").strip()
-        photo = (player_or_id.get("photo") or "").strip()
-    else:
-        # предполагаем personId
-        pid = str(player_or_id).strip()
-        photo = ""
-
-    if not pid:
-        return None
-
-    dst = os.path.join(HEAD_CACHE_PATH, f"head_{pid}.png")
-    if _is_fresh(dst, IMG_CACHE_TTL_SEC):
-        return dst
-
-    # приоритет: прокси → явная ссылка из данных → cdn
-    urls: List[str] = []
-    for base in IMAGE_PROXY_URLS:
-        if base.endswith("/"):
-            base = base[:-1]
-        urls.append(f"{base}/img?u={pid}")
-
-    if photo:
-        urls.append(photo)
-
-    urls.append(f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png")
-
-    for u in urls:
-        if _download_to(dst, u, timeout=timeout):
-            return dst
+def _extract_person_id(p: Dict[str, Any]) -> Optional[str]:
+    for k in ("personId","person_id","playerId","id"):
+        v = p.get(k)
+        if isinstance(v, (int, float)):
+            return str(int(v))
+        if isinstance(v, str) and v.strip():
+            return v.strip()
     return None
 
-def ensure_team_logo_png(team_id: Any) -> Optional[str]:
+def _extract_names(p: Dict[str, Any]) -> Tuple[str, str]:
+    fn = p.get("firstName") or p.get("first_name") or p.get("first") or ""
+    ln = p.get("lastName") or p.get("last_name") or p.get("last") or ""
+    return str(fn or "").strip(), str(ln or "").strip()
+
+def _extract_photo(p: Dict[str, Any], pid: str) -> str:
+    # у прокси может быть уже прямая ссылка
+    ph = p.get("photo") or p.get("image") or ""
+    if isinstance(ph, str) and ph.startswith(("http://","https://")):
+        return ph
+    # формируем CDN
+    return f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png"
+
+def _normalize_player(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    pid = _extract_person_id(p)
+    if not pid: return None
+    fn, ln = _extract_names(p)
+    team_id = _extract_team_id(p)
+    img = _extract_photo(p, pid)
+    is_active = bool(p.get("isActive", True))
+    return {
+        "personId": pid,
+        "firstName": fn,
+        "lastName": ln,
+        "teamId": team_id,
+        "isActive": is_active,
+        "photo": img,
+    }
+
+def _parse_payload(raw: Any) -> List[Dict[str, Any]]:
+    # 1) Уже список
+    if isinstance(raw, list):
+        out: List[Dict[str, Any]] = []
+        for p in raw:
+            if isinstance(p, dict):
+                q = _normalize_player(p)
+                if q: out.append(q)
+        return out
+
+    # 2) В dict где ключи разные: league/standard, resultSets, data, players
+    if isinstance(raw, dict):
+        # прямой список в dict
+        if isinstance(raw.get("players"), list):
+            return _parse_payload(raw["players"])
+        if isinstance(raw.get("data"), list):
+            return _parse_payload(raw["data"])
+        # nba json style
+        league = raw.get("league") or raw.get("League") or {}
+        if isinstance(league, dict):
+            for key in ("standard","vegas","africa","sacramento","utah"):
+                arr = league.get(key)
+                if isinstance(arr, list) and arr:
+                    return _parse_payload(arr)
+        # last fallback — пройтись по значениям
+        for k, v in raw.items():
+            if isinstance(v, list) and v and isinstance(v[0], dict):
+                tmp = _parse_payload(v)
+                if tmp: return tmp
+    return []
+
+# ---------- CACHE ----------
+def _cache_ok(meta: Dict[str, Any]) -> bool:
+    if not isinstance(meta, dict): return False
+    ts = int(meta.get("ts", 0))
+    if ( _now() - ts ) > CACHE_TTL: return False
+    n = int(meta.get("count", 0))
+    return n >= MIN_EXPECTED
+
+def _load_cache() -> Optional[List[Dict[str, Any]]]:
+    meta = _load_json(PLAYERS_CACHE_PATH)
+    if not meta or not _cache_ok(meta): return None
+    arr = meta.get("players")
+    if isinstance(arr, list): return arr
+    return None
+
+def _save_cache(players: List[Dict[str, Any]], info: Dict[str, Any]) -> None:
+    data = {
+        "ts": _now(),
+        "count": len(players),
+        "players": players,
+        "info": info or {},
+    }
+    _save_json(PLAYERS_CACHE_PATH, data)
+
+# ---------- PUBLIC: refresh ----------
+def refresh_players(drop_cache: bool = False) -> Tuple[int, Dict[str, Any]]:
     """
-    Возвращает путь к PNG логотипа (из assets/cache или assets/teams, если есть).
+    Возвращает: (кол-во, info)
+    info: { ok, source, source_url }
     """
-    from team_brand import get_team_logo_path
-    tid = str(team_id or "0")
-    p = get_team_logo_path(tid)
-    return p if (p and os.path.exists(p)) else None
+    global _PLAYERS, _LAST_REFRESH_INFO
+
+    if not drop_cache:
+        cached = _load_cache()
+        if cached:
+            _PLAYERS = cached
+            _LAST_REFRESH_INFO = {"ok": True, "source": "cache", "source_url": None}
+            _log("loaded from cache:", len(_PLAYERS))
+            return len(_PLAYERS), dict(_LAST_REFRESH_INFO)
+
+    # иначе — тянем из сети
+    sources = _candidate_sources()
+    if not sources:
+        _log("no sources configured")
+        _PLAYERS = []
+        _LAST_REFRESH_INFO = {"ok": False, "source": None, "source_url": None}
+        return 0, dict(_LAST_REFRESH_INFO)
+
+    last_err = None
+    for url in sources:
+        # дозаполняем сезон, если в URL нет явного query
+        try_url = url
+        if "{season}" in try_url:
+            try_url = try_url.replace("{season}", quote(SEASON))
+        # попытки
+        for attempt in range(1, max(1, CUSTOM_ATTEMPTS) + 1):
+            try:
+                raw = _http_get(try_url, timeout=CUSTOM_TIMEOUT)
+                js = json.loads(raw.decode("utf-8", errors="ignore"))
+                arr = _parse_payload(js)
+                _log("custom parsed", len(arr), "from", try_url)
+                if len(arr) >= MIN_EXPECTED:
+                    _PLAYERS = arr
+                    info = {"ok": True, "source": "custom", "source_url": try_url}
+                    _LAST_REFRESH_INFO = info
+                    _save_cache(_PLAYERS, info)
+                    return len(_PLAYERS), dict(info)
+            except Exception as e:
+                last_err = e
+                _log("custom get error:", repr(e))
+    # если дошли сюда — не смогли
+    _PLAYERS = []
+    _LAST_REFRESH_INFO = {"ok": False, "source": "none", "source_url": None, "error": repr(last_err) if last_err else None}
+    return 0, dict(_LAST_REFRESH_INFO)
+
+# ---------- PUBLIC: counts/index ----------
+def players_count() -> int:
+    return len(_PLAYERS)
+
+def get_players_index() -> List[Dict[str, Any]]:
+    return _PLAYERS
+
+# ---------- PUBLIC: find ----------
+def _score_candidate(qn: str, p: Dict[str, Any]) -> int:
+    # Очень простой скорер: точные совпадения/начало строки — больше вес
+    fn = _norm_name(p.get("firstName",""))
+    ln = _norm_name(p.get("lastName",""))
+    full = (fn + " " + ln).strip()
+    score = 0
+    if qn == fn or qn == ln or qn == full: score += 100
+    if fn and qn.startswith(fn): score += 30
+    if ln and qn.startswith(ln): score += 30
+    if fn and fn in qn: score += 10
+    if ln and ln in qn: score += 10
+    if full and qn in full: score += 10
+    return score
+
+def find_player_by_name(q: str, limit: int = 6) -> List[Dict[str, Any]]:
+    """
+    Поиск по части имени/фамилии (англ) или по ID.
+    Возвращает top-N кандидатов.
+    """
+    if not q: return []
+    if not _PLAYERS:
+        # Автоподгрузка, если пусто — не падать
+        try:
+            refresh_players(drop_cache=False)
+        except Exception:
+            pass
+    # Если ID
+    qq = q.strip()
+    if re.fullmatch(r"\d{2,}", qq):
+        for p in _PLAYERS:
+            if str(p.get("personId")) == qq:
+                return [p]
+        return []
+
+    qn = _norm_name(qq)
+    scored: List[Tuple[int, Dict[str, Any]]] = []
+    for p in _PLAYERS:
+        sc = _score_candidate(qn, p)
+        if sc > 0:
+            scored.append((sc, p))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [p for _, p in scored[:limit]]
+
+# ---------- PUBLIC: headshot ----------
+def _head_tmp_path(pid: str) -> str:
+    return os.path.join(TMP_DIR, f"head_{pid}.png")
+
+def _head_local_assets(pid: str) -> Optional[str]:
+    # если заранее положили
+    for d in ("cache", "heads"):
+        p = os.path.join(ASSETS_DIR, d, f"{pid}.png")
+        if os.path.exists(p):
+            return p
+    return None
+
+def _possible_head_urls(pid: str, players_idx: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+    urls: List[str] = []
+    # из индекса возьмём photo если есть
+    if players_idx:
+        for p in players_idx:
+            if str(p.get("personId")) == str(pid):
+                if isinstance(p.get("photo"), str) and p["photo"].startswith(("http://","https://")):
+                    urls.append(p["photo"])
+                break
+    # CDN крупный и мелкий
+    urls.append(f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png")
+    urls.append(f"https://cdn.nba.com/headshots/nba/latest/260x190/{pid}.png")
+    # прокси
+    if IMAGE_PROXY_URLS:
+        for base in IMAGE_PROXY_URLS:
+            base = base.rstrip("/")
+            # 1) проксируем id (если ваш воркер поддерживает /img?u=<id>)
+            urls.append(f"{base}/img?u={quote(str(pid))}")
+            # 2) проксируем оригинальный cdn урл
+            orig = f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png"
+            urls.append(f"{base}/img?u={quote(orig, safe='')}")
+    # уникализируем
+    seen = set(); out = []
+    for u in urls:
+        if u not in seen:
+            out.append(u); seen.add(u)
+    return out
+
+def ensure_headshot_png(player_or_id: Any, timeout: int = 15, **_kwargs) -> Optional[str]:
+    """
+    Возвращает локальный путь к PNG в /tmp.
+    Принимает personId (str/int) или dict игрока.
+    Игнорирует лишние именованные аргументы.
+    """
+    try:
+        if isinstance(player_or_id, dict):
+            pid = str(player_or_id.get("personId","")).strip()
+        else:
+            pid = str(player_or_id).strip()
+        if not pid:
+            return None
+
+        # уже есть в /tmp?
+        tp = _head_tmp_path(pid)
+        if os.path.exists(tp) and os.path.getsize(tp) > 0:
+            return tp
+
+        # ассеты
+        aset = _head_local_assets(pid)
+        if aset:
+            try:
+                # скопируем в /tmp для единообразия
+                with open(aset, "rb") as f:
+                    data = f.read()
+                with open(tp, "wb") as f:
+                    f.write(data)
+                return tp
+            except Exception as e:
+                _log("img copy error", pid, e)
+
+        # индексация могла ещё не прогрузиться
+        idx = _PLAYERS if _PLAYERS else None
+        urls = _possible_head_urls(pid, idx)
+
+        last_err = None
+        for u in urls:
+            try:
+                data = _http_get_img(u, timeout=timeout)
+                # очень короткий ответ — отбросим
+                if not data or len(data) < 128:
+                    continue
+                with open(tp, "wb") as f:
+                    f.write(data)
+                _log("img ok", pid, u)
+                return tp
+            except Exception as e:
+                last_err = e
+                _log("img get error", u, repr(e))
+        # не смогли — возвращаем None
+        return None
+    except Exception as e:
+        _log("headshot ensure err", repr(e))
+        return None
