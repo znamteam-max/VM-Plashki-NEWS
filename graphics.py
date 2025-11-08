@@ -12,13 +12,34 @@ ICONS_DIR = os.path.join(ASSETS_DIR, "icons")
 
 # ---------- utils: colors / fonts ----------
 
-def _hex_to_rgb(h: str) -> Tuple[int, int, int]:
-    h = (h or "").strip().lstrip("#")
-    if len(h) == 3:
-        h = "".join([c*2 for c in h])
-    if len(h) != 6:
-        return (32, 32, 32)
-    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+def _hex_to_rgb(h) -> tuple[int, int, int]:
+    """
+    Принимает '#RRGGBB' ИЛИ (r,g,b) ИЛИ [r,g,b].
+    Всегда возвращает (r,g,b).
+    """
+    # уже RGB
+    if isinstance(h, (tuple, list)) and len(h) >= 3:
+        try:
+            r, g, b = int(h[0]), int(h[1]), int(h[2])
+            return (max(0, min(255, r)),
+                    max(0, min(255, g)),
+                    max(0, min(255, b)))
+        except Exception:
+            return (32, 32, 32)
+
+    # строка с hex
+    if isinstance(h, str):
+        s = h.strip().lstrip("#")
+        if len(s) == 3:
+            s = "".join(c * 2 for c in s)
+        if len(s) == 6:
+            try:
+                return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+            except Exception:
+                pass
+
+    # дефолт на любые странности
+    return (32, 32, 32)
 
 def _rgb_to_hex(c: Tuple[int, int, int]) -> str:
     r,g,b = c
@@ -203,20 +224,19 @@ def _place_team_logo_circle(base: Image.Image, logo_img: Optional[Image.Image], 
     # смещение
     base.paste(canvas, (cx - r + dx, cy - r + dy), mask)
 
-def _ensure_palette(colors: Any) -> Tuple[Tuple[int,int,int], Tuple[int,int,int], Tuple[int,int,int]]:
-    # ожидаем ('#A', '#B', '#C')
+def _ensure_palette(colors: Any) -> tuple[tuple[int,int,int], tuple[int,int,int], tuple[int,int,int]]:
+    """
+    Принимает:
+      - ('#A', '#B', '#C') или
+      - ((r,g,b), (r,g,b), (r,g,b)) или смешанный вариант.
+    Возвращает всегда три RGB-кортежа.
+    """
     if isinstance(colors, (list, tuple)) and len(colors) >= 3:
-        return _hex_to_rgb(colors[0]), _hex_to_rgb(colors[1]), _hex_to_rgb(colors[2])
-    # дефолт
+        return (_hex_to_rgb(colors[0]),
+                _hex_to_rgb(colors[1]),
+                _hex_to_rgb(colors[2]))
+    # запаска
     return (29,66,138), (0,40,100), (29,66,138)
-
-def _stats_to_lines(stats: List[Tuple[str,str]]) -> List[Tuple[str,str]]:
-    out = []
-    for v, label in (stats or [])[:6]:
-        val = (str(v) or "").strip()
-        lab = (str(label) or "").strip().upper()
-        out.append((val, lab))
-    return out
 
 # ---------- RENDER: SINGLE (card) ----------
 
