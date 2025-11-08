@@ -1,19 +1,7 @@
-# api/telegram.py
-# Telegram webhook (FastAPI) + вспомогательные GET-действия.
-# Команды:
-# /start, /help
-# /find <имя/фамилия>
-# /card <name> | <stats>
-# /card2 <name1> | <stats1> || <name2> | <stats2>
-# /cards <name> | <stats> | <доп. текст>
-# /cardbad <name> | <stats>
-#
-# Поток для /card и /card2:
-# - если нет RU-имени — спрашиваем (жирное имя, без лишних служебных тегов)
-# - затем спрашиваем цвет (кнопки: авто / свой HEX)
-# - рендерим и отправляем PNG как документ
-#
-# Логи помечены [tg] ...; есть GET /api/telegram?action=diag|refresh|test_find
+# api/telegram.py — стабильная версия (revert-friendly)
+# Поддержка плашек: /card, /card2, /cards, /cardbad
+# Поиск — только по локальному кэшу (norm), без passthrough-хаков.
+# Грузим игроков через data.get_players()/refresh_players().
 
 from __future__ import annotations
 import os, io, re, json, time, unicodedata, uuid
@@ -29,7 +17,7 @@ from urllib.error import HTTPError, URLError
 DEBUG = os.getenv("DEBUG", "1") in ("1", "true", "yes")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-API_ORIGIN = os.getenv("API_ORIGIN")  # опционально — отдать в /diag
+API_ORIGIN = os.getenv("API_ORIGIN")
 
 def _log(*a: Any) -> None:
     try:
@@ -37,7 +25,7 @@ def _log(*a: Any) -> None:
     except:
         pass
 
-def _safe_import(modname: str, names: List[str]) -> Tuple[Optional[Any], List[Any], Optional[str]]:
+def _safe_import(modname: str, names: List[str]):
     try:
         m = __import__(modname, fromlist=names)
         out = [getattr(m, n) for n in names]
@@ -51,16 +39,13 @@ _data_mod, _data_objs, _data_err = _safe_import("data", [
     "get_players", "refresh_players", "find_player_by_name", "display_name_for",
     "overrides_save_name_ru", "overrides_get_name_ru",
     "ensure_headshot_png", "ensure_team_logo_png",
-    # необязательные, если вдруг есть:
-    "pt_lookup_player_by_text",
 ])
 if _data_err and DEBUG: _log("[boot] data import error:", _data_err)
 (
     get_players, refresh_players, find_player_by_name, display_name_for,
     overrides_save_name_ru, overrides_get_name_ru,
     ensure_headshot_png, ensure_team_logo_png,
-    pt_lookup_player_by_text,
-) = ([_ for _ in _data_objs] + [None]*9)[:9]
+) = ([_ for _ in _data_objs] + [None]*8)[:8]
 
 # team_brand
 _brand_mod, _brand_objs, _brand_err = _safe_import("team_brand", [
@@ -71,10 +56,10 @@ if _brand_err and DEBUG: _log("[boot] team_brand import error:", _brand_err)
 
 # graphics
 _graphics_mod, _graphics_objs, _graphics_err = _safe_import("graphics", [
-    "render_card", "render_card2", "render_card_special", "render_card_bad", "render_card_drN",
+    "render_card", "render_card2", "render_card_special", "render_card_bad",
 ])
 if _graphics_err and DEBUG: _log("[boot] graphics import error:", _graphics_err)
-(render_card, render_card2, render_card_special, render_card_bad, render_card_drN) = ([_ for _ in _graphics_objs] + [None]*5)[:5]
+(render_card, render_card2, render_card_special, render_card_bad) = ([_ for _ in _graphics_objs] + [None]*4)[:4]
 
 app = FastAPI()
 
@@ -164,7 +149,7 @@ def _tg_send_png_as_document(chat_id: int, png_bytes: bytes, filename: str = "ca
         if DEBUG: _log("[tg] sendDocument error:", repr(e))
         return {"ok": False, "error": repr(e)}
 
-# ----------------- NORMALIZATION / SEARCH -----------------
+# ----------------- NORMALIZATION / STATS -----------------
 def _normalize(s: str) -> str:
     s = (s or "").strip().lower()
     s = s.replace("ё", "е")
@@ -174,7 +159,6 @@ def _normalize(s: str) -> str:
     s = "".join(ch for ch in s if ch in keep)
     return " ".join(s.split())
 
-# расширенный парсер статов (значение может быть с символами)
 LABEL_TOKENS = [
     ("плюс/минус", "+/-"), ("plus/minus", "+/-"), ("pm", "+/-"), ("+/-", "+/-"),
     ("% трех", "3P%"), ("% трёх", "3P%"), ("3p%", "3P%"), ("3pt%", "3P%"), ("3 %", "3P%"),
@@ -200,7 +184,7 @@ STAT_TOKEN_MAP = {
     "блок":"БЛОКИ","blk":"БЛОКИ","блокшот":"БЛОКИ","блок-шот":"БЛОКИ",
     "стилоблок":"СТИЛОБЛОКИ","stocks":"СТИЛОБЛОКИ",
     "трехочков":"3-ОЧКОВЫЕ","трех":"3-ОЧКОВЫЕ","3-очков":"3-ОЧКОВЫЕ","3 очк":"3-ОЧКОВЫЕ",
-    "трешк":"3-ОЧКОВЫЕ","трешки":"3-ОЧКОВЫЕ","трёшк":"3-ОЧКОВЫЕ","трёшки":"3-ОЧКОВЫЕ","3pt":"3-ОЧКОВЫЕ","3pm":"3-ОЧКОВЫЕ",
+    "трешк":"3-ОЧКОВЫЕ","трёшк":"3-ОЧКОВЫЕ","3pt":"3-ОЧКОВЫЕ","3pm":"3-ОЧКОВЫЕ",
     "броски с игры":"С ИГРЫ","с игры":"С ИГРЫ","fgm-a":"С ИГРЫ","fg":"С ИГРЫ",
     "% трех":"3P%","% трёх":"3P%","3p%":"3P%","3pt%":"3P%","3 %":"3P%",
     "fg%":"FG%","% бросков":"FG%","% с игры":"FG%",
@@ -224,8 +208,7 @@ def parse_stats_list(raw: str) -> List[Tuple[str,str]]:
     for p in parts:
         seg = _strip_quotes(p)
         low = seg.lower().replace("ё","е")
-        found = None
-        found_pos = None
+        found = None; found_pos = None
         for tok, canon in LABEL_TOKENS:
             pos = low.find(tok)
             if pos != -1 and (found_pos is None or pos < found_pos):
@@ -238,8 +221,7 @@ def parse_stats_list(raw: str) -> List[Tuple[str,str]]:
                 m = re.search(r'([+\-]?\d+(?:\s*из\s*\d+)?|[+\-]?\d+/\d+|[+\-]?\d+(?:\.\d+)?%?)', tail)
                 value = m.group(1) if m else ""
             if not value: value = "0"
-            out.append((value, label))
-            continue
+            out.append((value, label)); continue
         lbl = "СТАТ"
         for k, v in STAT_TOKEN_MAP.items():
             if k in _normalize(seg):
@@ -256,7 +238,6 @@ PLAYERS: List[Dict[str,Any]] = []
 def _call_get_players(force: bool) -> List[Dict[str,Any]]:
     if not get_players:
         return []
-    # совместимость со старыми сигнатурами
     try:
         return get_players(force_refresh=bool(force))
     except TypeError:
@@ -266,6 +247,7 @@ def _call_get_players(force: bool) -> List[Dict[str,Any]]:
             return []
 
 def ensure_players_loaded(force: bool = False) -> List[Dict[str,Any]]:
+    """Никаких pt-поисков тут. Только локальный кэш norm."""
     global PLAYERS_READY, PLAYERS
     try:
         ps = _call_get_players(force)
@@ -274,9 +256,9 @@ def ensure_players_loaded(force: bool = False) -> List[Dict[str,Any]]:
             if refresh_players:
                 try:
                     res = refresh_players()
-                except TypeError:
-                    res = refresh_players()
-                _log("[players] refresh:", res if isinstance(res, dict) else {})
+                    _log("[players] refresh:", res if isinstance(res, (dict, tuple)) else {"res": str(res)})
+                except Exception as e:
+                    _log("[players] refresh error:", repr(e))
                 ps = _call_get_players(False)
         PLAYERS = ps or []
         PLAYERS_READY = bool(PLAYERS and len(PLAYERS) >= 50)
@@ -303,30 +285,22 @@ def _display_name_for(p: Dict[str,Any]) -> str:
     return p.get("displayName") or f"{p.get('firstName','').strip()} {p.get('lastName','').strip()}".strip()
 
 def search_players_loose(q: str) -> List[Dict[str,Any]]:
+    """Только локальный поиск по кэшу + data.find_player_by_name (если есть)."""
     qn = _normalize(q)
     ps = ensure_players_loaded(False)
     if not ps: return []
-    # 1) если в data есть свой поиск
     if find_player_by_name:
         try:
             hits = find_player_by_name(q) or []
             if hits: return hits
         except Exception:
             pass
-    # 2) fallback: по displayName/first+last
     out = []
     for p in ps:
         dn = p.get("displayName") or f"{p.get('firstName','')} {p.get('lastName','')}"
         if dn and qn in _normalize(dn):
             out.append(p)
             if len(out) >= 10: break
-    # 3) если есть pt_lookup (по passthrough), используем как догрузку
-    if not out and pt_lookup_player_by_text:
-        try:
-            pt = pt_lookup_player_by_text(q) or []
-            out.extend(pt[:10])
-        except Exception:
-            pass
     return out
 
 # ----------------- TEAM / IMAGES -----------------
@@ -369,7 +343,6 @@ def _team_colors(team_id: str) -> Tuple[str,str,str]:
         return ("#007ACC", "#005C99", "#007ACC")
 
 # ----------------- SIMPLE STATE -----------------
-# Небольшой контекст на тёплом контейнере (для шагов имени/цвета)
 CTX: Dict[int, Dict[str,Any]] = {}  # chat_id -> state
 
 def _ctx(chat_id: int) -> Dict[str,Any]:
@@ -419,7 +392,8 @@ async def telegram_get(request: Request):
         })
     if action == "refresh":
         try:
-            cnt, info = (0, {})
+            # доверяем возвращаемым данным от data.refresh_players()
+            cnt, info = 0, {}
             if refresh_players:
                 res = refresh_players()
                 if isinstance(res, tuple) and len(res) >= 2:
@@ -427,15 +401,23 @@ async def telegram_get(request: Request):
                 elif isinstance(res, dict):
                     info = res
                     cnt = int(info.get("count") or 0)
+
+            # берём актуальный список после refresh
             ps = _call_get_players(False)
             count_now = len(ps) if isinstance(ps, list) else int(cnt)
-            src = None
-            src_url = None
+
+            src = None; src_url = None
             if isinstance(info, dict):
                 src = info.get("src") or info.get("source") or info.get("source_name")
                 src_url = info.get("url") or info.get("source_url")
-            _log(f"[data] final players count: {count_now} (source={src or 'none'}) url: {src_url or 'none'}")
-            return JSONResponse({"ok": True, "refreshed": True, "players_indexed": count_now, "source": src or "none", "source_url": src_url or "none"})
+
+            _log(f"[data] final players count: {count_now} (source={src or 'unknown'}) url: {src_url or 'n/a'}")
+            return JSONResponse({
+                "ok": True, "refreshed": True,
+                "players_indexed": count_now,
+                "source": src or "unknown",
+                "source_url": src_url or None,
+            })
         except Exception as e:
             return JSONResponse({"ok": False, "refreshed": False, "error": repr(e)}, status_code=500)
     if action == "test_find":
@@ -444,26 +426,22 @@ async def telegram_get(request: Request):
         return JSONResponse({"ok": True, "q": q, "players_ready": PLAYERS_READY, "hits": hits})
     return PlainTextResponse("ok")
 
-# ----------------- HELPERS -----------------
+# ----------------- UI ASKERS -----------------
 def _send_typing(chat_id: int, t: str = "typing"):
     _tg_post("sendChatAction", {"chat_id": chat_id, "action": t})
 
 def _ask_ru_name(chat_id: int, pid: str, display_name: str, reply_to: Optional[int] = None):
-    # жирный ник, без лишних служебных токенов
     txt = f"Как подписать игрока <b>{display_name}</b> на плашке?\nОтветьте на это сообщение русским именем.\n[setname:{pid}]"
     _tg_send_message(chat_id, txt, reply_to=reply_to, parse_mode="HTML")
 
-def _ask_color(chat_id: int, team_id: str, i_label: str = "1", message_id: Optional[int] = None):
+def _ask_color(chat_id: int, team_id: str, i_label: str = "1"):
     kb = {
         "inline_keyboard": [[
             {"text": f"Цвет команды {i_label}: авто", "callback_data": f"color:auto:{team_id}:{i_label}"},
             {"text": f"Цвет команды {i_label}: свой HEX", "callback_data": f"color:ask:{team_id}:{i_label}"},
         ]]
     }
-    if message_id:
-        _tg_edit_message(chat_id, message_id, "Выберите цвет плашки:", parse_mode=None, reply_markup=kb)
-    else:
-        _tg_post("sendMessage", {"chat_id": chat_id, "text": "Выберите цвет плашки:", "reply_markup": kb})
+    _tg_post("sendMessage", {"chat_id": chat_id, "text": "Выберите цвет плашки:", "reply_markup": kb})
 
 def _valid_hex(s: str) -> bool:
     return bool(re.fullmatch(r"#?[0-9A-Fa-f]{6}", s.strip()))
@@ -476,8 +454,7 @@ def _fix_hex(s: str) -> str:
 def _stats_text(stats: List[Tuple[str,str]]) -> str:
     parts = []
     for v, l in stats:
-        if l: parts.append(f"{v} {l}")
-        else: parts.append(f"{v}")
+        parts.append(f"{v} {l}" if l else f"{v}")
     return ", ".join(parts)
 
 # ----------------- MAIN WEBHOOK -----------------
@@ -496,7 +473,6 @@ async def webhook_query(request: Request):
         if DEBUG: _log("[tg]", rid, "json error:", repr(e))
         return PlainTextResponse("OK")
 
-    # прогрев игроков
     ensure_players_loaded(False)
 
     # ---------- CALLBACKS (цвет) ----------
@@ -509,20 +485,23 @@ async def webhook_query(request: Request):
                 _, kind, team_id, i_label = data.split(":", 3)
             except ValueError:
                 kind, team_id, i_label = "auto", "0", "1"
-            st = _ctx(chat_id)
+
             if kind == "auto":
                 if set_team_primary_color:
                     set_team_primary_color(team_id, "AUTO")
                 _tg_send_message(chat_id, f"Цвет команды {i_label}: авто ✅")
             elif kind == "ask":
+                # ждём HEX в следующем сообщении
+                st = _ctx(chat_id)
                 st["waiting_hex"] = {"team_id": team_id, "i_label": i_label}
                 _tg_send_message(chat_id, f"Пришлите HEX для команды {i_label} (например, #FDB927):")
                 return PlainTextResponse("OK")
 
-            # цвет готов → рендер
+            # После выбора цвета — ищем, что рендерить из контекста
+            st = _ctx(chat_id)
             try:
-                # SINGLE
-                if st.get("mode") == "single":
+                mode = st.get("mode")
+                if mode == "single":
                     p = st.get("p1") or {}
                     stats = st.get("stats1") or []
                     ru = st.get("ru1") or _display_name_for(p)
@@ -539,17 +518,13 @@ async def webhook_query(request: Request):
                                              caption=_stats_text(stats))
                     _ctx_clear(chat_id); return PlainTextResponse("OK")
 
-                # DUO
-                if st.get("mode") == "duo":
-                    # спросили ли уже цвет для второй?
-                    if not st.get("color1_done"):
-                        st["color1_done"] = True
-                        # спросим цвет второй команды
+                if mode == "duo":
+                    # сначала спросим цвет второй, если ещё нет
+                    if not _ctx(chat_id).get("color1_done"):
+                        _ctx(chat_id)["color1_done"] = True
                         p2 = st.get("p2") or {}
                         _ask_color(chat_id, str(p2.get("teamId") or "0"), i_label="2")
                         return PlainTextResponse("OK")
-
-                    # color2_done → рендер
                     p1, p2 = st.get("p1") or {}, st.get("p2") or {}
                     stats1, stats2 = st.get("stats1") or [], st.get("stats2") or []
                     ru1 = st.get("ru1") or _display_name_for(p1)
@@ -567,8 +542,7 @@ async def webhook_query(request: Request):
                                              caption=f"{_stats_text(stats1)}  |  {_stats_text(stats2)}")
                     _ctx_clear(chat_id); return PlainTextResponse("OK")
 
-                # SPECIAL
-                if st.get("mode") == "special":
+                if mode == "special":
                     p = st.get("p1") or {}
                     stats = st.get("stats1") or []
                     info_text = st.get("info") or ""
@@ -586,8 +560,7 @@ async def webhook_query(request: Request):
                                              caption=_stats_text(stats))
                     _ctx_clear(chat_id); return PlainTextResponse("OK")
 
-                # BAD
-                if st.get("mode") == "bad":
+                if mode == "bad":
                     p = st.get("p1") or {}
                     stats = st.get("stats1") or []
                     ru = st.get("ru1") or _display_name_for(p)
@@ -610,14 +583,13 @@ async def webhook_query(request: Request):
 
     # ---------- MESSAGE ----------
     msg = update.get("message") or update.get("edited_message")
-    if not msg:
-        return PlainTextResponse("OK")
+    if not msg: return PlainTextResponse("OK")
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
     text = (msg.get("text") or "").strip()
     st = _ctx(chat_id)
 
-    # HEX ожидание
+    # ожидание HEX
     if st.get("waiting_hex"):
         hx = text.strip()
         wh = st["waiting_hex"]
@@ -630,11 +602,11 @@ async def webhook_query(request: Request):
             set_team_primary_color(team_id, _fix_hex(hx))
         _tg_send_message(chat_id, f"Цвет команды {i_label}: {_fix_hex(hx)} ✅")
         st.pop("waiting_hex", None)
-        # продолжаем как при нажатии "auto" — то есть к рендеру:
+        # эмулируем коллбек auto → общий рендер
         update["callback_query"] = {"from":{"id":chat_id},"data":f"color:auto:{team_id}:{i_label}"}
         return await webhook_query(request)
 
-    # Реплай на setname
+    # Реплай на запрос имени
     rpl = msg.get("reply_to_message")
     if rpl and text:
         rtxt = (rpl.get("text") or "") + " " + (rpl.get("caption") or "")
@@ -648,29 +620,16 @@ async def webhook_query(request: Request):
             except Exception as e:
                 _tg_send_message(chat_id, f"Не удалось сохранить имя: {repr(e)}", reply_to=msg.get("message_id"))
                 return PlainTextResponse("OK")
-            # Обновим контекст
-            if st.get("p1") and str(st["p1"].get("personId")) == pid:
-                st["ru1"] = name_ru
-                team_id = str(st["p1"].get("teamId") or "0")
-                # если режим duo и у второго нет имени — сначала спросим второе имя
-                if st.get("mode") == "duo" and not st.get("ru2"):
+            if st.get("mode") == "duo":
+                # если у второй стороны имени нет — спросим
+                if st.get("p2") and not st.get("ru2"):
                     p2 = st.get("p2") or {}
                     _ask_ru_name(chat_id, str(p2.get("personId") or ""), p2.get("displayName") or "", reply_to=None)
                     return PlainTextResponse("OK")
-                # иначе спросим цвет 1
-                _ask_color(chat_id, team_id, i_label="1")
-                return PlainTextResponse("OK")
-
-            if st.get("p2") and str(st["p2"].get("personId")) == pid:
-                st["ru2"] = name_ru
-                # после второго имени спросим цвет 1 (если не спросили раньше)
-                if not st.get("color1_done"):
-                    p1 = st.get("p1") or {}
-                    _ask_color(chat_id, str(p1.get("teamId") or "0"), i_label="1")
-                else:
-                    p2 = st.get("p2") or {}
-                    _ask_color(chat_id, str(p2.get("teamId") or "0"), i_label="2")
-                return PlainTextResponse("OK")
+            # затем спросим цвет 1
+            p1 = st.get("p1") or {}
+            _ask_color(chat_id, str(p1.get("teamId") or "0"), i_label="1")
+            return PlainTextResponse("OK")
 
     # Команды
     if text.startswith("/start"):
@@ -721,11 +680,11 @@ async def webhook_query(request: Request):
             pid = str(p.get("personId") or "")
             st.clear()
             st.update({"mode":"single", "p1":p, "stats1":stats})
-            # Если уже есть RU — сразу спросим цвет, иначе имя
+
+            # RU имя?
             ru = None
             try:
-                if overrides_get_name_ru:
-                    ru = overrides_get_name_ru(pid)
+                ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
             except Exception:
                 ru = None
             if not ru:
@@ -741,15 +700,16 @@ async def webhook_query(request: Request):
     if text.startswith("/card2 "):
         try:
             args = text[len("/card2"):].strip()
-            # ожидаем разделитель "||" между игроками
             sides = [s.strip() for s in args.split("||")]
             if len(sides) != 2:
                 _tg_send_message(chat_id, "Формат: /card2 <имя1> | <статы1> || <имя2> | <статы2>")
                 return PlainTextResponse("OK")
+
             def parse_side(s: str) -> Tuple[str, List[Tuple[str,str]]]:
                 parts = [p.strip() for p in s.split("|")]
                 if len(parts) < 2: return parts[0] if parts else "", []
                 return parts[0], parse_stats_list(parts[1])
+
             n1, st1 = parse_side(sides[0])
             n2, st2 = parse_side(sides[1])
 
@@ -761,21 +721,20 @@ async def webhook_query(request: Request):
             if not h1 or not h2:
                 _tg_send_message(chat_id, "Не нашёл одного из игроков, уточните имена.")
                 return PlainTextResponse("OK")
+
             p1, p2 = h1[0], h2[0]
             st.clear()
             st.update({"mode":"duo", "p1":p1, "stats1":st1, "p2":p2, "stats2":st2})
 
-            # Имена RU: если нет — спросим по порядку
-            need1 = need2 = False
             pid1 = str(p1.get("personId") or "")
             pid2 = str(p2.get("personId") or "")
+
             ru1 = ru2 = None
-            try:
-                ru1 = overrides_get_name_ru(pid1) if overrides_get_name_ru else None
+            try: ru1 = overrides_get_name_ru(pid1) if overrides_get_name_ru else None
             except Exception: ru1 = None
-            try:
-                ru2 = overrides_get_name_ru(pid2) if overrides_get_name_ru else None
+            try: ru2 = overrides_get_name_ru(pid2) if overrides_get_name_ru else None
             except Exception: ru2 = None
+
             if not ru1:
                 _ask_ru_name(chat_id, pid1, p1.get("displayName") or "", reply_to=None)
                 return PlainTextResponse("OK")
@@ -784,13 +743,12 @@ async def webhook_query(request: Request):
                 _ask_ru_name(chat_id, pid2, p2.get("displayName") or "", reply_to=None)
                 return PlainTextResponse("OK")
             st["ru2"] = ru2
-            # Оба имени есть — спрашиваем цвет первой
             _ask_color(chat_id, str(p1.get("teamId") or "0"), i_label="1")
         except Exception as e:
             _tg_send_message(chat_id, f"Ошибка: {repr(e)}")
         return PlainTextResponse("OK")
 
-    # /cards (special с правым текстом)
+    # /cards
     if text.startswith("/cards "):
         try:
             args = text[len("/cards"):].strip()
@@ -815,10 +773,8 @@ async def webhook_query(request: Request):
             st.update({"mode":"special", "p1":p, "stats1":stats, "info":info_text})
 
             ru = None
-            try:
-                ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
-            except Exception:
-                ru = None
+            try: ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
+            except Exception: ru = None
             if not ru:
                 _ask_ru_name(chat_id, pid, p.get("displayName") or "", reply_to=None)
                 return PlainTextResponse("OK")
@@ -853,20 +809,16 @@ async def webhook_query(request: Request):
             st.update({"mode":"bad", "p1":p, "stats1":stats})
 
             ru = None
-            try:
-                ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
-            except Exception:
-                ru = None
+            try: ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
+            except Exception: ru = None
             if not ru:
                 _ask_ru_name(chat_id, pid, p.get("displayName") or "", reply_to=None)
                 return PlainTextResponse("OK")
             st["ru1"] = ru
-            # BAD — тоже спросим цвет (для круга логотипа команды), но рендер всегда коричневый
             _ask_color(chat_id, str(p.get("teamId") or "0"), i_label="1")
         except Exception as e:
             _tg_send_message(chat_id, f"Ошибка: {repr(e)}")
         return PlainTextResponse("OK")
 
-    # если ничего не подошло
     _tg_send_message(chat_id, HELP_TEXT)
     return PlainTextResponse("OK")
