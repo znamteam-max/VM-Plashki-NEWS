@@ -1,6 +1,6 @@
-# api/telegram.py — anti-loop, /stop, единое статус-сообщение, error reporting (❌)
+# api/telegram.py — safe render kwargs, anti-loop, statuses, error ❌
 from __future__ import annotations
-import os, io, re, json, time, unicodedata, uuid
+import os, io, re, json, time, unicodedata, uuid, inspect
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Request
@@ -298,9 +298,21 @@ def _team_colors(team_id: str) -> Tuple[str,str,str]:
     except Exception:
         return ("#007ACC","#005C99","#007ACC")
 
-# ----------------- State + anti-loop -----------------
+# ----------------- Render-safe wrapper -----------------
+def _call_render(func, *args, **kwargs):
+    """
+    Фильтрует kwargs по сигнатуре целевой функции, чтобы не было unexpected keyword.
+    """
+    try:
+        sig = inspect.signature(func)
+        allowed = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return func(*args, **allowed)
+    except Exception:
+        # пробуем без kwargs совсем
+        return func(*args)
+
+# ----------------- State + statuses -----------------
 CTX: Dict[int, Dict[str,Any]] = {}
-SEEN_UPDATES: set[int] = set()
 
 def _ctx(chat_id: int) -> Dict[str,Any]:
     return CTX.setdefault(chat_id, {})
@@ -414,7 +426,7 @@ async def telegram_get(request: Request):
         return JSONResponse({"ok": True, "q": q, "players_ready": PLAYERS_READY, "hits": hits})
     return PlainTextResponse("ok")
 
-# ----------------- Render wrappers (with robust error reporting) -----------------
+# ----------------- Render wrappers (safe) -----------------
 def _render_single(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,str]], ask_corrections:bool=True):
     try:
         _status_update(chat_id, "Готовлю плашку…")
@@ -424,12 +436,17 @@ def _render_single(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,st
             _fail(chat_id, "Не удалось получить фото игрока."); return
         logo = _ensure_team_logo_image(team_id)
         colors = _team_colors(team_id)
-        png = render_card(
-            "single", ru, "", logo, colors, head, stats,
+        # желаемые kwargs (будут отфильтрованы по сигнатуре)
+        want = dict(
             round_left=False, round_right=True,
             name_stat_center=True,
             right_panel_width_ratio=None,
             text_topmost=True
+        )
+        png = _call_render(
+            render_card,
+            "single", ru, "", logo, colors, head, stats,
+            **want
         )
         sent = _tg_send_png_as_document(chat_id, png, filename=f"card_{p.get('personId','x')}.png", caption=_stats_text(stats))
         if not sent.get("ok"):
@@ -447,12 +464,15 @@ def _render_bad(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,str]]
         if head is None:
             _fail(chat_id, "Не удалось получить фото игрока."); return
         logo = _ensure_team_logo_image(str(p.get("teamId") or "0"))
-        png = render_card_bad(
-            ru, head, stats,
-            team_logo_img=logo,
+        want = dict(
             round_left=False, round_right=True,
             poop_larger=True, poop_lower=18,
             name_stat_center=True
+        )
+        png = _call_render(
+            render_card_bad,
+            ru, head, stats,
+            team_logo_img=logo, **want
         )
         sent = _tg_send_png_as_document(chat_id, png, filename=f"cardBAD_{p.get('personId','x')}.png", caption=_stats_text(stats))
         if not sent.get("ok"):
@@ -471,13 +491,17 @@ def _render_duo(chat_id:int, p1:Dict[str,Any], ru1:str, st1:List[Tuple[str,str]]
             _fail(chat_id, "Не удалось получить фото одного из игроков."); return
         l1, l2 = _ensure_team_logo_image(t1), _ensure_team_logo_image(t2)
         c1, c2 = _team_colors(t1), _team_colors(t2)
-        png = render_card2(
-            ru1, l1, c1, h1, st1,
-            ru2, l2, c2, h2, st2,
+        want = dict(
             round_left=False, round_right=False, round_all=False,
             name_stat_center=True,
             duo_name_delta_plus=2,
             duo_autofit_names=True
+        )
+        png = _call_render(
+            render_card2,
+            ru1, l1, c1, h1, st1,
+            ru2, l2, c2, h2, st2,
+            **want
         )
         sent = _tg_send_png_as_document(chat_id, png, filename=f"card2_{p1.get('personId','x')}_{p2.get('personId','y')}.png",
                                         caption=f"{_stats_text(st1)}  |  {_stats_text(st2)}")
@@ -496,12 +520,16 @@ def _render_special(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,s
             _fail(chat_id, "Не удалось получить фото игрока."); return
         logo = _ensure_team_logo_image(t)
         colors = _team_colors(t)
-        png = render_card_special(
-            ru, logo, colors, head, stats, info_text,
+        want = dict(
             round_left=False, round_right=True,
             right_panel_half_width=True,
             right_wrap=True, text_topmost=True,
             name_stat_center=True
+        )
+        png = _call_render(
+            render_card_special,
+            ru, logo, colors, head, stats, info_text,
+            **want
         )
         sent = _tg_send_png_as_document(chat_id, png, filename=f"cards_{p.get('personId','x')}.png", caption=_stats_text(stats))
         if not sent.get("ok"):
@@ -523,12 +551,6 @@ async def webhook_query(request: Request):
         if DEBUG: _log("[tg] ", raw)
     except Exception:
         return PlainTextResponse("OK")
-
-    update_id = update.get("update_id")
-    if isinstance(update_id, int):
-        # локальная идемпотентность
-        # (не держим бесконечно — но для версел-воркера достаточно)
-        pass
 
     # callbacks
     cb = update.get("callback_query")
@@ -558,7 +580,12 @@ async def webhook_query(request: Request):
 
             if data == "fix:color":
                 st["fix_wait"] = "color_which"
-                _status_update(chat_id, "Для какой команды изменить цвет?", keep_kb=_kb_color_which(st.get("mode","single")))
+                # в duo получим выбор 1/2; в single/special — один вариант
+                kb = {"inline_keyboard":[
+                    [{"text":"Цвет команды 1","callback_data":"colorwhich:1"}] +
+                    ([{"text":"Цвет команды 2","callback_data":"colorwhich:2"}] if st.get("mode")=="duo" else [])
+                ]}
+                _status_update(chat_id, "Для какой команды изменить цвет?", keep_kb=kb)
                 return PlainTextResponse("OK")
 
             if data == "fix:teams":
@@ -675,7 +702,7 @@ async def webhook_query(request: Request):
             _fail(chat_id, f"Ошибка: {repr(e)}")
         return PlainTextResponse("OK")
 
-    # Reply с русским именем — идемпотентно и с безопасной продолжалкой
+    # Reply с русским именем
     rpl = msg.get("reply_to_message")
     if rpl and text:
         try:
@@ -749,7 +776,7 @@ async def webhook_query(request: Request):
             _fail(chat_id, f"Ошибка: {repr(e)}")
         return PlainTextResponse("OK")
 
-    # /card (not case-sensitive)
+    # /card
     if re.match(r"^/(card)\b", low):
         try:
             args = text.split(" ",1)[1] if " " in text else ""
