@@ -1,7 +1,7 @@
 # graphics.py
 from __future__ import annotations
 import io, os, math
-from typing import Any, Iterable, List, Tuple, Optional
+from typing import Any, Iterable, List, Tuple, Optional, Union
 from PIL import Image, ImageDraw, ImageFont
 
 # ------------------------------------------------------------
@@ -126,12 +126,41 @@ def _wrap_text(font: ImageFont.ImageFont, text: str, max_width: int) -> List[str
         lines.append(" ".join(cur))
     return lines
 
-def _ensure_rgba(img_or_none: Optional[Image.Image]) -> Optional[Image.Image]:
-    if img_or_none is None:
+# === ЗАГРУЗКА ИЗ ЛЮБОГО ТИПА =================================================
+def _as_image(obj: Any) -> Optional[Image.Image]:
+    """
+    Корректно превращает в PIL.Image:
+    - PIL.Image.Image → как есть
+    - bytes/bytearray → Image.open(BytesIO)
+    - str (путь к файлу) → Image.open(path)
+    - иначе → None
+    """
+    if obj is None:
         return None
-    if img_or_none.mode != "RGBA":
-        return img_or_none.convert("RGBA")
-    return img_or_none
+    if isinstance(obj, Image.Image):
+        return obj
+    if isinstance(obj, (bytes, bytearray)):
+        try:
+            return Image.open(io.BytesIO(obj)).convert("RGBA")
+        except Exception:
+            return None
+    if isinstance(obj, str):
+        # пробуем открыть локальный путь (или смонтированный путь в /var/task)
+        try:
+            if os.path.exists(obj):
+                return Image.open(obj).convert("RGBA")
+        except Exception:
+            return None
+    return None
+
+def _ensure_rgba(img_like: Any) -> Optional[Image.Image]:
+    """
+    Принимает любые входы (Image/bytes/str/None) → возвращает RGBA или None.
+    """
+    im = _as_image(img_like) if not isinstance(img_like, Image.Image) else img_like
+    if im is None:
+        return None
+    return im if im.mode == "RGBA" else im.convert("RGBA")
 
 # ---------------------------------------------
 # СТАТЫ → СТРОКИ (устойчиво к мусору)
@@ -183,16 +212,16 @@ def _draw_gradient(w: int, h: int, top: Tuple[int,int,int], bottom: Tuple[int,in
         d.line([(0,y),(w,y)], fill=(r,g,b,255))
     return grad
 
-def _draw_team_logo_circle(base: Image.Image, logo_img: Optional[Image.Image], cx: int, cy: int, radius: int):
-    if logo_img is None:
+def _draw_team_logo_circle(base: Image.Image, logo_img_like: Any, cx: int, cy: int, radius: int):
+    im_logo = _ensure_rgba(logo_img_like)
+    if im_logo is None:
         return
-    logo_img = _ensure_rgba(logo_img)
     r = radius
     circ = Image.new("RGBA", (r*2, r*2), (0,0,0,0))
     d = ImageDraw.Draw(circ)
     d.ellipse((0,0,r*2,r*2), fill=(255,255,255,255))
     inner = int(r * 1.4)
-    L = logo_img.copy()
+    L = im_logo.copy()
     L.thumbnail((inner, inner))
     lx = (circ.width - L.width)//2
     ly = (circ.height - L.height)//2
@@ -200,10 +229,8 @@ def _draw_team_logo_circle(base: Image.Image, logo_img: Optional[Image.Image], c
     ox, oy = TEAM_LOGO_OFFSET
     base.alpha_composite(circ, (cx - r + ox, cy - r + oy))
 
-def _place_headshot(base: Image.Image, head: Optional[Image.Image], x_right: int, y_bottom: int, max_w: int, max_h: int):
-    if head is None:
-        return
-    H = _ensure_rgba(head)
+def _place_headshot(base: Image.Image, head_like: Any, x_right: int, y_bottom: int, max_w: int, max_h: int):
+    H = _ensure_rgba(head_like)
     if H is None:
         return
     H = H.copy()
@@ -213,14 +240,14 @@ def _place_headshot(base: Image.Image, head: Optional[Image.Image], x_right: int
     base.alpha_composite(H, (x, y))
 
 # ------------------------------------------------------------
-# ОДИНОЧНАЯ ПЛАШКА (card)
+# ОДИНОЧНАЯ ПЛАШКА (card) — скругления только справа
 # ------------------------------------------------------------
 def render_card(template_key: str,
                 player_name: str,
                 team_text: str,
-                logo_img: Optional[Image.Image],
+                logo_img: Any,
                 colors: Any,
-                head_img: Optional[Image.Image],
+                head_img: Any,
                 stats: Any,
                 **kwargs) -> bytes:
     c1, c2, _ = _ensure_palette(colors)
@@ -235,6 +262,7 @@ def render_card(template_key: str,
 
     _draw_team_logo_circle(im, logo_img, cx=SAFE_PADDING + 120, cy=SAFE_PADDING + 120, radius=84)
 
+    # Имя ≥ цифр
     name_font = _load_font(FONT_PRIMARY, 132)
     stat_big = _load_font(FONT_PRIMARY, 88)
     stat_small = _load_font(FONT_SECONDARY, 52)
@@ -245,8 +273,9 @@ def render_card(template_key: str,
     col_gap = 46
     col_w = min(240, (W - SAFE_PADDING*2) // max(1, cols) - col_gap) if cols else 0
     stats_w = cols * col_w + (cols - 1) * col_gap if cols else 0
-    name_w = name_font.getbbox(str(player_name))[2]
-    name_h = name_font.getbbox(str(player_name))[3] - name_font.getbbox(str(player_name))[1]
+    name_text = str(player_name)
+    name_w = name_font.getbbox(name_text)[2]
+    name_h = name_font.getbbox(name_text)[3] - name_font.getbbox(name_text)[1]
     block_w = max(name_w, stats_w)
     stats_big_h = stat_big.getbbox("88")[3] - stat_big.getbbox("88")[1]
     stats_small_h = stat_small.getbbox("ОЧКИ")[3] - stat_small.getbbox("ОЧКИ")[1]
@@ -255,7 +284,7 @@ def render_card(template_key: str,
     bx = (W - block_w)//2
     by = (H - block_h)//2
     d = ImageDraw.Draw(im)
-    d.text((bx, by), str(player_name), font=name_font, fill=(255,255,255,255))
+    d.text((bx, by), name_text, font=name_font, fill=(255,255,255,255))
 
     if cols:
         sx = (W - stats_w)//2
@@ -277,8 +306,8 @@ def render_card(template_key: str,
 # ДВОЙНАЯ ПЛАШКА (card2) — без скруглений вообще
 # ------------------------------------------------------------
 def render_card2(template_key: str,
-                 p1_name: str, _team1: str, logo1: Optional[Image.Image], colors1: Any, head1: Optional[Image.Image], stats1: Any,
-                 p2_name: str, _team2: str, logo2: Optional[Image.Image], colors2: Any, head2: Optional[Image.Image], stats2: Any,
+                 p1_name: str, _team1: str, logo1: Any, colors1: Any, head1: Any, stats1: Any,
+                 p2_name: str, _team2: str, logo2: Any, colors2: Any, head2: Any, stats2: Any,
                  **kwargs) -> bytes:
     c1L, c2L, _ = _ensure_palette(colors1)
     c1R, c2R, _ = _ensure_palette(colors2)
@@ -307,14 +336,15 @@ def render_card2(template_key: str,
     _draw_team_logo_circle(im, logo1, cx=SAFE_PADDING + 120, cy=SAFE_PADDING + 120, radius=84)
     _draw_team_logo_circle(im, logo2, cx=W - (SAFE_PADDING + 120), cy=SAFE_PADDING + 120, radius=84)
 
-    def draw_side(x0: int, side_name: str, head: Optional[Image.Image], stats_any: Any):
+    def draw_side(x0: int, side_name: str, head_like: Any, stats_any: Any):
         vals, labs, cols = _stats_to_lines(stats_any)
         d = ImageDraw.Draw(im)
-        nw = f_name.getbbox(str(side_name))[2]
-        nh = f_name.getbbox(str(side_name))[3] - f_name.getbbox(str(side_name))[1]
+        name_text = str(side_name)
+        nw = f_name.getbbox(name_text)[2]
+        nh = f_name.getbbox(name_text)[3] - f_name.getbbox(name_text)[1]
         nx = x0 + (W//2 - nw)//2
         ny = (H - nh)//2 - 80
-        d.text((nx, ny), str(side_name), font=f_name, fill=(255,255,255,255))
+        d.text((nx, ny), name_text, font=f_name, fill=(255,255,255,255))
 
         if cols:
             col_gap = 36
@@ -332,7 +362,7 @@ def render_card2(template_key: str,
                 vh = f_val.getbbox(v)[3] - f_val.getbbox(v)[1]
                 d.text((cx + (col_w - lw)//2, sy + vh + 8), lab, font=f_lab, fill=(255,255,255,220))
 
-        _place_headshot(im, head, x_right=x0 + W//2 - SAFE_PADDING, y_bottom=H - SAFE_PADDING, max_w=600, max_h=620)
+        _place_headshot(im, head_like, x_right=x0 + W//2 - SAFE_PADDING, y_bottom=H - SAFE_PADDING, max_w=600, max_h=620)
 
     draw_side(0, p1_name, head1, stats1)
     draw_side(W//2, p2_name, head2, stats2)
@@ -341,15 +371,14 @@ def render_card2(template_key: str,
 # ------------------------------------------------------------
 # ОСНОВНАЯ + ДОП. ПАНЕЛЬ (cardS)
 #   — основная с закруглением только справа;
-#   — правая доп.плашка со скруглениями по всем углам;
-#   — внизу доп.плашки добавляем пустую строку.
+#   — правая доп.плашка со скруглениями по всем углам и пустой строкой снизу.
 # ------------------------------------------------------------
 def render_card_special(template_key: str,
                         player_name: str,
                         right_text: Any,
-                        logo_img: Optional[Image.Image],
+                        logo_img: Any,
                         colors: Any,
-                        head_img: Optional[Image.Image],
+                        head_img: Any,
                         stats: Any = None,
                         **kwargs) -> bytes:
     c1, c2, _ = _ensure_palette(colors)
@@ -375,8 +404,9 @@ def render_card_special(template_key: str,
     stat_small= _load_font(FONT_SECONDARY, 48)
     vals, labs, cols = _stats_to_lines(stats)
 
-    name_w = name_font.getbbox(str(player_name))[2]
-    name_h = name_font.getbbox(str(player_name))[3] - name_font.getbbox(str(player_name))[1]
+    name_text = str(player_name)
+    name_w = name_font.getbbox(name_text)[2]
+    name_h = name_font.getbbox(name_text)[3] - name_font.getbbox(name_text)[1]
     col_gap = 42
     col_w = min(220, (main_w - SAFE_PADDING*2) // max(1, cols) - col_gap) if cols else 0
     stats_w = cols * col_w + (cols - 1)*col_gap if cols else 0
@@ -389,7 +419,7 @@ def render_card_special(template_key: str,
     by = (H - block_h)//2
 
     d = ImageDraw.Draw(im)
-    d.text((bx, by), str(player_name), font=name_font, fill=(255,255,255,255))
+    d.text((bx, by), name_text, font=name_font, fill=(255,255,255,255))
 
     if cols:
         sx = SAFE_PADDING + (main_w - stats_w)//2
@@ -444,9 +474,9 @@ def _load_icon(name: str, size: int) -> Optional[Image.Image]:
 def render_card_bad(template_key: str,
                     player_name: str,
                     _team_text: str,
-                    _logo_img: Optional[Image.Image],
+                    _logo_img: Any,
                     _colors_unused: Any,
-                    head_img: Optional[Image.Image],
+                    head_img: Any,
                     stats: Any,
                     **kwargs) -> bytes:
     W, H = 1400, 560
@@ -461,13 +491,14 @@ def render_card_bad(template_key: str,
     stat_small= _load_font(FONT_SECONDARY, 50)
     vals, labs, cols = _stats_to_lines(stats)
 
+    name_text = str(player_name)
     nx = SAFE_PADDING + 20
     ny = SAFE_PADDING + 40
-    d.text((nx, ny), str(player_name), font=name_font, fill=(255,255,255,255))
-    name_w = name_font.getbbox(str(player_name))[2]
-    name_h = name_font.getbbox(str(player_name))[3] - name_font.getbbox(str(player_name))[1]
+    d.text((nx, ny), name_text, font=name_font, fill=(255,255,255,255))
+    name_w = name_font.getbbox(name_text)[2]
+    name_h = name_font.getbbox(name_text)[3] - name_font.getbbox(name_text)[1]
 
-    poop = _load_icon("poop.png", size=140) or _load_icon("poop@2x.png", size=140)
+    poop = _load_icon("poop.png", size=160) or _load_icon("poop@2x.png", size=160)
     if poop:
         px = nx + name_w + 16
         py = ny + name_h - poop.height + 18  # опустить на ~15-20 px
