@@ -1,4 +1,4 @@
-# api/telegram.py — safe render kwargs, anti-loop, statuses, error ❌
+# api/telegram.py — no-rounded presets, font rules, bottom line for cardS
 from __future__ import annotations
 import os, io, re, json, time, unicodedata, uuid, inspect
 from typing import Any, Dict, List, Optional, Tuple
@@ -300,15 +300,11 @@ def _team_colors(team_id: str) -> Tuple[str,str,str]:
 
 # ----------------- Render-safe wrapper -----------------
 def _call_render(func, *args, **kwargs):
-    """
-    Фильтрует kwargs по сигнатуре целевой функции, чтобы не было unexpected keyword.
-    """
     try:
         sig = inspect.signature(func)
         allowed = {k: v for k, v in kwargs.items() if k in sig.parameters}
         return func(*args, **allowed)
     except Exception:
-        # пробуем без kwargs совсем
         return func(*args)
 
 # ----------------- State + statuses -----------------
@@ -436,11 +432,13 @@ def _render_single(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,st
             _fail(chat_id, "Не удалось получить фото игрока."); return
         logo = _ensure_team_logo_image(team_id)
         colors = _team_colors(team_id)
-        # желаемые kwargs (будут отфильтрованы по сигнатуре)
         want = dict(
+            # закругления: только справа
+            round_all=False, no_round=False,
             round_left=False, round_right=True,
+            left_radius=0, radius=0, radius_left=0, radius_right=16,
+            # выравнивание
             name_stat_center=True,
-            right_panel_width_ratio=None,
             text_topmost=True
         )
         png = _call_render(
@@ -465,8 +463,13 @@ def _render_bad(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,str]]
             _fail(chat_id, "Не удалось получить фото игрока."); return
         logo = _ensure_team_logo_image(str(p.get("teamId") or "0"))
         want = dict(
+            # только справа
+            round_all=False, no_round=False,
             round_left=False, round_right=True,
-            poop_larger=True, poop_lower=18,
+            left_radius=0, radius=0, radius_left=0, radius_right=16,
+            # визуал BAD
+            poop_larger=True, poop_lower=20,
+            # центрирование
             name_stat_center=True
         )
         png = _call_render(
@@ -491,11 +494,18 @@ def _render_duo(chat_id:int, p1:Dict[str,Any], ru1:str, st1:List[Tuple[str,str]]
             _fail(chat_id, "Не удалось получить фото одного из игроков."); return
         l1, l2 = _ensure_team_logo_image(t1), _ensure_team_logo_image(t2)
         c1, c2 = _team_colors(t1), _team_colors(t2)
+
         want = dict(
-            round_left=False, round_right=False, round_all=False,
-            name_stat_center=True,
-            duo_name_delta_plus=2,
-            duo_autofit_names=True
+            # Никаких закруглений
+            round_all=False, no_round=True,
+            round_left=False, round_right=False,
+            left_radius=0, right_radius=0, radius=0, radius_left=0, radius_right=0,
+            # Центровка имени/статов
+            name_stat_center=True, duo_name_stat_center=True,
+            # Шрифты: имя ≥ статистики; статистика на 2 меньше
+            duo_autofit_names=True, duo_sync_fit=True, duo_lock_ratio=True,
+            duo_name_delta_plus=2, duo_stat_delta_minus=2,
+            duo_min_name_vs_stat=True
         )
         png = _call_render(
             render_card2,
@@ -503,8 +513,11 @@ def _render_duo(chat_id:int, p1:Dict[str,Any], ru1:str, st1:List[Tuple[str,str]]
             ru2, l2, c2, h2, st2,
             **want
         )
-        sent = _tg_send_png_as_document(chat_id, png, filename=f"card2_{p1.get('personId','x')}_{p2.get('personId','y')}.png",
-                                        caption=f"{_stats_text(st1)}  |  {_stats_text(st2)}")
+        sent = _tg_send_png_as_document(
+            chat_id, png,
+            filename=f"card2_{p1.get('personId','x')}_{p2.get('personId','y')}.png",
+            caption=f"{_stats_text(st1)}  |  {_stats_text(st2)}"
+        )
         if not sent.get("ok"):
             _fail(chat_id, f"Ошибка отправки PNG: {sent.get('error') or sent}"); return
         _status_update(chat_id, "Готово. Всё ок или нужно исправить?", keep_kb=_kb_ok_or_fix())
@@ -520,10 +533,23 @@ def _render_special(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,s
             _fail(chat_id, "Не удалось получить фото игрока."); return
         logo = _ensure_team_logo_image(t)
         colors = _team_colors(t)
+
+        # Принудительно добавляем «пустую строку» в конце правого текста
+        info_text = (info_text or "").rstrip() + "\n\u00A0"
+
         want = dict(
+            # Основная часть: закругление только справа
+            round_all=False, no_round=False,
             round_left=False, round_right=True,
-            right_panel_half_width=True,
-            right_wrap=True, text_topmost=True,
+            left_radius=0, radius=0, radius_left=0, radius_right=16,
+            # Правая панель: оба края закруглены
+            right_round_left=True, right_round_right=True,
+            right_radius_left=16, right_radius_right=16,
+            # Правая панель уже в 2 раза
+            right_panel_half_width=True, right_panel_width_ratio=0.5,
+            # Текст справа — перенос и поверх всех слоёв + нижний паддинг
+            right_wrap=True, text_topmost=True, right_text_pad_bottom=14,
+            # Центровка имени/статов
             name_stat_center=True
         )
         png = _call_render(
@@ -580,7 +606,6 @@ async def webhook_query(request: Request):
 
             if data == "fix:color":
                 st["fix_wait"] = "color_which"
-                # в duo получим выбор 1/2; в single/special — один вариант
                 kb = {"inline_keyboard":[
                     [{"text":"Цвет команды 1","callback_data":"colorwhich:1"}] +
                     ([{"text":"Цвет команды 2","callback_data":"colorwhich:2"}] if st.get("mode")=="duo" else [])
