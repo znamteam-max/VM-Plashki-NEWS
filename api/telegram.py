@@ -1,4 +1,4 @@
-# api/telegram.py — flow с автоименами, автокрасом и пост-правками
+# api/telegram.py — anti-loop, /stop, единое статус-сообщение, авто-продолжение после имени
 from __future__ import annotations
 import os, io, re, json, time, unicodedata, uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,29 +26,22 @@ def _safe_import(modname: str, names: List[str]):
     except Exception as e:
         return None, [], f"{e.__class__.__name__}: {e}"
 
-# data
+# ---- deps
 _data_mod, _data_objs, _data_err = _safe_import("data", [
     "get_players", "refresh_players", "find_player_by_name", "display_name_for",
     "overrides_save_name_ru", "overrides_get_name_ru",
     "ensure_headshot_png", "ensure_team_logo_png",
 ])
-if _data_err and DEBUG: _log("[boot] data import error:", _data_err)
 (get_players, refresh_players, find_player_by_name, display_name_for,
  overrides_save_name_ru, overrides_get_name_ru,
  ensure_headshot_png, ensure_team_logo_png) = ([_ for _ in _data_objs] + [None]*8)[:8]
-
-# team_brand
 _brand_mod, _brand_objs, _brand_err = _safe_import("team_brand", [
     "get_team_brand", "color_name_ru", "set_team_primary_color",
 ])
-if _brand_err and DEBUG: _log("[boot] team_brand import error:", _brand_err)
 (get_team_brand, color_name_ru, set_team_primary_color) = ([_ for _ in _brand_objs] + [None]*3)[:3]
-
-# graphics
 _graphics_mod, _graphics_objs, _graphics_err = _safe_import("graphics", [
     "render_card", "render_card2", "render_card_special", "render_card_bad",
 ])
-if _graphics_err and DEBUG: _log("[boot] graphics import error:", _graphics_err)
 (render_card, render_card2, render_card_special, render_card_bad) = ([_ for _ in _graphics_objs] + [None]*4)[:4]
 
 app = FastAPI()
@@ -70,26 +63,28 @@ def _http_json(url: str, payload: Dict[str, Any], timeout: int = 25) -> Dict[str
 def _tg_post(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         return _http_json(_tg_url(method), payload)
-    except HTTPError as e:
-        if DEBUG: _log("[tg] HTTPError", method, e)
-        return {"ok": False, "error": f"HTTPError {e.code}"}
-    except URLError as e:
-        if DEBUG: _log("[tg] URLError", method, e)
-        return {"ok": False, "error": "URLError"}
     except Exception as e:
         if DEBUG: _log("[tg] send error:", repr(e))
         return {"ok": False, "error": repr(e)}
 
-def _tg_send_message(chat_id: int, text: str, reply_to: Optional[int] = None, parse_mode: Optional[str] = None, reply_markup: Optional[Dict[str,Any]]=None):
-    payload = {"chat_id": chat_id, "text": text}
+def _tg_send_message(chat_id: int, text: str, *, reply_to: Optional[int]=None,
+                     parse_mode: Optional[str]=None, reply_markup: Optional[Dict[str,Any]]=None) -> Dict[str,Any]:
+    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
     if reply_to:
         payload["reply_to_message_id"] = reply_to
         payload["allow_sending_without_reply"] = True
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
+    if parse_mode: payload["parse_mode"] = parse_mode
+    if reply_markup: payload["reply_markup"] = reply_markup
     return _tg_post("sendMessage", payload)
+
+def _tg_edit_message(chat_id: int, message_id: int, text: str,
+                     *, parse_mode: Optional[str]=None,
+                     reply_markup: Optional[Dict[str,Any]]=None) -> Dict[str,Any]:
+    payload = {"chat_id": chat_id, "message_id": message_id,
+               "text": text, "disable_web_page_preview": True}
+    if parse_mode: payload["parse_mode"] = parse_mode
+    if reply_markup: payload["reply_markup"] = reply_markup
+    return _tg_post("editMessageText", payload)
 
 def _multipart_boundary() -> str:
     return "----WebKitFormBoundary" + uuid.uuid4().hex
@@ -130,7 +125,7 @@ def _tg_send_png_as_document(chat_id: int, png_bytes: bytes, filename: str = "ca
         if DEBUG: _log("[tg] sendDocument error:", repr(e))
         return {"ok": False, "error": repr(e)}
 
-# ----------------- Normalization & stats -----------------
+# ----------------- Normalize & stats -----------------
 def _normalize(s: str) -> str:
     s = (s or "").strip().lower().replace("ё","е")
     s = unicodedata.normalize("NFKD", s)
@@ -203,19 +198,18 @@ def parse_stats_list(raw: str) -> List[Tuple[str,str]]:
         out.append((value, lbl))
     return out
 
-# ----------------- Players cache/search -----------------
+# ----------------- Players/search -----------------
 PLAYERS_READY = False
 PLAYERS: List[Dict[str,Any]] = []
 
 def _call_get_players(force: bool) -> List[Dict[str,Any]]:
     if not get_players: return []
-    try:
-        return get_players(force_refresh=bool(force))
+    try: return get_players(force_refresh=bool(force))
     except TypeError:
         try: return get_players()
         except Exception: return []
 
-def ensure_players_loaded(force: bool = False) -> List[Dict[str,Any]]:
+def ensure_players_loaded(force: bool=False) -> List[Dict[str,Any]]:
     global PLAYERS_READY, PLAYERS
     try:
         ps = _call_get_players(force)
@@ -278,8 +272,7 @@ def _ensure_headshot_image(p: Dict[str,Any]):
             return Image.open(hs).convert("RGBA")
         return hs.convert("RGBA")
     except Exception as e:
-        _log("[tg] headshot ensure err", p.get("personId"), repr(e))
-        return None
+        _log("[tg] headshot ensure err", p.get("personId"), repr(e)); return None
 
 def _ensure_team_logo_image(team_id: str):
     from PIL import Image
@@ -294,8 +287,7 @@ def _ensure_team_logo_image(team_id: str):
                 return Image.open(logo_path).convert("RGBA")
         return None
     except Exception as e:
-        _log("[tg] team logo ensure err", team_id, repr(e))
-        return None
+        _log("[tg] team logo ensure err", team_id, repr(e)); return None
 
 def _team_colors(team_id: str) -> Tuple[str,str,str]:
     try:
@@ -304,8 +296,10 @@ def _team_colors(team_id: str) -> Tuple[str,str,str]:
     except Exception:
         return ("#007ACC","#005C99","#007ACC")
 
-# ----------------- State -----------------
+# ----------------- State + anti-loop -----------------
 CTX: Dict[int, Dict[str,Any]] = {}
+LAST_UPDATES: Dict[int, int] = {}   # chat_id -> last update_id
+SEEN_UPDATES: set[int] = set()      # process-local idempotency
 
 def _ctx(chat_id: int) -> Dict[str,Any]:
     return CTX.setdefault(chat_id, {})
@@ -313,27 +307,41 @@ def _ctx(chat_id: int) -> Dict[str,Any]:
 def _ctx_clear(chat_id: int) -> None:
     CTX.pop(chat_id, None)
 
-# ----------------- UI helpers -----------------
-def _ask_ru_name(chat_id: int, pid: str, display_name: str, reply_to: Optional[int]):
-    txt = f"Как подписать игрока <b>{display_name}</b> на плашке?\nОтветьте на это сообщение русским именем.\n[setname:{pid}]"
-    _tg_send_message(chat_id, txt, reply_to=reply_to, parse_mode="HTML")
+def _status_update(chat_id: int, text: str, *, parse_mode: Optional[str]=None, keep_kb: Optional[Dict[str,Any]]=None):
+    st = _ctx(chat_id)
+    mid = st.get("status_mid")
+    if mid:
+        r = _tg_edit_message(chat_id, mid, text, parse_mode=parse_mode, reply_markup=keep_kb)
+        if not r.get("ok"):
+            sent = _tg_send_message(chat_id, text, parse_mode=parse_mode, reply_markup=keep_kb)
+            if sent.get("ok"): st["status_mid"] = sent["result"]["message_id"]
+    else:
+        sent = _tg_send_message(chat_id, text, parse_mode=parse_mode, reply_markup=keep_kb)
+        if sent.get("ok"): st["status_mid"] = sent["result"]["message_id"]
 
+def _ask_ru_name(chat_id: int, pid: str, display_name: str, reply_to: Optional[int], *, mark_wait=True):
+    st = _ctx(chat_id)
+    text = f"Как подписать игрока <b>{display_name}</b> на плашке?\nОтветьте на это сообщение русским именем.\n[setname:{pid}]"
+    sent = _tg_send_message(chat_id, text, reply_to=reply_to, parse_mode="HTML")
+    if mark_wait:
+        st["waiting_name_pid"] = pid
+        st["waiting_name_msg_id"] = sent["result"]["message_id"] if sent.get("ok") else None
+        st.setdefault("saved_names", set())
+
+# ----------------- Keyboards -----------------
 def _kb_ok_or_fix() -> Dict[str,Any]:
-    return {
-        "inline_keyboard":[
-            [{"text":"Всё ок ✅","callback_data":"fix:ok"},
-             {"text":"Нужно исправить ✏️","callback_data":"fix:menu"}]
-        ]
-    }
+    return {"inline_keyboard":[
+        [{"text":"Всё ок ✅","callback_data":"fix:ok"},
+         {"text":"Нужно исправить ✏️","callback_data":"fix:menu"}]
+    ]}
 
 def _kb_fix_menu(mode: str) -> Dict[str,Any]:
     rows = [[{"text":"Имена игроков","callback_data":"fix:names"},
              {"text":"Цвет плашки","callback_data":"fix:color"}]]
-    if mode in ("duo","special","single","bad","cards"):
-        rows.append([{"text":"Команды","callback_data":"fix:teams"}])
+    rows.append([{"text":"Команды","callback_data":"fix:teams"}])
     return {"inline_keyboard": rows}
 
-def _kb_color_which(mode: str) -> Optional[Dict[str,Any]]:
+def _kb_color_which(mode: str) -> Dict[str,Any]:
     if mode == "duo":
         return {"inline_keyboard":[
             [{"text":"Цвет команды 1","callback_data":"colorwhich:1"},
@@ -343,7 +351,6 @@ def _kb_color_which(mode: str) -> Optional[Dict[str,Any]]:
 
 def _valid_hex(s: str) -> bool:
     return bool(re.fullmatch(r"#?[0-9A-Fa-f]{6}", s.strip()))
-
 def _fix_hex(s: str) -> str:
     s = s.strip().upper()
     if not s.startswith("#"): s = "#" + s
@@ -387,8 +394,7 @@ async def telegram_get(request: Request):
                 if isinstance(res, tuple) and len(res) >= 2:
                     cnt, info = res[0], res[1] or {}
                 elif isinstance(res, dict):
-                    info = res
-                    cnt = int(info.get("count") or 0)
+                    info = res; cnt = int(info.get("count") or 0)
             ps = _call_get_players(False)
             count_now = len(ps) if isinstance(ps, list) else int(cnt)
             src = (info.get("src") or info.get("source") or info.get("source_name")) if isinstance(info, dict) else None
@@ -404,16 +410,16 @@ async def telegram_get(request: Request):
         return JSONResponse({"ok": True, "q": q, "players_ready": PLAYERS_READY, "hits": hits})
     return PlainTextResponse("ok")
 
-# ----------------- Render helpers -----------------
+# ----------------- Render wrappers -----------------
 def _render_single(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,str]], ask_corrections:bool=True):
+    _status_update(chat_id, "Готовлю плашку…")
     team_id = str(p.get("teamId") or "0")
     head = _ensure_headshot_image(p)
     if head is None:
-        _tg_send_message(chat_id, "Не удалось получить фото игрока.")
+        _status_update(chat_id, "❌ Не удалось получить фото игрока.")
         return
     logo = _ensure_team_logo_image(team_id)
     colors = _team_colors(team_id)
-    # Без скруглений слева
     png = render_card(
         "single", ru, "", logo, colors, head, stats,
         round_left=False, round_right=True,
@@ -423,15 +429,15 @@ def _render_single(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,st
     )
     _tg_send_png_as_document(chat_id, png, filename=f"card_{p.get('personId','x')}.png", caption=_stats_text(stats))
     if ask_corrections:
-        _tg_send_message(chat_id, "Всё ок или нужно исправить?", reply_markup=_kb_ok_or_fix())
+        _status_update(chat_id, "Готово. Всё ок или нужно исправить?", keep_kb=_kb_ok_or_fix())
 
 def _render_bad(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,str]]):
+    _status_update(chat_id, "Готовлю коричневую BAD-плашку…")
     head = _ensure_headshot_image(p)
     logo = _ensure_team_logo_image(str(p.get("teamId") or "0"))
     if head is None:
-        _tg_send_message(chat_id, "Не удалось получить фото игрока.")
+        _status_update(chat_id, "❌ Не удалось получить фото игрока.")
         return
-    # Всегда коричневая, без цвета команды, без скругления слева, чуть шире, какашка ниже
     png = render_card_bad(
         ru, head, stats,
         team_logo_img=logo,
@@ -440,18 +446,18 @@ def _render_bad(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,str]]
         name_stat_center=True
     )
     _tg_send_png_as_document(chat_id, png, filename=f"cardBAD_{p.get('personId','x')}.png", caption=_stats_text(stats))
-    _tg_send_message(chat_id, "Всё ок или нужно исправить?", reply_markup=_kb_ok_or_fix())
+    _status_update(chat_id, "Готово. Всё ок или нужно исправить?", keep_kb=_kb_ok_or_fix())
 
 def _render_duo(chat_id:int, p1:Dict[str,Any], ru1:str, st1:List[Tuple[str,str]],
                 p2:Dict[str,Any], ru2:str, st2:List[Tuple[str,str]]):
+    _status_update(chat_id, "Готовлю двойную плашку…")
     t1, t2 = str(p1.get("teamId") or "0"), str(p2.get("teamId") or "0")
     h1, h2 = _ensure_headshot_image(p1), _ensure_headshot_image(p2)
     if h1 is None or h2 is None:
-        _tg_send_message(chat_id, "Не удалось получить фото одного из игроков.")
+        _status_update(chat_id, "❌ Не удалось получить фото одного из игроков.")
         return
     l1, l2 = _ensure_team_logo_image(t1), _ensure_team_logo_image(t2)
     c1, c2 = _team_colors(t1), _team_colors(t2)
-    # card2: без скруглений вообще; имя больше цифр на +2; если не влазит — автофит обоих
     png = render_card2(
         ru1, l1, c1, h1, st1,
         ru2, l2, c2, h2, st2,
@@ -462,17 +468,17 @@ def _render_duo(chat_id:int, p1:Dict[str,Any], ru1:str, st1:List[Tuple[str,str]]
     )
     _tg_send_png_as_document(chat_id, png, filename=f"card2_{p1.get('personId','x')}_{p2.get('personId','y')}.png",
                              caption=f"{_stats_text(st1)}  |  {_stats_text(st2)}")
-    _tg_send_message(chat_id, "Всё ок или нужно исправить?", reply_markup=_kb_ok_or_fix())
+    _status_update(chat_id, "Готово. Всё ок или нужно исправить?", keep_kb=_kb_ok_or_fix())
 
 def _render_special(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,str]], info_text:str):
+    _status_update(chat_id, "Готовлю плашку с правой колонкой…")
     t = str(p.get("teamId") or "0")
     head = _ensure_headshot_image(p)
     if head is None:
-        _tg_send_message(chat_id, "Не удалось получить фото игрока.")
+        _status_update(chat_id, "❌ Не удалось получить фото игрока.")
         return
     logo = _ensure_team_logo_image(t)
     colors = _team_colors(t)
-    # cards: левая — без скруглений слева; правая узкая, перенос строк, поверх всех слоёв
     png = render_card_special(
         ru, logo, colors, head, stats, info_text,
         round_left=False, round_right=True,
@@ -481,7 +487,7 @@ def _render_special(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,s
         name_stat_center=True
     )
     _tg_send_png_as_document(chat_id, png, filename=f"cards_{p.get('personId','x')}.png", caption=_stats_text(stats))
-    _tg_send_message(chat_id, "Всё ок или нужно исправить?", reply_markup=_kb_ok_or_fix())
+    _status_update(chat_id, "Готово. Всё ок или нужно исправить?", keep_kb=_kb_ok_or_fix())
 
 # ----------------- POST webhook -----------------
 @app.post("/api/telegram")
@@ -489,89 +495,91 @@ async def webhook_query(request: Request):
     bad = _check_secret(request)
     if bad: return bad
 
-    rid = f"[RID={int(time.time()*1000)}-{uuid.uuid4().hex[:6]}]"
     try:
         body = await request.body()
         raw = body.decode("utf-8","ignore")
-        if DEBUG: _log("[tg] ", rid, "POST", request.url, "\nbody:", raw)
         update = json.loads(raw)
-    except Exception as e:
-        if DEBUG: _log("[tg]", rid, "json error:", repr(e))
+        if DEBUG: _log("[tg] ", raw)
+    except Exception:
         return PlainTextResponse("OK")
 
-    ensure_players_loaded(False)
+    update_id = update.get("update_id")
+    # process-local идемпотентность
+    if isinstance(update_id, int):
+        if update_id in SEEN_UPDATES:
+            return PlainTextResponse("OK")
+        SEEN_UPDATES.add(update_id)
 
-    # ---------- callbacks ----------
+    # callbacks
     cb = update.get("callback_query")
     if cb:
         chat_id = cb["from"]["id"]
         data = cb.get("data") or ""
         st = _ctx(chat_id)
 
-        # OK or FIX
         if data == "fix:ok":
             _ctx_clear(chat_id)
             _tg_send_message(chat_id, "Готово ✅")
             return PlainTextResponse("OK")
+
         if data == "fix:menu":
-            _tg_send_message(chat_id, "Что исправить?", reply_markup=_kb_fix_menu(st.get("mode") or ""))
+            _status_update(chat_id, "Что исправить?", keep_kb=_kb_fix_menu(st.get("mode") or ""))
             return PlainTextResponse("OK")
 
-        # FIX submenus
         if data == "fix:names":
-            mode = st.get("mode")
-            if mode == "duo":
+            if st.get("mode") == "duo":
                 st["fix_wait"] = "name_which"
-                _tg_send_message(chat_id, "Чьё имя исправить? Напишите: 1=<имя> или 2=<имя>")
+                _status_update(chat_id, "Чьё имя исправить? Напишите: 1=<имя> или 2=<имя>")
             else:
                 st["fix_wait"] = "name_one"
-                _tg_send_message(chat_id, "Как записать имя игрока? Напишите: 1=<имя>")
+                _status_update(chat_id, "Как записать имя игрока? Напишите: 1=<имя>")
             return PlainTextResponse("OK")
 
         if data == "fix:color":
             st["fix_wait"] = "color_which"
-            _tg_send_message(chat_id, "Для какой команды изменить цвет?", reply_markup=_kb_color_which(st.get("mode","single")))
+            _status_update(chat_id, "Для какой команды изменить цвет?", keep_kb=_kb_color_which(st.get("mode","single")))
             return PlainTextResponse("OK")
 
         if data == "fix:teams":
             st["fix_wait"] = "teams_map"
-            _tg_send_message(chat_id, "Задайте команды. Пример: 1=1610612747, 2=1610612744")
+            _status_update(chat_id, "Задайте команды. Пример: 1=1610612747, 2=1610612744")
             return PlainTextResponse("OK")
 
         if data.startswith("colorwhich:"):
             which = data.split(":",1)[1]
             st["waiting_hex"] = {"which": which}
-            _tg_send_message(chat_id, f"Введите HEX для команды {which} (например, #FDB927):")
+            _status_update(chat_id, f"Введите HEX для команды {which} (например, #FDB927):")
             return PlainTextResponse("OK")
 
         return PlainTextResponse("OK")
 
-    # ---------- messages ----------
+    # messages
     msg = update.get("message") or update.get("edited_message")
     if not msg: return PlainTextResponse("OK")
+
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
     text = (msg.get("text") or "").strip()
     st = _ctx(chat_id)
     st.setdefault("last_cmd_msg_id", msg.get("message_id"))
 
-    # Waiting HEX (from fix)
+    # /stop — экстренный выход
+    if text.lower().startswith("/stop"):
+        _ctx_clear(chat_id)
+        _tg_send_message(chat_id, "Остановил сценарий и очистил контекст. ✅")
+        return PlainTextResponse("OK")
+
+    # обработка шагов исправлений (имена/цвет/команды)
     if st.get("waiting_hex"):
         hx = text.strip()
         if not _valid_hex(hx):
-            _tg_send_message(chat_id, "HEX некорректен. Пример: #FDB927")
+            _status_update(chat_id, "HEX некорректен. Пример: #FDB927")
             return PlainTextResponse("OK")
         which = (st["waiting_hex"] or {}).get("which") or "1"
-        # choose team by which
-        if st.get("mode") == "duo" and which == "2":
-            p = st.get("p2") or {}
-        else:
-            p = st.get("p1") or {}
-        tid = str(p.get("teamId") or "0")
-        if set_team_primary_color:
-            set_team_primary_color(tid, _fix_hex(hx))
+        p = st["p2"] if (st.get("mode") == "duo" and which == "2") else st.get("p1")
+        tid = str((p or {}).get("teamId") or "0")
+        if set_team_primary_color: set_team_primary_color(tid, _fix_hex(hx))
         st.pop("waiting_hex", None)
-        # re-render
         mode = st.get("mode")
         if mode == "single":
             _render_single(chat_id, st["p1"], st.get("ru1") or _display_name_for(st["p1"]), st.get("stats1") or [])
@@ -585,53 +593,42 @@ async def webhook_query(request: Request):
             _render_bad(chat_id, st["p1"], st.get("ru1") or _display_name_for(st["p1"]), st.get("stats1") or [])
         return PlainTextResponse("OK")
 
-    # Fix names / teams via free text
     if st.get("fix_wait"):
-        fw = st["fix_wait"]
-        s = text.strip()
+        fw = st["fix_wait"]; s = text.strip()
         if fw == "name_which":
-            # format: 1=Имя или 2=Имя
             m = re.match(r'^\s*([12])\s*=\s*(.+?)\s*$', s)
             if not m:
-                _tg_send_message(chat_id, "Формат: 1=Имя или 2=Имя")
-                return PlainTextResponse("OK")
+                _status_update(chat_id, "Формат: 1=Имя или 2=Имя"); return PlainTextResponse("OK")
             idx, name_ru = m.group(1), m.group(2).strip()
             p = st["p1"] if idx == "1" else st["p2"]
             pid = str((p or {}).get("personId") or "")
             try:
-                if overrides_save_name_ru and pid:
-                    overrides_save_name_ru(pid, name_ru)
+                if overrides_save_name_ru and pid: overrides_save_name_ru(pid, name_ru)
             except Exception: pass
             st["ru1" if idx=="1" else "ru2"] = name_ru
             st["fix_wait"] = None
         elif fw == "name_one":
             m = re.match(r'^\s*1\s*=\s*(.+?)\s*$', s)
             if not m:
-                _tg_send_message(chat_id, "Формат: 1=Имя")
-                return PlainTextResponse("OK")
+                _status_update(chat_id, "Формат: 1=Имя"); return PlainTextResponse("OK")
             name_ru = m.group(1).strip()
             p = st.get("p1") or {}
             pid = str(p.get("personId") or "")
             try:
-                if overrides_save_name_ru and pid:
-                    overrides_save_name_ru(pid, name_ru)
+                if overrides_save_name_ru and pid: overrides_save_name_ru(pid, name_ru)
             except Exception: pass
             st["ru1"] = name_ru
             st["fix_wait"] = None
         elif fw == "teams_map":
-            # 1=TEAMID[, 2=TEAMID]
             for part in s.split(","):
                 part = part.strip()
                 if not part: continue
                 m = re.match(r'^\s*([12])\s*=\s*(\d+)\s*$', part)
                 if not m: continue
                 idx, team_id = m.group(1), m.group(2)
-                if idx == "1" and st.get("p1"):
-                    st["p1"]["teamId"] = int(team_id)
-                if idx == "2" and st.get("p2"):
-                    st["p2"]["teamId"] = int(team_id)
+                if idx == "1" and st.get("p1"): st["p1"]["teamId"] = int(team_id)
+                if idx == "2" and st.get("p2"): st["p2"]["teamId"] = int(team_id)
             st["fix_wait"] = None
-        # re-render after fixes
         mode = st.get("mode")
         if mode == "single":
             _render_single(chat_id, st["p1"], st.get("ru1") or _display_name_for(st["p1"]), st.get("stats1") or [])
@@ -645,27 +642,33 @@ async def webhook_query(request: Request):
             _render_bad(chat_id, st["p1"], st.get("ru1") or _display_name_for(st["p1"]), st.get("stats1") or [])
         return PlainTextResponse("OK")
 
-    # Reply: russian name save (auto-reply flow)
+    # Reply на запрос имени — ИДЕМПОТЕНТНО
     rpl = msg.get("reply_to_message")
     if rpl and text:
         rtxt = (rpl.get("text") or "") + " " + (rpl.get("caption") or "")
         m = re.search(r"\[setname:(\d+)\]", rtxt)
         if m and overrides_save_name_ru:
             pid = m.group(1)
+            # анти-дубли: не сохраняем одно и то же несколько раз
+            st.setdefault("saved_names", set())
+            if pid in st["saved_names"]:
+                # уже сохраняли — просто игнор и не зацикливаемся
+                return PlainTextResponse("OK")
             name_ru = text.strip()
             try:
                 overrides_save_name_ru(pid, name_ru)
-                _tg_send_message(chat_id, f"Сохранил имя для {pid}: {name_ru}", reply_to=msg.get("message_id"))
+                st["saved_names"].add(pid)
+                _status_update(chat_id, f"Сохранил имя для {pid}: {name_ru}")
             except Exception as e:
-                _tg_send_message(chat_id, f"Не удалось сохранить имя: {repr(e)}", reply_to=msg.get("message_id"))
+                _status_update(chat_id, f"Не удалось сохранить имя: {repr(e)}")
                 return PlainTextResponse("OK")
-            # Continue flow automatically: if duo and second missing — ask second; else render with auto color
+            # продолжение сценария
             mode = st.get("mode")
             if mode == "duo":
                 if not st.get("ru1"):
-                    st["ru1"] = name_ru
-                elif not st.get("ru2"):
-                    st["ru2"] = name_ru
+                    st["ru1"] = name_ru if str((st.get("p1") or {}).get("personId")) == pid else st.get("ru1")
+                if not st.get("ru2"):
+                    st["ru2"] = name_ru if str((st.get("p2") or {}).get("personId")) == pid else st.get("ru2")
                 if not st.get("ru1"):
                     p1 = st.get("p1") or {}
                     _ask_ru_name(chat_id, str(p1.get("personId") or ""), p1.get("displayName") or "", reply_to=st.get("last_cmd_msg_id"))
@@ -674,39 +677,34 @@ async def webhook_query(request: Request):
                     p2 = st.get("p2") or {}
                     _ask_ru_name(chat_id, str(p2.get("personId") or ""), p2.get("displayName") or "", reply_to=st.get("last_cmd_msg_id"))
                     return PlainTextResponse("OK")
-                _render_duo(chat_id,
-                            st["p1"], st["ru1"], st.get("stats1") or [],
-                            st["p2"], st["ru2"], st.get("stats2") or [])
+                _render_duo(chat_id, st["p1"], st["ru1"], st.get("stats1") or [], st["p2"], st["ru2"], st.get("stats2") or [])
                 return PlainTextResponse("OK")
             else:
-                if not st.get("ru1"):
-                    st["ru1"] = name_ru
-                _render_modes = {
-                    "single": lambda: _render_single(chat_id, st["p1"], st["ru1"], st.get("stats1") or []),
-                    "special": lambda: _render_special(chat_id, st["p1"], st["ru1"], st.get("stats1") or [], st.get("info") or ""),
-                    "bad":    lambda: _render_bad(chat_id, st["p1"], st["ru1"], st.get("stats1") or []),
-                }
-                fn = _render_modes.get(mode)
-                if fn: fn()
+                st["ru1"] = name_ru
+                if mode == "single":
+                    _render_single(chat_id, st["p1"], st["ru1"], st.get("stats1") or [])
+                elif mode == "special":
+                    _render_special(chat_id, st["p1"], st["ru1"], st.get("stats1") or [], st.get("info") or "")
+                elif mode == "bad":
+                    _render_bad(chat_id, st["p1"], st["ru1"], st.get("stats1") or [])
             return PlainTextResponse("OK")
 
     # ---- Commands (case-insensitive) ----
     low = text.lower()
-    def _cmd(name: str) -> bool:
-        return low.startswith("/"+name)
 
     if low.startswith("/start"):
-        _tg_send_message(chat_id, "Я здесь. Готов работать 💼")
+        _status_update(chat_id, "Я здесь. Готов работать 💼")
         return PlainTextResponse("OK")
 
     if low.startswith("/help"):
-        _tg_send_message(chat_id,
+        _status_update(chat_id,
             "Команды:\n"
             "• /find <имя>\n"
             "• /card <имя> | <статы>\n"
             "• /card2 <имя1> | <статы1> || <имя2> | <статы2>\n"
             "• /cards <имя> | <статы> | <текст справа>\n"
             "• /cardbad <имя> | <статы> (или /bad)\n"
+            "• /stop — сброс сценария\n"
         )
         return PlainTextResponse("OK")
 
@@ -714,40 +712,41 @@ async def webhook_query(request: Request):
         q = text[text.find(" "):].strip() if " " in text else ""
         hits = search_players_loose(q)
         if not hits:
-            _tg_send_message(chat_id, "Ничего не нашёл 🤷")
-            return PlainTextResponse("OK")
+            _status_update(chat_id, "Ничего не нашёл 🤷"); return PlainTextResponse("OK")
         lines = [f"{h.get('displayName')} (id={h.get('personId')}, teamId={h.get('teamId')})" for h in hits[:8]]
-        _tg_send_message(chat_id, "\n".join(lines))
+        _status_update(chat_id, "\n".join(lines))
         return PlainTextResponse("OK")
 
-    # /card (case-insensitive)
+    # /card
     if re.match(r"^/(card)\b", low):
         try:
             args = text.split(" ",1)[1] if " " in text else ""
             parts = [p.strip() for p in args.split("|")]
             if len(parts) < 2:
-                _tg_send_message(chat_id, "Формат: /card <имя> | <метрики через запятую>")
+                _status_update(chat_id, "Формат: /card <имя> | <метрики через запятую>")
                 return PlainTextResponse("OK")
             name_q, stats_raw = parts[0], parts[1]
             stats = parse_stats_list(stats_raw)
-            _tg_send_message(chat_id, "_Уточнения…_", parse_mode="Markdown")
+            _status_update(chat_id, "Ищу игрока…")
             hits = search_players_loose(name_q)
             if not hits:
-                _tg_send_message(chat_id, f"Не нашёл игрока: {name_q}")
+                _status_update(chat_id, f"Не нашёл игрока: {name_q}")
                 return PlainTextResponse("OK")
             p = hits[0]
             pid = str(p.get("personId") or "")
-            st.clear(); st.update({"mode":"single","p1":p,"stats1":stats,"last_cmd_msg_id":msg.get("message_id")})
+            st.clear(); st.update({"mode":"single","p1":p,"stats1":stats,"last_cmd_msg_id":msg.get("message_id"),
+                                   "status_mid": st.get("status_mid")})
             ru = None
             try: ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
-            except Exception: ru = None
+            except Exception: pass
             if not ru:
                 _ask_ru_name(chat_id, pid, p.get("displayName") or "", reply_to=st.get("last_cmd_msg_id"))
+                _status_update(chat_id, "Жду русское имя… Ответьте на сообщение выше.")
                 return PlainTextResponse("OK")
             st["ru1"] = ru
             _render_single(chat_id, p, ru, stats)
         except Exception as e:
-            _tg_send_message(chat_id, f"Ошибка: {repr(e)}")
+            _status_update(chat_id, f"Ошибка: {repr(e)}")
         return PlainTextResponse("OK")
 
     # /card2
@@ -756,7 +755,7 @@ async def webhook_query(request: Request):
             args = text.split(" ",1)[1] if " " in text else ""
             sides = [s.strip() for s in args.split("||")]
             if len(sides) != 2:
-                _tg_send_message(chat_id, "Формат: /card2 <имя1> | <статы1> || <имя2> | <статы2>")
+                _status_update(chat_id, "Формат: /card2 <имя1> | <статы1> || <имя2> | <статы2>")
                 return PlainTextResponse("OK")
 
             def _side(s: str) -> Tuple[str, List[Tuple[str,str]]]:
@@ -765,16 +764,16 @@ async def webhook_query(request: Request):
 
             n1, st1 = _side(sides[0])
             n2, st2 = _side(sides[1])
-            _tg_send_message(chat_id, "_Уточнения…_", parse_mode="Markdown")
-
+            _status_update(chat_id, "Ищу игроков…")
             h1, h2 = search_players_loose(n1), search_players_loose(n2)
             if not h1 or not h2:
-                _tg_send_message(chat_id, "Не нашёл одного из игроков, уточните имена.")
+                _status_update(chat_id, "Не нашёл одного из игроков, уточните имена.")
                 return PlainTextResponse("OK")
             p1, p2 = h1[0], h2[0]
             st.clear(); st.update({
                 "mode":"duo","p1":p1,"stats1":st1,"p2":p2,"stats2":st2,
-                "last_cmd_msg_id": msg.get("message_id")
+                "last_cmd_msg_id": msg.get("message_id"),
+                "status_mid": st.get("status_mid")
             })
 
             pid1, pid2 = str(p1.get("personId") or ""), str(p2.get("personId") or "")
@@ -786,15 +785,17 @@ async def webhook_query(request: Request):
 
             if not ru1:
                 _ask_ru_name(chat_id, pid1, p1.get("displayName") or "", reply_to=st.get("last_cmd_msg_id"))
+                _status_update(chat_id, "Жду русское имя для игрока 1…")
                 return PlainTextResponse("OK")
             st["ru1"] = ru1
             if not ru2:
                 _ask_ru_name(chat_id, pid2, p2.get("displayName") or "", reply_to=st.get("last_cmd_msg_id"))
+                _status_update(chat_id, "Жду русское имя для игрока 2…")
                 return PlainTextResponse("OK")
             st["ru2"] = ru2
             _render_duo(chat_id, p1, ru1, st1, p2, ru2, st2)
         except Exception as e:
-            _tg_send_message(chat_id, f"Ошибка: {repr(e)}")
+            _status_update(chat_id, f"Ошибка: {repr(e)}")
         return PlainTextResponse("OK")
 
     # /cards
@@ -803,28 +804,31 @@ async def webhook_query(request: Request):
             args = text.split(" ",1)[1] if " " in text else ""
             parts = [p.strip() for p in args.split("|")]
             if len(parts) < 3:
-                _tg_send_message(chat_id, "Формат: /cards <имя> | <статы> | <короткий текст справа>")
+                _status_update(chat_id, "Формат: /cards <имя> | <статы> | <короткий текст справа>")
                 return PlainTextResponse("OK")
             name_q, stats_raw, info_text = parts[0], parts[1], parts[2]
             stats = parse_stats_list(stats_raw)
-            _tg_send_message(chat_id, "_Уточнения…_", parse_mode="Markdown")
+            _status_update(chat_id, "Ищу игрока…")
             hits = search_players_loose(name_q)
             if not hits:
-                _tg_send_message(chat_id, f"Не нашёл игрока: {name_q}")
+                _status_update(chat_id, f"Не нашёл игрока: {name_q}")
                 return PlainTextResponse("OK")
             p = hits[0]
             pid = str(p.get("personId") or "")
-            st.clear(); st.update({"mode":"special","p1":p,"stats1":stats,"info":info_text,"last_cmd_msg_id":msg.get("message_id")})
+            st.clear(); st.update({"mode":"special","p1":p,"stats1":stats,"info":info_text,
+                                   "last_cmd_msg_id":msg.get("message_id"),
+                                   "status_mid": st.get("status_mid")})
             ru = None
             try: ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
             except Exception: pass
             if not ru:
                 _ask_ru_name(chat_id, pid, p.get("displayName") or "", reply_to=st.get("last_cmd_msg_id"))
+                _status_update(chat_id, "Жду русское имя… Ответьте на сообщение выше.")
                 return PlainTextResponse("OK")
             st["ru1"] = ru
             _render_special(chat_id, p, ru, stats, info_text)
         except Exception as e:
-            _tg_send_message(chat_id, f"Ошибка: {repr(e)}")
+            _status_update(chat_id, f"Ошибка: {repr(e)}")
         return PlainTextResponse("OK")
 
     # /cardbad или /bad
@@ -833,36 +837,40 @@ async def webhook_query(request: Request):
             args = text.split(" ",1)[1] if " " in text else ""
             parts = [p.strip() for p in args.split("|")]
             if len(parts) < 2:
-                _tg_send_message(chat_id, "Формат: /cardbad <имя> | <метрики через запятую>")
+                _status_update(chat_id, "Формат: /cardbad <имя> | <метрики через запятую>")
                 return PlainTextResponse("OK")
             name_q, stats_raw = parts[0], parts[1]
             stats = parse_stats_list(stats_raw)
-            _tg_send_message(chat_id, "_Уточнения…_", parse_mode="Markdown")
+            _status_update(chat_id, "Ищу игрока…")
             hits = search_players_loose(name_q)
             if not hits:
-                _tg_send_message(chat_id, f"Не нашёл игрока: {name_q}")
+                _status_update(chat_id, f"Не нашёл игрока: {name_q}")
                 return PlainTextResponse("OK")
             p = hits[0]
             pid = str(p.get("personId") or "")
-            st.clear(); st.update({"mode":"bad","p1":p,"stats1":stats,"last_cmd_msg_id":msg.get("message_id")})
+            st.clear(); st.update({"mode":"bad","p1":p,"stats1":stats,
+                                   "last_cmd_msg_id":msg.get("message_id"),
+                                   "status_mid": st.get("status_mid")})
             ru = None
             try: ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
             except Exception: pass
             if not ru:
                 _ask_ru_name(chat_id, pid, p.get("displayName") or "", reply_to=st.get("last_cmd_msg_id"))
+                _status_update(chat_id, "Жду русское имя… Ответьте на сообщение выше.")
                 return PlainTextResponse("OK")
             st["ru1"] = ru
             _render_bad(chat_id, p, ru, stats)
         except Exception as e:
-            _tg_send_message(chat_id, f"Ошибка: {repr(e)}")
+            _status_update(chat_id, f"Ошибка: {repr(e)}")
         return PlainTextResponse("OK")
 
     # fallback
-    _tg_send_message(chat_id,
+    _status_update(chat_id,
         "Команды:\n"
         "• /find <имя>\n"
         "• /card <имя> | <статы>\n"
         "• /card2 <имя1> | <статы1> || <имя2> | <статы2>\n"
         "• /cards <имя> | <статы> | <текст справа>\n"
-        "• /cardbad <имя> | <статы> (или /bad)\n")
+        "• /cardbad <имя> | <статы> (или /bad)\n"
+        "• /stop — сброс сценария\n")
     return PlainTextResponse("OK")
