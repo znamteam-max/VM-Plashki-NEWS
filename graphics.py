@@ -23,7 +23,7 @@ FONT_SECONDARY = (
 FONT_FALLBACK = ImageFont.load_default()
 
 # Базовый размер холста под «вытянутые» плашки
-CANVAS_W, CANVAS_H = 1600, 900  # не критично, плашки рисуем с обрезкой по контенту
+CANVAS_W, CANVAS_H = 1600, 900
 SAFE_PADDING = 40
 
 # Сдвиг логотипа команды (круг) — «на 30 пикселей вверх и влево»
@@ -44,10 +44,6 @@ def _load_font(paths: Iterable[str], size: int) -> ImageFont.FreeTypeFont | Imag
     return FONT_FALLBACK
 
 def _hex_to_rgb(h) -> Tuple[int, int, int]:
-    """
-    Принимает '#RRGGBB' ИЛИ (r,g,b) ИЛИ [r,g,b].
-    Возвращает (r,g,b).
-    """
     if isinstance(h, (tuple, list)) and len(h) >= 3:
         try:
             r, g, b = int(h[0]), int(h[1]), int(h[2])
@@ -76,7 +72,6 @@ def _save_png(im: Image.Image) -> bytes:
     return buf.getvalue()
 
 def _draw_star(draw: ImageDraw.ImageDraw, xy: Tuple[int,int], r: int, fill=(255,191,0)):
-    """Простая пятиконечная звезда."""
     cx, cy = xy
     pts = []
     for i in range(10):
@@ -88,16 +83,10 @@ def _draw_star(draw: ImageDraw.ImageDraw, xy: Tuple[int,int], r: int, fill=(255,
     draw.polygon(pts, fill=fill)
 
 def _rounded_mask(size: Tuple[int,int], radius: int, corners=(True,True,True,True)) -> Image.Image:
-    """
-    Маска для скруглений. corners = (TL, TR, BR, BL) — какие углы КРУГЛЫЕ.
-    Квадратные «дозаливаем» после базового rounded_rectangle.
-    """
     w, h = size
     m = Image.new("L", (w, h), 0)
     d = ImageDraw.Draw(m)
-    # сначала скруглённая прямоугольная форма
     d.rounded_rectangle((0, 0, w, h), radius=radius, fill=255)
-    # если угол должен быть квадратным — дорисуем квадрат
     r = radius
     if not corners[0]:  # TL
         d.rectangle((0, 0, r, r), fill=255)
@@ -153,12 +142,7 @@ def _ensure_rgba(img_or_none: Optional[Image.Image]) -> Optional[Image.Image]:
 # ---------------------------------------------
 # СБОРКА СТАТОВ → СТРОКИ
 # ---------------------------------------------
-def _stats_to_lines(stats: Iterable[Tuple[str, str]], gap: int = 36) -> Tuple[List[str], List[str], int]:
-    """
-    Делит список статов на 2 строки: значения (крупно) и подписи (мелко).
-    Возвращает: (vals, labels, кол-во колонок).
-    Значения могут быть нечисловыми ('3/5', '7-12', '3 из 5').
-    """
+def _stats_to_lines(stats: Iterable[Tuple[str, str]] | None, gap: int = 36) -> Tuple[List[str], List[str], int]:
     vals, labels = [], []
     for item in stats or []:
         if not item:
@@ -168,7 +152,6 @@ def _stats_to_lines(stats: Iterable[Tuple[str, str]], gap: int = 36) -> Tuple[Li
             vals.append(v)
             labels.append(lab)
         else:
-            # если пришла одна строка, положим как “значение”
             vals.append(str(item))
             labels.append("")
     cols = max(1, len(vals))
@@ -186,36 +169,33 @@ def _draw_base_box(w: int, h: int, color: Tuple[int,int,int], radius: int, corne
 
 def _draw_gradient(w: int, h: int, top: Tuple[int,int,int], bottom: Tuple[int,int,int]) -> Image.Image:
     grad = Image.new("RGBA", (w, h), (0,0,0,0))
+    d = ImageDraw.Draw(grad)
     for y in range(h):
         t = y / max(1, h - 1)
         r = int(top[0] * (1 - t) + bottom[0] * t)
         g = int(top[1] * (1 - t) + bottom[1] * t)
         b = int(top[2] * (1 - t) + bottom[2] * t)
-        ImageDraw.Draw(grad).line([(0,y),(w,y)], fill=(r,g,b,255))
+        d.line([(0,y),(w,y)], fill=(r,g,b,255))
     return grad
 
 def _draw_team_logo_circle(base: Image.Image, logo_img: Optional[Image.Image], cx: int, cy: int, radius: int):
     if logo_img is None:
         return
     logo_img = _ensure_rgba(logo_img)
-    # белый круг
     r = radius
     circ = Image.new("RGBA", (r*2, r*2), (0,0,0,0))
     d = ImageDraw.Draw(circ)
     d.ellipse((0,0,r*2,r*2), fill=(255,255,255,255))
-    # впишем лого внутрь круга
-    inner = int(r * 1.4)  # чуть больше, чтобы логотип был крупным
+    inner = int(r * 1.4)
     L = logo_img.copy()
     L.thumbnail((inner, inner))
     lx = (circ.width - L.width)//2
     ly = (circ.height - L.height)//2
     circ.alpha_composite(L, (lx, ly))
-    # оффсеты
     ox, oy = TEAM_LOGO_OFFSET
     base.alpha_composite(circ, (cx - r + ox, cy - r + oy))
 
 def _place_headshot(base: Image.Image, head: Optional[Image.Image], x_right: int, y_bottom: int, max_w: int, max_h: int):
-    """Голова всегда СВЕРХУ ВСЕХ слоёв — рисуем в самом конце."""
     if head is None:
         return
     H = _ensure_rgba(head)
@@ -238,103 +218,71 @@ def render_card(template_key: str,
                 head_img: Optional[Image.Image],
                 stats: Iterable[Tuple[str,str]] | None,
                 **kwargs) -> bytes:
-    """
-    ОДИНОЧНАЯ ПЛАШКА:
-    - скругления ТОЛЬКО СПРАВА
-    - логотип в круге смещён на -30,-30
-    - имя и статы центрируются относительно друг друга
-    """
     c1, c2, c3 = _ensure_palette(colors)
     W, H = 1280, 720
     im = Image.new("RGBA", (W, H), (0,0,0,0))
 
-    # фон — градиент + форма (без левых скруглений)
     grad = _draw_gradient(W, H, c1, c2)
     box = _draw_base_box(W, H, (0,0,0), radius=48, corners=(False, True, True, False))
     grad.putalpha(box.split()[-1])
     im.alpha_composite(grad, (0, 0))
 
-    # логотип команды
     _draw_team_logo_circle(im, logo_img, cx=SAFE_PADDING + 120, cy=SAFE_PADDING + 120, radius=84)
 
-    # имя и статы — центрируем как блоки друг относительно друга
-    # сначала — подготовим шрифты
     name_font = _load_font(FONT_PRIMARY, 132)
     stat_big = _load_font(FONT_PRIMARY, 88)
     stat_small = _load_font(FONT_SECONDARY, 52)
 
-    # разложим статы
     vals, labels, cols = _stats_to_lines(stats)
     col_gap = 46
     col_w = min(240, (W - SAFE_PADDING*2) // max(1, cols) - col_gap)
 
-    # размеры блоков
     name_w, name_h = name_font.getbbox(player_name)[2:]
     stats_w = cols * col_w + (cols - 1) * col_gap if cols else 0
     block_w = max(name_w, stats_w)
-    # общая высота блока: имя + отступ + два ряда статов
     stats_big_h = stat_big.getbbox("88")[3] - stat_big.getbbox("88")[1]
     stats_small_h = stat_small.getbbox("ОЧКИ")[3] - stat_small.getbbox("ОЧКИ")[1]
     block_h = name_h + 28 + stats_big_h + 10 + stats_small_h
 
-    # левый верх блока (центрируем)
     bx = (W - block_w)//2
     by = (H - block_h)//2
-
     d = ImageDraw.Draw(im)
-
-    # имя
     d.text((bx, by), player_name, font=name_font, fill=(255,255,255,255))
-    # сетка статов
+
     sx = (W - stats_w)//2
     sy = by + name_h + 28
-
     for i in range(cols):
         cx = sx + i * (col_w + col_gap)
-        # значение
         v = vals[i] if i < len(vals) else ""
         vw, vh = stat_big.getbbox(v)[2:]
         d.text((cx + (col_w - vw)//2, sy), v, font=stat_big, fill=(255,255,255,255))
-        # подпись
         lab = labels[i] if i < len(labels) else ""
         lw, lh = stat_small.getbbox(lab)[2:]
         d.text((cx + (col_w - lw)//2, sy + vh + 10), lab, font=stat_small, fill=(255,255,255,220))
 
-    # Голова — поверх
     _place_headshot(im, head_img, x_right=W - SAFE_PADDING, y_bottom=H - SAFE_PADDING, max_w=720, max_h=720)
-
     return _save_png(im)
 
 # ------------------------------------------------------------
-# ДВОЙНАЯ ПЛАШКА (card2) — без СКРУГЛЕНИЙ, одинаковые шрифты
+# ДВОЙНАЯ ПЛАШКА (card2)
 # ------------------------------------------------------------
 def render_card2(template_key: str,
                  p1_name: str, _team1: str, logo1: Optional[Image.Image], colors1: Any, head1: Optional[Image.Image], stats1: Iterable[Tuple[str,str]] | None,
                  p2_name: str, _team2: str, logo2: Optional[Image.Image], colors2: Any, head2: Optional[Image.Image], stats2: Iterable[Tuple[str,str]] | None,
                  **kwargs) -> bytes:
-    """
-    Правила:
-    - вообще БЕЗ скруглений;
-    - размер шрифта ИМЁН >= размера цифр (на 2 больше);
-    - размер шрифта у обоих игроков одинаковый (подгоняем под худший кейс);
-    - имена/статы выровнены по вертикали.
-    """
     c1L, c2L, _ = _ensure_palette(colors1)
     c1R, c2R, _ = _ensure_palette(colors2)
 
     W, H = 1600, 720
     im = Image.new("RGBA", (W, H), (0,0,0,0))
 
-    # фон: левая/правая половины без скруглений
     left = _draw_gradient(W//2, H, c1L, c2L)
     right = _draw_gradient(W//2, H, c1R, c2R)
     im.alpha_composite(left, (0, 0))
     im.alpha_composite(right, (W//2, 0))
 
-    # Определим общий допустимый размер шрифтов (имя больше на 2pt)
     max_name_w = W//2 - SAFE_PADDING*2
     name_font_try = 120
-    # подгоним под оба имени
     f1, s1 = _fit_text(FONT_PRIMARY, p1_name, max_name_w, name_font_try, 48)
     f2, s2 = _fit_text(FONT_PRIMARY, p2_name, max_name_w, name_font_try, 48)
     name_size = min(s1, s2)
@@ -344,20 +292,16 @@ def render_card2(template_key: str,
     f_val = _load_font(FONT_PRIMARY, stat_size)
     f_lab = _load_font(FONT_SECONDARY, max(18, stat_size - 8))
 
-    # лого-круги
     _draw_team_logo_circle(im, logo1, cx=SAFE_PADDING + 120, cy=SAFE_PADDING + 120, radius=84)
     _draw_team_logo_circle(im, logo2, cx=W - (SAFE_PADDING + 120), cy=SAFE_PADDING + 120, radius=84)
 
-    # стат-блоки
     def draw_side(x0: int, side_name: str, head: Optional[Image.Image], stats: Iterable[Tuple[str,str]] | None):
         vals, labs, cols = _stats_to_lines(stats)
         d = ImageDraw.Draw(im)
-        # имя
         nw, nh = f_name.getbbox(side_name)[2:]
         nx = x0 + (W//2 - nw)//2
         ny = (H - nh)//2 - 80
         d.text((nx, ny), side_name, font=f_name, fill=(255,255,255,255))
-        # статы
         col_gap = 36
         col_w = min(240, (W//2 - SAFE_PADDING*2) // max(1, cols) - col_gap)
         stats_w = cols * col_w + (cols - 1) * col_gap
@@ -371,12 +315,10 @@ def render_card2(template_key: str,
             lab = labs[i] if i < len(labs) else ""
             lw, lh = f_lab.getbbox(lab)[2:]
             d.text((cx + (col_w - lw)//2, sy + vh + 8), lab, font=f_lab, fill=(255,255,255,220))
-        # голова поверх
         _place_headshot(im, head, x_right=x0 + W//2 - SAFE_PADDING, y_bottom=H - SAFE_PADDING, max_w=600, max_h=620)
 
     draw_side(0, p1_name, head1, stats1)
     draw_side(W//2, p2_name, head2, stats2)
-
     return _save_png(im)
 
 # ------------------------------------------------------------
@@ -388,43 +330,31 @@ def render_card_special(template_key: str,
                         logo_img: Optional[Image.Image],
                         colors: Any,
                         head_img: Optional[Image.Image],
-                        stats: Iterable[Tuple[str,str]] | None,
+                        stats: Iterable[Tuple[str,str]] | None = None,
                         **kwargs) -> bytes:
-    """
-    Правила:
-    - основная плашка — скругления ТОЛЬКО СПРАВА;
-    - правая доп.плашка — МЕНЬШЕ в 2 раза по ширине, со скруглениями **с обеих сторон**;
-    - текст справа НЕ обрезается (wrap) и +1 пустая строка снизу;
-    - имя/статы центрированы относительно друг друга.
-    """
     c1, c2, _ = _ensure_palette(colors)
     W, H = 1600, 720
     im = Image.new("RGBA", (W, H), (0,0,0,0))
 
-    # Левая «основная» полка
     main_w = int(W * 0.65)
     main = _draw_gradient(main_w, H, c1, c2)
     main_mask = _rounded_mask((main_w, H), radius=48, corners=(False, True, True, False))
     main.putalpha(main_mask)
     im.alpha_composite(main, (0,0))
 
-    # Правая доп. панель — половина основной
     right_w = max(420, main_w // 2)
     right = _draw_gradient(right_w, H, c1, c2)
     right_mask = _rounded_mask((right_w, H), radius=40, corners=(True, True, True, True))
     right.putalpha(right_mask)
     im.alpha_composite(right, (main_w + 12, 0))
 
-    # Логотип команды на основной
     _draw_team_logo_circle(im, logo_img, cx=SAFE_PADDING + 120, cy=SAFE_PADDING + 120, radius=84)
 
-    # Текст слева
     name_font = _load_font(FONT_PRIMARY, 128)
     stat_big = _load_font(FONT_PRIMARY, 86)
     stat_small = _load_font(FONT_SECONDARY, 48)
     vals, labs, cols = _stats_to_lines(stats)
 
-    # размеры блока слева
     name_w, name_h = name_font.getbbox(player_name)[2:]
     col_gap = 42
     col_w = min(220, (main_w - SAFE_PADDING*2) // max(1, cols) - col_gap)
@@ -451,35 +381,30 @@ def render_card_special(template_key: str,
         lw, lh = stat_small.getbbox(lab)[2:]
         d.text((cx + (col_w - lw)//2, sy + vh + 8), lab, font=stat_small, fill=(255,255,255,220))
 
-    # Правый текст — wrap + дополнительная пустая строка снизу
     right_pad = 36
     rx = main_w + 12 + right_pad
     ry = right_pad + 10
     rmax = right_w - right_pad*2
 
     rt_font = _load_font(FONT_PRIMARY, 64)
-    # звезда слева от первой строки
     star_y = ry + 26
     _draw_star(d, (rx + 18, star_y), 16, fill=(255,200,0))
     rx_text = rx + 44
 
-    lines = _wrap_text(rt_font, right_text, rmax - 44)
+    lines = _wrap_text(rt_font, right_text or "", rmax - 44)
     if not lines:
         lines = [" "]
-    # добавляем пустую строку
-    lines.append("")
+    lines.append("")  # пустая строка снизу
 
     lh = (rt_font.getbbox("A")[3] - rt_font.getbbox("A")[1]) + 6
     for i, line in enumerate(lines):
         d.text((rx_text, ry + i*lh), line, font=rt_font, fill=(255,255,255,240))
 
-    # Голова поверх
     _place_headshot(im, head_img, x_right=main_w - SAFE_PADDING, y_bottom=H - SAFE_PADDING, max_w=600, max_h=640)
-
     return _save_png(im)
 
 # ------------------------------------------------------------
-# BAD — всегда коричневый, без скруглений слева (только справа), иконка «💩»
+# BAD — всегда коричневый
 # ------------------------------------------------------------
 def _load_icon(name: str, size: int) -> Optional[Image.Image]:
     path = os.path.join(ICONS_DIR, name)
@@ -500,13 +425,6 @@ def render_card_bad(template_key: str,
                     head_img: Optional[Image.Image],
                     stats: Iterable[Tuple[str,str]] | None,
                     **kwargs) -> bytes:
-    """
-    cardBAD:
-    - коричневый цвет;
-    - скругления ТОЛЬКО СПРАВА;
-    - большая «какашка» после имени, нижняя граница выровнена с нижней границей имени;
-    - ширина по контенту, не «во весь экран».
-    """
     W, H = 1400, 560
     im = Image.new("RGBA", (W, H), (0,0,0,0))
 
@@ -519,20 +437,17 @@ def render_card_bad(template_key: str,
     stat_small= _load_font(FONT_SECONDARY, 50)
     vals, labs, cols = _stats_to_lines(stats)
 
-    # имя
     nx = SAFE_PADDING + 20
     ny = SAFE_PADDING + 40
     d.text((nx, ny), player_name, font=name_font, fill=(255,255,255,255))
     name_w, name_h = name_font.getbbox(player_name)[2:]
 
-    # какашка
     poop = _load_icon("poop.png", size=120) or _load_icon("poop@2x.png", size=120)
     if poop:
         px = nx + name_w + 16
-        py = ny + name_h - poop.height  # нижняя граница иконки = низу имени
+        py = ny + name_h - poop.height
         im.alpha_composite(poop, (px, py))
 
-    # статы под именем
     col_gap = 42
     col_w = min(230, (W - SAFE_PADDING*2) // max(1, cols) - col_gap)
     stats_w = cols * col_w + (cols - 1) * col_gap
@@ -548,19 +463,15 @@ def render_card_bad(template_key: str,
         lw, lh = stat_small.getbbox(lab)[2:]
         d.text((cx + (col_w - lw)//2, sy + vh + 8), lab, font=stat_small, fill=(255,255,255,230))
 
-    # голова можно не показывать на BAD, но оставим поддержу
     _place_headshot(im, head_img, x_right=W - SAFE_PADDING, y_bottom=H - SAFE_PADDING, max_w=520, max_h=520)
-
     return _save_png(im)
 
 # ------------------------------------------------------------
-# Резервный рендер (если в коде откуда-то зовётся render_card_drN)
+# Резервный рендер
 # ------------------------------------------------------------
 def render_card_drN(*args, **kwargs) -> bytes:
-    # простой заглушечный вариант — вызов обычной карточки
     try:
         return render_card("single", *args, **kwargs)
     except Exception:
-        # вернём прозрачный PNG, чтобы бот отработал с ошибкой красиво
         im = Image.new("RGBA", (10, 10), (0,0,0,0))
         return _save_png(im)
