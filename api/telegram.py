@@ -5,7 +5,7 @@
 # 2) Любая ошибка рендера — отправляем ❌ и текст ошибки.
 
 from __future__ import annotations
-import os, io, re, json, time, unicodedata, uuid
+import os, io, re, json, time, unicodedata, uuid, importlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Request
@@ -31,7 +31,7 @@ def _safe_import(modname: str, names: List[str]) -> Tuple[Optional[Any], List[An
     except Exception as e:
         return None, [], f"{e.__class__.__name__}: {e}"
 
-# -------- deps --------
+# -------- deps: data / team_brand (safe import) --------
 _data_mod, _data_objs, _data_err = _safe_import("data", [
     "get_players", "refresh_players", "find_player_by_name",
     "display_name_for", "overrides_save_name_ru", "overrides_get_name_ru",
@@ -48,17 +48,38 @@ _brand_mod, _brand_objs, _brand_err = _safe_import("team_brand", [
 if _brand_err and DEBUG: _log("[boot] team_brand import error:", _brand_err)
 (get_team_brand, color_name_ru, set_team_primary_color) = ([_ for _ in _brand_objs] + [None]*3)[:3]
 
-_graphics_mod, _graphics_objs, _graphics_err = _safe_import("graphics", [
-    "render_card", "render_card2", "render_card_bad", "render_card_special"
-])
-if _graphics_err and DEBUG: _log("[boot] graphics import error:", _graphics_err)
-(render_card, render_card2, render_card_bad, render_card_special) = ([_ for _ in _graphics_objs] + [None]*4)[:4]
+# -------- graphics: ленивый импорт, чтобы избежать круговых импортов --------
+render_card = render_card2 = render_card_bad = render_card_special = None  # type: ignore
+_graphics_err: Optional[str] = None
 
-app = FastAPI()
+def _ensure_graphics() -> bool:
+    """Лениво импортируем graphics и подхватываем функции render_*."""
+    global render_card, render_card2, render_card_bad, render_card_special, _graphics_err
+    if callable(render_card) and callable(render_card2) and callable(render_card_bad) and callable(render_card_special):
+        return True
+    try:
+        m = importlib.import_module("graphics")
+        render_card         = getattr(m, "render_card")
+        render_card2        = getattr(m, "render_card2")
+        render_card_bad     = getattr(m, "render_card_bad")
+        render_card_special = getattr(m, "render_card_special")
+        if not (callable(render_card) and callable(render_card2) and callable(render_card_bad) and callable(render_card_special)):
+            raise AttributeError("graphics.render_* not callable")
+        _graphics_err = None
+        return True
+    except Exception as e:
+        _graphics_err = f"{e.__class__.__name__}: {e}"
+        render_card = render_card2 = render_card_bad = render_card_special = None  # type: ignore
+        return False
+
+def _graphics_check_or_msg(chat_id: int) -> bool:
+    if not _ensure_graphics():
+        _tg_send_message(chat_id, f"❌ Графический модуль не загружен: {_graphics_err or 'unknown error'}")
+        return False
+    return True
 
 # -------- Telegram HTTP --------
 def _tg_url(method: str) -> str:
-    # ВАЖНО: никаких импортов из graphics; держим модуль без круговых зависимостей
     return f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
 
 def _http_json(url: str, payload: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
@@ -143,18 +164,21 @@ def _normalize(s: str) -> str:
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.replace("ё","е")
-    keep = "abcdefghijklmnopqrstuvwxyzабвгдеёжзийклмнопрстуфхцчшщьыъэюя -'/"
+    keep = "abcdefghijklmnopqrstuvwxyzабвгдеёжзийклмнопрстуфхцчшщьыъэюя -'/"  # разрешённые
     s = "".join(ch for ch in s if ch in keep)
     return " ".join(s.split())
 
 def _img_to_png_bytes(obj: Any) -> bytes:
     if isinstance(obj, (bytes, bytearray)):
         return bytes(obj)
+    # ожидаем PIL.Image.Image
     try:
+        from PIL import Image  # noqa
         bio = io.BytesIO()
         obj.save(bio, "PNG")
         return bio.getvalue()
     except Exception:
+        # fallback — если пришёл memoryview/bytearray-like
         return bytes(obj)
 
 def ensure_players_loaded(force: bool=False) -> List[Dict[str,Any]]:
@@ -177,12 +201,12 @@ def ensure_players_loaded(force: bool=False) -> List[Dict[str,Any]]:
 def search_players_loose(q: str) -> List[Dict[str,Any]]:
     qn = _normalize(q)
     ps = ensure_players_loaded(False)
-    if find_player_by_name:
-        try:
+    try:
+        if find_player_by_name:
             hits = find_player_by_name(q)
             if hits: return hits
-        except Exception:
-            pass
+    except Exception:
+        pass
     out = []
     for p in ps:
         dn = p.get("displayName") or f"{p.get('firstName','')} {p.get('lastName','')}"
@@ -286,8 +310,7 @@ def _team_brand_tuple(team_id: str):
         return (("#0A2A4A","#081E36","#0A2A4A"), None, [], False)
 
 # -------- state tags --------
-# Поддерживаем оба формата: "[setname:123]" и "setname:123"
-SETNAME_TAG_RE = re.compile(r"(?:\[setname:(\d+)\]|setname:(\d+))", re.IGNORECASE)
+SETNAME_TAG_RE = re.compile(r"\[setname:(\d+)\]")
 
 def _check_secret(req: Request):
     s = (req.query_params.get("secret") or "").strip()
@@ -296,12 +319,15 @@ def _check_secret(req: Request):
     return None
 
 # -------- GET --------
+app = FastAPI()
+
 @app.get("/api/telegram")
 async def telegram_get(request: Request):
     bad = _check_secret(request)
     if bad: return bad
     action = (request.query_params.get("action") or "").strip().lower()
     if action == "diag":
+        g_ok = _ensure_graphics()
         return JSONResponse({
             "ok": True,
             "py": ".".join(map(str, __import__("sys").version_info[:3])),
@@ -309,7 +335,7 @@ async def telegram_get(request: Request):
             "has_bot_token": bool(BOT_TOKEN),
             "modules": {
                 "data": "ok" if _data_err is None else "error",
-                "graphics": "ok" if _graphics_err is None else "error",
+                "graphics": "ok" if g_ok else "error",
                 "team_brand": "ok" if _brand_err is None else "error",
             },
             "errors": {"data": _data_err, "graphics": _graphics_err, "team_brand": _brand_err},
@@ -338,16 +364,9 @@ HELP = (
     "• /card <имя> | <стата>\n"
     "• /cards <имя> | <стата> | <надпись справа>\n"
     "• /card2 <A> | <статаA> || <B> | <статаB>\n"
-    "• /cardbad <имя> | <стата>\n"
+    "• /cardbad (или /bad) <имя> | <стата>\n"
     "• /stop — сбросить контекст\n"
 )
-
-def _graphics_check_or_msg(chat_id: int) -> bool:
-    """Возвращает True, если рендер-функции доступны, иначе пишет ошибку и False."""
-    if not callable(render_card) or not callable(render_card2) or not callable(render_card_bad) or not callable(render_card_special):
-        _tg_send_message(chat_id, f"❌ Графический модуль не загружен: {_graphics_err or 'unknown error'}")
-        return False
-    return True
 
 # -------- POST (webhook) --------
 @app.post("/api/telegram")
@@ -375,15 +394,15 @@ async def telegram_post(request: Request):
         rtxt = (msg["reply_to_message"].get("text") or "") + " " + (msg["reply_to_message"].get("caption") or "")
         m = SETNAME_TAG_RE.search(rtxt)
         if m and overrides_save_name_ru:
-            pid = (m.group(1) or m.group(2))
+            pid = m.group(1)
             try:
-                overrides_save_name_ru(pid, (msg["text"] or "").strip())
-                _tg_send_message(msg["chat"]["id"], f"Сохранил имя для {pid}: {(msg['text'] or '').strip()}")
+                overrides_save_name_ru(pid, msg["text"].strip())
+                _tg_send_message(msg["chat"]["id"], f"Сохранил имя для {pid}: {msg['text'].strip()}")
             except Exception as e:
                 _tg_send_message(msg["chat"]["id"], f"Не удалось сохранить имя: {e!r}")
             return PlainTextResponse("OK")
 
-    # callback-кнопки цвета (если будут)
+    # callback-кнопки (если будут добавлены позже)
     if cb:
         data = cb.get("data") or ""
         if data.startswith("color:"):
@@ -441,15 +460,15 @@ async def telegram_post(request: Request):
             )
             return PlainTextResponse("OK")
 
-        team_id = str(p.get("teamId") or "0")
-        colors, _, _, _ = _team_brand_tuple(team_id)  # игнор цвета — cardbad рисуется коричневой внутри graphics
+        # headshot
         head = _ensure_headshot_image(p)
         if head is None:
             _tg_send_message(chat_id, "❌ Не удалось получить фото игрока"); return PlainTextResponse("OK")
 
         try:
             _tg_send_message(chat_id, "_Готовлю плашку…_", parse_mode="Markdown")
-            img = render_card_bad(ru, "", None, colors, head, stats)
+            # card_bad: коричневый и 💩 — внутри graphics
+            img = render_card_bad(ru, "", None, None, head, stats)  # type: ignore[arg-type]
             png = _img_to_png_bytes(img)
             _tg_send_png_as_document(chat_id, png, filename=f"cardBAD_{pid}.png")
         except Exception as e:
@@ -492,7 +511,8 @@ async def telegram_post(request: Request):
 
         try:
             _tg_send_message(chat_id, "_Готовлю плашку…_", parse_mode="Markdown")
-            img = render_card_special(ru, "", logo_img, colors, head, stats, right_text)
+            # special: слева обычная плашка (под размер контента), справа — блок со ⭐ и переносами
+            img = render_card_special(ru, "", logo_img, colors, head, stats, right_text)  # type: ignore[arg-type]
             png = _img_to_png_bytes(img)
             _tg_send_png_as_document(chat_id, png, filename=f"cards_{pid}.png")
         except Exception as e:
@@ -550,7 +570,7 @@ async def telegram_post(request: Request):
             img = render_card2(
                 ruA, "", logoA, colorsA, headA, statsA,
                 ruB, "", logoB, colorsB, headB, statsB
-            )
+            )  # type: ignore[arg-type]
             png = _img_to_png_bytes(img)
             _tg_send_png_as_document(chat_id, png, filename=f"card2_{idA}_{idB}.png")
         except Exception as e:
@@ -592,7 +612,7 @@ async def telegram_post(request: Request):
 
         try:
             _tg_send_message(chat_id, "_Готовлю плашку…_", parse_mode="Markdown")
-            img = render_card(ru, "", logo_img, colors, head, stats)
+            img = render_card(ru, "", logo_img, colors, head, stats)  # type: ignore[arg-type]
             png = _img_to_png_bytes(img)
             _tg_send_png_as_document(chat_id, png, filename=f"card_{pid}.png")
         except Exception as e:
