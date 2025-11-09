@@ -1,9 +1,8 @@
 # api/telegram.py
 # Webhook FastAPI для Телеграма. Поддержка: /start /help /stop /find
 # /card, /cards, /card2, /cardbad (/bad). Автопродолжение после setname.
-
 from __future__ import annotations
-import os, io, re, json, time, unicodedata, uuid
+import os, io, re, json, time, unicodedata, uuid, importlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Request
@@ -29,7 +28,7 @@ def _safe_import(modname: str, names: List[str]):
     except Exception as e:
         return None, [], f"{e.__class__.__name__}: {e}"
 
-# -------- deps --------
+# -------- deps: data / team_brand --------
 _data_mod, _data_objs, _data_err = _safe_import("data", [
     "get_players", "refresh_players", "find_player_by_name",
     "display_name_for", "overrides_save_name_ru", "overrides_get_name_ru",
@@ -46,11 +45,35 @@ _brand_mod, _brand_objs, _brand_err = _safe_import("team_brand", [
 if _brand_err and DEBUG: _log("[boot] team_brand import error:", _brand_err)
 (get_team_brand, color_name_ru, set_team_primary_color) = ([_ for _ in _brand_objs] + [None]*3)[:3]
 
-_graphics_mod, _graphics_objs, _graphics_err = _safe_import("graphics", [
-    "render_card", "render_card2", "render_card_bad", "render_card_special"
-])
-if _graphics_err and DEBUG: _log("[boot] graphics import error:", _graphics_err)
-(render_card, render_card2, render_card_bad, render_card_special) = ([_ for _ in _graphics_objs] + [None]*4)[:4]
+# -------- graphics: ЛЕНИВАЯ загрузка (исправляет цикл импорта) --------
+render_card = None
+render_card2 = None
+render_card_bad = None
+render_card_special = None
+_graphics_err: Optional[str] = None
+
+def _require_graphics() -> bool:
+    """Импортирует graphics «на поздней стадии», когда этот модуль уже инициализирован."""
+    global render_card, render_card2, render_card_bad, render_card_special, _graphics_err
+    if callable(render_card) and callable(render_card_bad) and callable(render_card_special):
+        # card2 может быть не нужен в некоторых проектах — подгружаем тоже, если есть
+        return True
+    try:
+        g = importlib.import_module("graphics")
+        render_card = getattr(g, "render_card", None)
+        render_card2 = getattr(g, "render_card2", None)
+        render_card_bad = getattr(g, "render_card_bad", None)
+        render_card_special = getattr(g, "render_card_special", None)
+        _graphics_err = None
+        return True
+    except Exception as e:
+        _graphics_err = f"{e.__class__.__name__}: {e}"
+        if DEBUG: _log("[graphics] lazy import failed:", _graphics_err)
+        return False
+
+def _ensure_callable(fn: Any, name: str):
+    if not callable(fn):
+        raise TypeError(f"graphics.{name} is not callable (got {type(fn)})")
 
 app = FastAPI()
 
@@ -90,12 +113,6 @@ def _tg_send_message(chat_id: int, text: str, reply_to: Optional[int]=None, pars
         payload["parse_mode"] = parse_mode
     return _tg_post("sendMessage", payload)
 
-def _tg_edit_message(chat_id: int, message_id: int, text: str, parse_mode: Optional[str]=None):
-    payload: Dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    return _tg_post("editMessageText", payload)
-
 def _multipart_boundary() -> str:
     return "----WebKitFormBoundary" + uuid.uuid4().hex
 
@@ -134,8 +151,6 @@ def _tg_send_png_as_document(chat_id: int, png_bytes: bytes, filename: str="card
 
 # -------- helpers domain --------
 PLAYERS_READY = False
-
-# Простое состояние на время диалога (держим в памяти одной инстанции)
 PENDING: Dict[int, Dict[str, Any]] = {}
 PENDING_TTL = 600  # секунд
 
@@ -172,14 +187,8 @@ def _img_to_png_bytes(obj: Any) -> bytes:
         im = Image.open(obj).convert("RGBA")
         bio = io.BytesIO(); im.save(bio, "PNG"); return bio.getvalue()
     if getattr(obj, "save", None):
-        bio = io.BytesIO()
-        obj.save(bio, "PNG")
-        return bio.getvalue()
+        bio = io.BytesIO(); obj.save(bio, "PNG"); return bio.getvalue()
     raise TypeError(f"unexpected renderer return type: {type(obj)}")
-
-def _ensure_callable(fn: Any, name: str):
-    if not callable(fn):
-        raise TypeError(f"graphics.{name} is not callable (got {type(fn)})")
 
 def ensure_players_loaded(force: bool=False) -> List[Dict[str,Any]]:
     global PLAYERS_READY
@@ -296,7 +305,6 @@ def _team_brand_tuple(team_id: str):
         _log("[tg] team_brand err", team_id, repr(e))
         return (("#0A2A4A","#081E36","#0A2A4A"), None, [], False)
 
-# ловим и [setname:123] и setname:123
 SETNAME_ANY_RE = re.compile(r"(?:\[setname:(\d+)\]|setname:(\d+))", re.I)
 
 def _check_secret(req: Request):
@@ -305,11 +313,12 @@ def _check_secret(req: Request):
         return PlainTextResponse("bad secret", status_code=401)
     return None
 
-# ===== Переиспользуемый рендер по состоянию =====
 def _render_from_state(chat_id: int) -> None:
     st = _state_get(chat_id)
     if not st: return
-
+    if not _require_graphics():
+        _tg_send_message(chat_id, f"❌ Ошибка рендера: graphics не загрузился: {_graphics_err}")
+        _state_clear(chat_id); return
     cmd = st.get("cmd")
     try:
         if cmd == "card":
@@ -373,6 +382,7 @@ async def telegram_get(request: Request):
     if bad: return bad
     action = (request.query_params.get("action") or "").strip().lower()
     if action == "diag":
+        loaded = _require_graphics()
         return JSONResponse({
             "ok": True,
             "py": ".".join(map(str, __import__("sys").version_info[:3])),
@@ -380,7 +390,7 @@ async def telegram_get(request: Request):
             "has_bot_token": bool(BOT_TOKEN),
             "modules": {
                 "data": "ok" if _data_err is None else "error",
-                "graphics": "ok" if _graphics_err is None else "error",
+                "graphics": "ok" if loaded else "error",
                 "team_brand": "ok" if _brand_err is None else "error",
             },
             "graphics_fns": {
@@ -422,8 +432,7 @@ HELP = (
 # -------- POST (webhook) --------
 @app.post("/api/telegram")
 async def telegram_post(request: Request):
-    bad = _check_secret(request)
-    if bad: return bad
+    bad = _check_secret(request);  if bad: return bad
 
     rid = f"[RID={int(time.time()*1000)}-{uuid.uuid4().hex[:6]}]"
     raw = (await request.body()).decode("utf-8","ignore")
@@ -454,25 +463,22 @@ async def telegram_post(request: Request):
             except Exception as e:
                 _tg_send_message(msg["chat"]["id"], f"Не удалось сохранить имя: {e!r}")
                 return PlainTextResponse("OK")
-            # пробуем продолжить начатую плашку
             _render_from_state(msg["chat"]["id"])
             return PlainTextResponse("OK")
 
-    # callback-кнопки (если будут)
+    # callback-кнопки (на будущее)
     if cb:
         data = cb.get("data") or ""
         if data.startswith("color:"):
             _tg_post("answerCallbackQuery", {"callback_query_id": cb["id"], "text": "Цвет применён"})
             return PlainTextResponse("OK")
 
-    if not msg:
-        return PlainTextResponse("OK")
+    if not msg: return PlainTextResponse("OK")
 
     chat_id = msg["chat"]["id"]
     text = (msg.get("text") or "").strip()
     low = text.lower()
 
-    # --- команды ---
     if low.startswith("/start"):
         _tg_send_message(chat_id, "Я здесь. Готов работать 💼\n\n"+HELP); return PlainTextResponse("OK")
     if low.startswith("/help"):
@@ -503,13 +509,14 @@ async def telegram_post(request: Request):
         p = hits[0]; pid = str(p.get("personId") or ""); team_id = str(p.get("teamId") or "0")
         ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
         if not ru:
-            # сохраняем состояние и спрашиваем имя
             _state_set(chat_id, {"cmd":"cardbad","p":p,"pid":pid,"team_id":team_id,"stats":stats})
             _tg_send_message(chat_id, f"Как подписать игрока *{p.get('displayName')}* на плашке?\n"
                                       f"Ответьте на это сообщение русским именем.\nsetname:{pid}",
                              reply_to=msg["message_id"], parse_mode="Markdown")
             return PlainTextResponse("OK")
 
+        if not _require_graphics():
+            _tg_send_message(chat_id, f"❌ Ошибка рендера: graphics не загрузился: {_graphics_err}"); return PlainTextResponse("OK")
         colors, _, _, _ = _team_brand_tuple(team_id)
         head = _ensure_headshot_image(p)
         if head is None: _tg_send_message(chat_id, "❌ Не удалось получить фото игрока"); return PlainTextResponse("OK")
@@ -547,6 +554,8 @@ async def telegram_post(request: Request):
                              reply_to=msg["message_id"], parse_mode="Markdown")
             return PlainTextResponse("OK")
 
+        if not _require_graphics():
+            _tg_send_message(chat_id, f"❌ Ошибка рендера: graphics не загрузился: {_graphics_err}"); return PlainTextResponse("OK")
         colors, logo_img, _, _ = _team_brand_tuple(team_id)
         head = _ensure_headshot_image(p)
         if head is None: _tg_send_message(chat_id, "❌ Не удалось получить фото игрока"); return PlainTextResponse("OK")
@@ -588,7 +597,6 @@ async def telegram_post(request: Request):
         ruA = overrides_get_name_ru(idA) if overrides_get_name_ru else None
         ruB = overrides_get_name_ru(idB) if overrides_get_name_ru else None
 
-        # если хотя бы одно имя не известно — сохраняем состояние и спрашиваем по очереди
         if not (ruA and ruB):
             _state_set(chat_id, {
                 "cmd":"card2",
@@ -603,6 +611,8 @@ async def telegram_post(request: Request):
                 reply_to=msg["message_id"], parse_mode="Markdown")
             return PlainTextResponse("OK")
 
+        if not _require_graphics():
+            _tg_send_message(chat_id, f"❌ Ошибка рендера: graphics не загрузился: {_graphics_err}"); return PlainTextResponse("OK")
         colorsA, logoA, _, _ = _team_brand_tuple(teamA)
         colorsB, logoB, _, _ = _team_brand_tuple(teamB)
         headA = _ensure_headshot_image(pA); headB = _ensure_headshot_image(pB)
@@ -644,6 +654,8 @@ async def telegram_post(request: Request):
                              reply_to=msg["message_id"], parse_mode="Markdown")
             return PlainTextResponse("OK")
 
+        if not _require_graphics():
+            _tg_send_message(chat_id, f"❌ Ошибка рендера: graphics не загрузился: {_graphics_err}"); return PlainTextResponse("OK")
         colors, logo_img, _, _ = _team_brand_tuple(team_id)
         head = _ensure_headshot_image(p)
         if head is None: _tg_send_message(chat_id, "❌ Не удалось получить фото игрока"); return PlainTextResponse("OK")
@@ -657,6 +669,5 @@ async def telegram_post(request: Request):
             _tg_send_message(chat_id, f"❌ Ошибка рендера: {e!r}")
         return PlainTextResponse("OK")
 
-    # Неизвестный ввод — подсказываем команды
     _tg_send_message(chat_id, HELP)
     return PlainTextResponse("OK")
