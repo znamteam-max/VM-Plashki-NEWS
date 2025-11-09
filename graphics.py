@@ -1,18 +1,22 @@
-# api/telegram.py — no-rounded presets, font rules, bottom line for cardS
+# api/telegram.py — stable statuses, name persistence (Gist/file fallback), PNG-bytes render
 from __future__ import annotations
 import os, io, re, json, time, unicodedata, uuid, inspect
 from typing import Any, Dict, List, Optional, Tuple
-
 from fastapi import FastAPI, Request
 from starlette.responses import JSONResponse, PlainTextResponse
-
 from urllib.request import Request as UrlRequest, urlopen as http_urlopen
 from urllib.error import HTTPError, URLError
 
-DEBUG = os.getenv("DEBUG", "1") in ("1", "true", "yes")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+DEBUG = os.getenv("DEBUG", "1").lower() in ("1","true","yes")
+WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or "").strip()
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 API_ORIGIN = os.getenv("API_ORIGIN")
+
+# Optional name persistence fallback
+GH_TOKEN = (os.getenv("GH_TOKEN") or "").strip()
+OVERRIDES_GIST_ID = (os.getenv("OVERRIDES_GIST_ID") or "").strip()
+OVERRIDES_FILENAME = (os.getenv("OVERRIDES_FILENAME") or "names_ru.json").strip()
+OVERRIDES_FILE = (os.getenv("OVERRIDES_FILE") or "").strip()
 
 def _log(*a: Any) -> None:
     try: print(*a, flush=True)
@@ -145,18 +149,16 @@ LABEL_TOKENS = [
     ("3 очк", "3-ОЧКОВЫЕ"), ("трешки", "3-ОЧКОВЫЕ"), ("трёшки", "3-ОЧКОВЫЕ"),
     ("3pt", "3-ОЧКОВЫЕ"), ("3pm", "3-ОЧКОВЫЕ"), ("stocks", "СТИЛОБЛОКИ"), ("стилоблок", "СТИЛОБЛОКИ"),
     ("перехват", "ПЕРЕХВАТЫ"), ("stl", "ПЕРЕХВАТЫ"),
-    ("блок", "БЛОКИ"), ("blk", "БЛОКИ"), ("блокшот", "БЛОКИ"), ("блок-шот", "БЛОКИ"),
+    ("блок", "БЛОКИ"), ("blk", "БЛОКИ"),
     ("передач", "ПЕРЕДАЧИ"), ("ast", "ПЕРЕДАЧИ"),
-    ("подбор", "ПОДБОРЫ"), ("reb", "ПОДБОРЫ"), ("rebs", "ПОДБОРЫ"),
-    ("очк", "ОЧКИ"), ("pts", "ОЧКИ"), ("points", "ОЧКИ"),
+    ("подбор", "ПОДБОРЫ"), ("reb", "ПОДБОРЫ"),
+    ("очк", "ОЧКИ"), ("pts", "ОЧКИ"),
     ("минут", "МИНУТЫ"), ("мин", "МИНУТЫ"), ("min", "МИНУТЫ"),
     ("фол", "ФОЛЫ"), ("pf", "ФОЛЫ"),
     ("потер", "ПОТЕРИ"), ("tov", "ПОТЕРИ"), ("to", "ПОТЕРИ"),
 ]
 STAT_TOKEN_MAP = {k:v for k,v in LABEL_TOKENS}
-STAT_TOKEN_MAP.update({
-    "трех":"3-ОЧКОВЫЕ","трёх":"3-ОЧКОВЫЕ","3-очков":"3-ОЧКОВЫЕ","3 очк":"3-ОЧКОВЫЕ",
-})
+STAT_TOKEN_MAP.update({"трех":"3-ОЧКОВЫЕ","трёх":"3-ОЧКОВЫЕ","3-очков":"3-ОЧКОВЫЕ","3 очк":"3-ОЧКОВЫЕ"})
 
 def _strip_quotes(s: str) -> str:
     s = s.strip()
@@ -235,11 +237,17 @@ def ensure_players_loaded(force: bool=False) -> List[Dict[str,Any]]:
 
 def _display_name_for(p: Dict[str,Any]) -> str:
     pid = str(p.get("personId") or p.get("id") or "")
+    # local cache first
+    ru = _local_get_ru(pid)
+    if ru: return ru
     try:
         if overrides_get_name_ru:
             ru = overrides_get_name_ru(pid)
-            if ru: return ru
-    except Exception: pass
+            if ru:
+                _local_set_ru(pid, ru, persist=False)
+                return ru
+    except Exception:
+        pass
     if display_name_for:
         try: return display_name_for(p)
         except Exception: pass
@@ -299,13 +307,127 @@ def _team_colors(team_id: str) -> Tuple[str,str,str]:
         return ("#007ACC","#005C99","#007ACC")
 
 # ----------------- Render-safe wrapper -----------------
-def _call_render(func, *args, **kwargs):
+def _call_render(func, *args, **kwargs) -> bytes:
+    if func is None:
+        raise RuntimeError("graphics not loaded")
     try:
         sig = inspect.signature(func)
         allowed = {k: v for k, v in kwargs.items() if k in sig.parameters}
-        return func(*args, **allowed)
+        out = func(*args, **allowed)
     except Exception:
-        return func(*args)
+        out = func(*args)
+    if isinstance(out, ImageBytes := (bytes, bytearray)):
+        return bytes(out)
+    # allow PIL.Image as legacy
+    try:
+        from PIL import Image as _Img
+        if isinstance(out, _Img.Image):
+            bio=io.BytesIO(); out.save(bio, format="PNG"); return bio.getvalue()
+    except Exception:
+        pass
+    raise TypeError("render must return PNG bytes")
+
+# ----------------- Name overrides fallback (Gist / file) -----------------
+_NAMES_RU: Dict[str,str] = {}
+
+def _local_get_ru(pid: str) -> Optional[str]:
+    if not pid: return None
+    return _NAMES_RU.get(str(pid))
+
+def _local_set_ru(pid: str, name_ru: str, persist: bool=True) -> None:
+    if not pid: return
+    _NAMES_RU[str(pid)] = name_ru
+    if persist:
+        # try primary data.py
+        ok_primary = False
+        try:
+            if overrides_save_name_ru:
+                overrides_save_name_ru(pid, name_ru)
+                ok_primary = True
+        except Exception as e:
+            _log("[data] overrides_save_name_ru error:", repr(e))
+        if ok_primary: return
+        # gist
+        if GH_TOKEN and OVERRIDES_GIST_ID:
+            try:
+                _gist_save(pid, name_ru)
+                return
+            except Exception as e:
+                _log("[data] gist save error:", repr(e))
+        # file
+        if OVERRIDES_FILE:
+            try:
+                _file_save()
+            except Exception as e:
+                _log("[data] file save error:", repr(e))
+
+def _file_load():
+    global _NAMES_RU
+    if not OVERRIDES_FILE: return
+    try:
+        if os.path.exists(OVERRIDES_FILE):
+            with open(OVERRIDES_FILE,"r",encoding="utf-8") as f:
+                data=json.load(f)
+                if isinstance(data, dict): _NAMES_RU.update({str(k):str(v) for k,v in data.items()})
+    except Exception as e:
+        _log("[data] file load error:", repr(e))
+
+def _file_save():
+    if not OVERRIDES_FILE: return
+    tmp = OVERRIDES_FILE + ".tmp"
+    with open(tmp,"w",encoding="utf-8") as f:
+        json.dump(_NAMES_RU, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, OVERRIDES_FILE)
+
+def _gist_get_json() -> Dict[str,Any]:
+    if not (GH_TOKEN and OVERRIDES_GIST_ID): return {}
+    # get gist meta
+    url = f"https://api.github.com/gists/{OVERRIDES_GIST_ID}"
+    req = UrlRequest(url, headers={"Authorization": f"Bearer {GH_TOKEN}","Accept":"application/vnd.github+json"})
+    with http_urlopen(req, timeout=20) as r:
+        meta = json.loads(r.read().decode("utf-8","ignore"))
+    files = meta.get("files") or {}
+    fmeta = files.get(OVERRIDES_FILENAME)
+    if not fmeta:  # create empty
+        return {}
+    raw_url = fmeta.get("raw_url")
+    if not raw_url: return {}
+    req2 = UrlRequest(raw_url, headers={"Authorization": f"Bearer {GH_TOKEN}"})
+    with http_urlopen(req2, timeout=20) as r2:
+        txt = r2.read().decode("utf-8","ignore")
+        try: return json.loads(txt) if txt.strip() else {}
+        except Exception: return {}
+def _gist_save(pid: str, name_ru: str):
+    # merge current gist JSON and write back
+    cur = _gist_get_json()
+    cur[str(pid)] = name_ru
+    body = json.dumps({"files": {OVERRIDES_FILENAME: {"content": json.dumps(cur, ensure_ascii=False, indent=2)}}}).encode("utf-8")
+    url = f"https://api.github.com/gists/{OVERRIDES_GIST_ID}"
+    req = UrlRequest(url, data=body, headers={"Authorization": f"Bearer {GH_TOKEN}",
+                                              "Accept":"application/vnd.github+json",
+                                              "Content-Type":"application/json"})
+    with http_urlopen(req, timeout=25) as r:
+        _ = r.read()
+    _NAMES_RU[str(pid)] = name_ru
+
+def _maybe_init_names_cache():
+    # load primary data names (best effort)
+    try:
+        if overrides_get_name_ru:
+            # nothing to preload here, will call on demand
+            pass
+    except Exception:
+        pass
+    # then gist
+    if GH_TOKEN and OVERRIDES_GIST_ID:
+        try:
+            data = _gist_get_json()
+            if isinstance(data, dict):
+                _NAMES_RU.update({str(k):str(v) for k,v in data.items()})
+        except Exception as e:
+            _log("[data] gist load error:", repr(e))
+    # then local file
+    _file_load()
 
 # ----------------- State + statuses -----------------
 CTX: Dict[int, Dict[str,Any]] = {}
@@ -353,14 +475,6 @@ def _kb_fix_menu(mode: str) -> Dict[str,Any]:
     rows.append([{"text":"Команды","callback_data":"fix:teams"}])
     return {"inline_keyboard": rows}
 
-def _kb_color_which(mode: str) -> Dict[str,Any]:
-    if mode == "duo":
-        return {"inline_keyboard":[
-            [{"text":"Цвет команды 1","callback_data":"colorwhich:1"},
-             {"text":"Цвет команды 2","callback_data":"colorwhich:2"}]
-        ]}
-    return {"inline_keyboard":[[{"text":"Цвет команды","callback_data":"colorwhich:1"}]]}
-
 def _valid_hex(s: str) -> bool:
     return bool(re.fullmatch(r"#?[0-9A-Fa-f]{6}", s.strip()))
 def _fix_hex(s: str) -> str:
@@ -397,6 +511,9 @@ async def telegram_get(request: Request):
             },
             "errors": {"data": _data_err, "graphics": _graphics_err, "team_brand": _brand_err},
             "api_origin": API_ORIGIN or None,
+            "gist": bool(GH_TOKEN and OVERRIDES_GIST_ID),
+            "file": bool(OVERRIDES_FILE),
+            "names_cached": len(_NAMES_RU)
         })
     if action == "refresh":
         try:
@@ -416,10 +533,8 @@ async def telegram_get(request: Request):
                                  "source": src or "unknown","source_url": src_url or None})
         except Exception as e:
             return JSONResponse({"ok": False, "refreshed": False, "error": repr(e)}, status_code=500)
-    if action == "test_find":
-        q = request.query_params.get("q") or ""
-        hits = [{"personId": h.get("personId"), "displayName": h.get("displayName"), "teamId": h.get("teamId")} for h in search_players_loose(q)]
-        return JSONResponse({"ok": True, "q": q, "players_ready": PLAYERS_READY, "hits": hits})
+    if action == "names":
+        return JSONResponse({"ok": True, "names": _NAMES_RU})
     return PlainTextResponse("ok")
 
 # ----------------- Render wrappers (safe) -----------------
@@ -428,28 +543,16 @@ def _render_single(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,st
         _status_update(chat_id, "Готовлю плашку…")
         team_id = str(p.get("teamId") or "0")
         head = _ensure_headshot_image(p)
-        if head is None:
-            _fail(chat_id, "Не удалось получить фото игрока."); return
+        if head is None: _fail(chat_id, "Не удалось получить фото игрока."); return
         logo = _ensure_team_logo_image(team_id)
         colors = _team_colors(team_id)
-        want = dict(
-            # закругления: только справа
-            round_all=False, no_round=False,
-            round_left=False, round_right=True,
-            left_radius=0, radius=0, radius_left=0, radius_right=16,
-            # выравнивание
-            name_stat_center=True,
-            text_topmost=True
-        )
         png = _call_render(
             render_card,
-            "single", ru, "", logo, colors, head, stats,
-            **want
+            "single", ru, "", logo, colors, head, stats
         )
         sent = _tg_send_png_as_document(chat_id, png, filename=f"card_{p.get('personId','x')}.png", caption=_stats_text(stats))
         if not sent.get("ok"):
-            _fail(chat_id, f"Ошибка отправки PNG: {sent.get('error') or sent}")
-            return
+            _fail(chat_id, f"Ошибка отправки PNG: {sent.get('error') or sent}"); return
         if ask_corrections:
             _status_update(chat_id, "Готово. Всё ок или нужно исправить?", keep_kb=_kb_ok_or_fix())
     except Exception as e:
@@ -459,23 +562,12 @@ def _render_bad(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,str]]
     try:
         _status_update(chat_id, "Готовлю коричневую BAD-плашку…")
         head = _ensure_headshot_image(p)
-        if head is None:
-            _fail(chat_id, "Не удалось получить фото игрока."); return
+        if head is None: _fail(chat_id, "Не удалось получить фото игрока."); return
         logo = _ensure_team_logo_image(str(p.get("teamId") or "0"))
-        want = dict(
-            # только справа
-            round_all=False, no_round=False,
-            round_left=False, round_right=True,
-            left_radius=0, radius=0, radius_left=0, radius_right=16,
-            # визуал BAD
-            poop_larger=True, poop_lower=20,
-            # центрирование
-            name_stat_center=True
-        )
         png = _call_render(
             render_card_bad,
             ru, head, stats,
-            team_logo_img=logo, **want
+            team_logo_img=logo
         )
         sent = _tg_send_png_as_document(chat_id, png, filename=f"cardBAD_{p.get('personId','x')}.png", caption=_stats_text(stats))
         if not sent.get("ok"):
@@ -490,28 +582,14 @@ def _render_duo(chat_id:int, p1:Dict[str,Any], ru1:str, st1:List[Tuple[str,str]]
         _status_update(chat_id, "Готовлю двойную плашку…")
         t1, t2 = str(p1.get("teamId") or "0"), str(p2.get("teamId") or "0")
         h1, h2 = _ensure_headshot_image(p1), _ensure_headshot_image(p2)
-        if h1 is None or h2 is None:
-            _fail(chat_id, "Не удалось получить фото одного из игроков."); return
+        if h1 is None or h2 is None: _fail(chat_id, "Не удалось получить фото одного из игроков."); return
         l1, l2 = _ensure_team_logo_image(t1), _ensure_team_logo_image(t2)
         c1, c2 = _team_colors(t1), _team_colors(t2)
 
-        want = dict(
-            # Никаких закруглений
-            round_all=False, no_round=True,
-            round_left=False, round_right=False,
-            left_radius=0, right_radius=0, radius=0, radius_left=0, radius_right=0,
-            # Центровка имени/статов
-            name_stat_center=True, duo_name_stat_center=True,
-            # Шрифты: имя ≥ статистики; статистика на 2 меньше
-            duo_autofit_names=True, duo_sync_fit=True, duo_lock_ratio=True,
-            duo_name_delta_plus=2, duo_stat_delta_minus=2,
-            duo_min_name_vs_stat=True
-        )
         png = _call_render(
             render_card2,
             ru1, l1, c1, h1, st1,
-            ru2, l2, c2, h2, st2,
-            **want
+            ru2, l2, c2, h2, st2
         )
         sent = _tg_send_png_as_document(
             chat_id, png,
@@ -529,33 +607,13 @@ def _render_special(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,s
         _status_update(chat_id, "Готовлю плашку с правой колонкой…")
         t = str(p.get("teamId") or "0")
         head = _ensure_headshot_image(p)
-        if head is None:
-            _fail(chat_id, "Не удалось получить фото игрока."); return
+        if head is None: _fail(chat_id, "Не удалось получить фото игрока."); return
         logo = _ensure_team_logo_image(t)
         colors = _team_colors(t)
-
-        # Принудительно добавляем «пустую строку» в конце правого текста
         info_text = (info_text or "").rstrip() + "\n\u00A0"
-
-        want = dict(
-            # Основная часть: закругление только справа
-            round_all=False, no_round=False,
-            round_left=False, round_right=True,
-            left_radius=0, radius=0, radius_left=0, radius_right=16,
-            # Правая панель: оба края закруглены
-            right_round_left=True, right_round_right=True,
-            right_radius_left=16, right_radius_right=16,
-            # Правая панель уже в 2 раза
-            right_panel_half_width=True, right_panel_width_ratio=0.5,
-            # Текст справа — перенос и поверх всех слоёв + нижний паддинг
-            right_wrap=True, text_topmost=True, right_text_pad_bottom=14,
-            # Центровка имени/статов
-            name_stat_center=True
-        )
         png = _call_render(
             render_card_special,
-            ru, logo, colors, head, stats, info_text,
-            **want
+            ru, logo, colors, head, stats, info_text
         )
         sent = _tg_send_png_as_document(chat_id, png, filename=f"cards_{p.get('personId','x')}.png", caption=_stats_text(stats))
         if not sent.get("ok"):
@@ -569,6 +627,11 @@ def _render_special(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,s
 async def webhook_query(request: Request):
     bad = _check_secret(request)
     if bad: return bad
+
+    # lazy init names cache
+    if not _NAMES_RU:
+        try: _maybe_init_names_cache()
+        except Exception as e: _log("[names] init error:", repr(e))
 
     try:
         body = await request.body()
@@ -684,9 +747,7 @@ async def webhook_query(request: Request):
                 idx, name_ru = m.group(1), m.group(2).strip()
                 p = st["p1"] if idx == "1" else st["p2"]
                 pid = str((p or {}).get("personId") or "")
-                try:
-                    if overrides_save_name_ru and pid: overrides_save_name_ru(pid, name_ru)
-                except Exception: pass
+                _local_set_ru(pid, name_ru, persist=True)
                 st["ru1" if idx=="1" else "ru2"] = name_ru
                 st["fix_wait"] = None
             elif fw == "name_one":
@@ -696,9 +757,7 @@ async def webhook_query(request: Request):
                 name_ru = m.group(1).strip()
                 p = st.get("p1") or {}
                 pid = str(p.get("personId") or "")
-                try:
-                    if overrides_save_name_ru and pid: overrides_save_name_ru(pid, name_ru)
-                except Exception: pass
+                _local_set_ru(pid, name_ru, persist=True)
                 st["ru1"] = name_ru
                 st["fix_wait"] = None
             elif fw == "teams_map":
@@ -733,11 +792,11 @@ async def webhook_query(request: Request):
         try:
             rtxt = (rpl.get("text") or "") + " " + (rpl.get("caption") or "")
             m = re.search(r"\[setname:(\d+)\]", rtxt)
-            if m and overrides_save_name_ru:
+            if m:
                 pid = m.group(1)
                 name_ru = text.strip()
                 try:
-                    overrides_save_name_ru(pid, name_ru)
+                    _local_set_ru(pid, name_ru, persist=True)
                     _status_update(chat_id, f"Сохранил имя для {pid}: {name_ru}")
                 except Exception as e:
                     _fail(chat_id, f"Не удалось сохранить имя: {repr(e)}"); return PlainTextResponse("OK")
@@ -820,9 +879,10 @@ async def webhook_query(request: Request):
             pid = str(p.get("personId") or "")
             st.clear(); st.update({"mode":"single","p1":p,"stats1":stats,"last_cmd_msg_id":msg.get("message_id"),
                                    "status_mid": st.get("status_mid")})
-            ru = None
-            try: ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
-            except Exception: pass
+            ru = _local_get_ru(pid) or ""
+            if not ru:
+                try: ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
+                except Exception: ru = None
             if not ru:
                 _ask_ru_name(chat_id, pid, p.get("displayName") or "", reply_to=st.get("last_cmd_msg_id"))
                 _status_update(chat_id, "Жду русское имя… Ответьте на сообщение выше.")
@@ -861,11 +921,14 @@ async def webhook_query(request: Request):
             })
 
             pid1, pid2 = str(p1.get("personId") or ""), str(p2.get("personId") or "")
-            ru1 = ru2 = None
-            try: ru1 = overrides_get_name_ru(pid1) if overrides_get_name_ru else None
-            except Exception: pass
-            try: ru2 = overrides_get_name_ru(pid2) if overrides_get_name_ru else None
-            except Exception: pass
+            ru1 = _local_get_ru(pid1) or None
+            ru2 = _local_get_ru(pid2) or None
+            if not ru1 and overrides_get_name_ru:
+                try: ru1 = overrides_get_name_ru(pid1)
+                except Exception: ru1 = None
+            if not ru2 and overrides_get_name_ru:
+                try: ru2 = overrides_get_name_ru(pid2)
+                except Exception: ru2 = None
 
             if not ru1:
                 _ask_ru_name(chat_id, pid1, p1.get("displayName") or "", reply_to=st.get("last_cmd_msg_id"))
@@ -902,9 +965,10 @@ async def webhook_query(request: Request):
             st.clear(); st.update({"mode":"special","p1":p,"stats1":stats,"info":info_text,
                                    "last_cmd_msg_id":msg.get("message_id"),
                                    "status_mid": st.get("status_mid")})
-            ru = None
-            try: ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
-            except Exception: pass
+            ru = _local_get_ru(pid) or None
+            if not ru and overrides_get_name_ru:
+                try: ru = overrides_get_name_ru(pid)
+                except Exception: ru = None
             if not ru:
                 _ask_ru_name(chat_id, pid, p.get("displayName") or "", reply_to=st.get("last_cmd_msg_id"))
                 _status_update(chat_id, "Жду русское имя… Ответьте на сообщение выше.")
@@ -935,9 +999,10 @@ async def webhook_query(request: Request):
             st.clear(); st.update({"mode":"bad","p1":p,"stats1":stats,
                                    "last_cmd_msg_id":msg.get("message_id"),
                                    "status_mid": st.get("status_mid")})
-            ru = None
-            try: ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
-            except Exception: pass
+            ru = _local_get_ru(pid) or None
+            if not ru and overrides_get_name_ru:
+                try: ru = overrides_get_name_ru(pid)
+                except Exception: ru = None
             if not ru:
                 _ask_ru_name(chat_id, pid, p.get("displayName") or "", reply_to=st.get("last_cmd_msg_id"))
                 _status_update(chat_id, "Жду русское имя… Ответьте на сообщение выше.")
