@@ -1,591 +1,453 @@
-# api/telegram.py
-# Webhook FastAPI для Телеграма. Поддержка: /start /help /stop /find /card /cards /card2 /cardbad(/bad)
-# Поток:
-# 1) /card* -> поиск -> если нет RU-имени, спрашиваем (reply) -> рендер -> PNG как документ.
-# 2) Любая ошибка рендера — отправляем ❌ и текст ошибки.
+# graphics.py
+# Рендер плашек: render_card, render_card2, render_card_bad, render_card_special
+# Без зависимостей от api/telegram — чтобы не было круговых импортов.
 
 from __future__ import annotations
-import os, io, re, json, time, unicodedata, uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Tuple, Optional
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+import io, os, math
 
-from fastapi import FastAPI, Request
-from starlette.responses import JSONResponse, PlainTextResponse
+# ------------------------- Утилиты -------------------------
 
-from urllib.request import Request as UrlRequest, urlopen as http_urlopen
-from urllib.error import HTTPError, URLError
-
-DEBUG = os.getenv("DEBUG", "1") in ("1","true","yes")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET","").strip()
-BOT_TOKEN = os.getenv("BOT_TOKEN","").strip()
-API_ORIGIN = os.getenv("API_ORIGIN") or None
-
-def _log(*a: Any) -> None:
-    try: print(*a, flush=True)
-    except: pass
-
-def _safe_import(modname: str, names: List[str]) -> Tuple[Optional[Any], List[Any], Optional[str]]:
+def _hex_to_rgb(h: Optional[str], default=(16, 24, 40)) -> Tuple[int,int,int]:
+    if not h:
+        return default
+    h = h.strip().lstrip("#")
+    if len(h) == 3:
+        h = "".join(c*2 for c in h)
     try:
-        m = __import__(modname, fromlist=names)
-        out = [getattr(m, n) for n in names]
-        return m, out, None
-    except Exception as e:
-        return None, [], f"{e.__class__.__name__}: {e}"
-
-# -------- deps --------
-_data_mod, _data_objs, _data_err = _safe_import("data", [
-    "get_players", "refresh_players", "find_player_by_name",
-    "display_name_for", "overrides_save_name_ru", "overrides_get_name_ru",
-    "ensure_headshot_png", "ensure_team_logo_png"
-])
-if _data_err and DEBUG: _log("[boot] data import error:", _data_err)
-(get_players, refresh_players, find_player_by_name,
- display_name_for, overrides_save_name_ru, overrides_get_name_ru,
- ensure_headshot_png, ensure_team_logo_png) = ([_ for _ in _data_objs] + [None]*8)[:8]
-
-_brand_mod, _brand_objs, _brand_err = _safe_import("team_brand", [
-    "get_team_brand", "color_name_ru", "set_team_primary_color"
-])
-if _brand_err and DEBUG: _log("[boot] team_brand import error:", _brand_err)
-(get_team_brand, color_name_ru, set_team_primary_color) = ([_ for _ in _brand_objs] + [None]*3)[:3]
-
-_graphics_mod, _graphics_objs, _graphics_err = _safe_import("graphics", [
-    "render_card", "render_card2", "render_card_bad", "render_card_special"
-])
-if _graphics_err and DEBUG: _log("[boot] graphics import error:", _graphics_err)
-(render_card, render_card2, render_card_bad, render_card_special) = ([_ for _ in _graphics_objs] + [None]*4)[:4]
-
-app = FastAPI()
-
-# -------- Telegram HTTP --------
-
-def _http_json(url: str, payload: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = UrlRequest(url, data=body, headers={"Content-Type":"application/json"})
-    with http_urlopen(req, timeout=timeout) as r:
-        raw = r.read()
-    try:
-        return json.loads(raw.decode("utf-8"))
+        return tuple(int(h[i:i+2], 16) for i in (0,2,4))  # type: ignore
     except Exception:
-        return {"ok": False, "raw": raw.decode("utf-8","ignore")}
+        return default
 
-def _tg_post(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        return _http_json(_tg_url(method), payload)
-    except HTTPError as e:
-        if DEBUG: _log("[tg] HTTPError", method, e)
-        return {"ok": False, "error": f"HTTPError {e.code}"}
-    except URLError as e:
-        if DEBUG: _log("[tg] URLError", method, e)
-        return {"ok": False, "error": "URLError"}
-    except Exception as e:
-        if DEBUG: _log("[tg] send error:", repr(e))
-        return {"ok": False, "error": repr(e)}
-
-def _tg_send_message(chat_id: int, text: str, reply_to: Optional[int]=None, parse_mode: Optional[str]=None):
-    payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
-    if reply_to:
-        payload["reply_to_message_id"] = reply_to
-        payload["allow_sending_without_reply"] = True
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    return _tg_post("sendMessage", payload)
-
-def _tg_edit_message(chat_id: int, message_id: int, text: str, parse_mode: Optional[str]=None):
-    payload: Dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    return _tg_post("editMessageText", payload)
-
-def _multipart_boundary() -> str:
-    return "----WebKitFormBoundary" + uuid.uuid4().hex
-
-def _encode_multipart(fields: Dict[str,str], files: Dict[str,Tuple[str,bytes,str]]) -> Tuple[bytes,str]:
-    boundary = _multipart_boundary()
-    lines: List[bytes] = []
-    for k,v in fields.items():
-        lines.append(b"--"+boundary.encode())
-        lines.append(f'Content-Disposition: form-data; name="{k}"'.encode())
-        lines.append(b"")
-        lines.append(v.encode("utf-8"))
-    for field,(filename,content,ctype) in files.items():
-        lines.append(b"--"+boundary.encode())
-        lines.append(f'Content-Disposition: form-data; name="{field}"; filename="{filename}"'.encode())
-        lines.append(f"Content-Type: {ctype}".encode())
-        lines.append(b"")
-        lines.append(content)
-    lines.append(b"--"+boundary.encode()+b"--")
-    body = b"\r\n".join(lines)
-    return body, f"multipart/form-data; boundary={boundary}"
-
-def _tg_send_png_as_document(chat_id: int, png_bytes: bytes, filename: str="card.png", caption: Optional[str]=None):
-    url = _tg_url("sendDocument")
-    fields = {"chat_id": str(chat_id)}
-    if caption: fields["caption"] = caption
-    body, ctype = _encode_multipart(fields, {"document": (filename, png_bytes, "image/png")})
-    req = UrlRequest(url, data=body, headers={"Content-Type": ctype})
-    try:
-        with http_urlopen(req, timeout=30) as r:
-            raw = r.read().decode("utf-8","ignore")
-            try: return json.loads(raw)
-            except: return {"ok": False, "raw": raw}
-    except Exception as e:
-        if DEBUG: _log("[tg] sendDocument error:", repr(e))
-        return {"ok": False, "error": repr(e)}
-
-# -------- helpers domain --------
-PLAYERS_READY = False
-
-def _normalize(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = s.replace("ё","е")
-    keep = "abcdefghijklmnopqrstuvwxyzабвгдеёжзийклмнопрстуфхцчшщьыъэюя -'/"
-    s = "".join(ch for ch in s if ch in keep)
-    return " ".join(s.split())
-
-def _img_to_png_bytes(obj: Any) -> bytes:
-    if isinstance(obj, (bytes, bytearray)):
-        return bytes(obj)
-    try:
-        bio = io.BytesIO()
-        obj.save(bio, "PNG")
-        return bio.getvalue()
-    except Exception:
-        # если графика уже вернула bytes-строку, но тип странный (memoryview и т.п.)
-        return bytes(obj)
-
-def ensure_players_loaded(force: bool=False) -> List[Dict[str,Any]]:
-    global PLAYERS_READY
-    try:
-        ps = get_players(force_refresh=bool(force)) if get_players else []
-        if not ps or len(ps) < 100:
-            if refresh_players:
-                cnt, _src = refresh_players()
-                _log("[players] refresh:", cnt, _src)
-                ps = get_players(force_refresh=False) if get_players else []
-        PLAYERS_READY = bool(ps and len(ps) >= 100)
-        _log(f"[players] ready={PLAYERS_READY} count={len(ps) if ps else 0}")
-        return ps or []
-    except Exception as e:
-        _log("[players] ensure failed:", repr(e))
-        PLAYERS_READY = False
-        return []
-
-def search_players_loose(q: str) -> List[Dict[str,Any]]:
-    qn = _normalize(q)
-    ps = ensure_players_loaded(False)
-    if find_player_by_name:
+def _ensure_font(size: int, bold: bool=False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    # Попытка системных шрифтов; затемfallback
+    candidates = []
+    if bold:
+        candidates += ["Arial Bold.ttf", "arialbd.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
+    else:
+        candidates += ["Arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
+    for path in candidates:
         try:
-            hits = find_player_by_name(q)
-            if hits: return hits
+            return ImageFont.truetype(path, size=size)
         except Exception:
-            pass
-    out = []
-    for p in ps:
-        dn = p.get("displayName") or f"{p.get('firstName','')} {p.get('lastName','')}"
-        if dn and qn in _normalize(dn):
-            out.append(p)
-            if len(out) >= 10: break
-    return out
+            continue
+    return ImageFont.load_default()
 
-# ярлыки для показателей
-STAT_TOKEN_MAP = {
-    "очк": "ОЧКИ",
-    "подбор": "ПОДБОРЫ",
-    "передач": "ПЕРЕДАЧИ",
-    "перехват": "ПЕРЕХВАТЫ",
-    "блок": "БЛОКИ",
-    "стило": "СТИЛОБЛОКИ",
-    "трёш": "3-ОЧКОВЫЕ",
-    "трех": "3-ОЧКОВЫЕ",
-    "трёх": "3-ОЧКОВЫЕ",
-    "броск": "БРОСКИ С ИГРЫ",
-    "%": "%",  # % трёшек / % бросков
-    "мин": "МИНУТЫ",
-    "плюс": "ПЛЮС/МИНУС",
-    "фол": "ФОЛЫ",
-    "потер": "ПОТЕРИ",
-}
+def _textsize(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> Tuple[int,int]:
+    bbox = draw.textbbox((0,0), text, font=font)
+    return bbox[2]-bbox[0], bbox[3]-bbox[1]
 
-STAT_VALUE_RE = re.compile(
-    r"^\s*([0-9]+(?:\s*[-/]\s*[0-9]+)?(?:\s*из\s*[0-9]+)?)\s*([^\d,]*)$",
-    flags=re.IGNORECASE
-)
-
-def parse_stats_list(raw: str) -> List[Tuple[str,str]]:
-    if not raw: return []
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    out: List[Tuple[str,str]] = []
-    for p in parts:
-        m = STAT_VALUE_RE.match(p)
-        if not m: continue
-        val = m.group(1).replace("  ", " ")
-        tail = (m.group(2) or "").strip().lower()
-        label = "СТАТ"
-        for k,v in STAT_TOKEN_MAP.items():
-            if k in tail:
-                label = v
-                break
-        out.append((val, label))
-    return out
-
-def _display_name_for_player(p: Dict[str,Any]) -> str:
-    pid = str(p.get("personId") or p.get("id") or "")
-    try:
-        if overrides_get_name_ru:
-            ru = overrides_get_name_ru(pid)
-            if ru: return ru
-    except Exception:
-        pass
-    if display_name_for:
-        try: return display_name_for(p)
-        except Exception: pass
-    return p.get("displayName") or f"{p.get('firstName','').strip()} {p.get('lastName','').strip()}".strip()
-
-def _ensure_headshot_image(p: Dict[str,Any]):
-    from PIL import Image
-    try:
-        hs = ensure_headshot_png(p) if ensure_headshot_png else None
-        if hs is None: return None
-        if isinstance(hs, bytes):
-            return Image.open(io.BytesIO(hs)).convert("RGBA")
-        if isinstance(hs, str):
-            return Image.open(hs).convert("RGBA")
-        return hs.convert("RGBA")
-    except Exception as e:
-        _log("[tg] headshot ensure err", p.get("personId"), repr(e)); return None
-
-def _ensure_team_logo_image(team_id: str):
-    from PIL import Image
-    try:
-        path = ensure_team_logo_png(team_id) if ensure_team_logo_png else None
-        if path and os.path.exists(path):
-            return Image.open(path).convert("RGBA")
-        brand = get_team_brand(team_id) if get_team_brand else None
-        if brand:
-            _, logo_path, _, _ = brand
-            if logo_path and os.path.exists(logo_path):
-                return Image.open(logo_path).convert("RGBA")
-        return None
-    except Exception as e:
-        _log("[tg] team logo ensure err", team_id, repr(e)); return None
-
-def _team_brand_tuple(team_id: str):
-    try:
-        colors, logo_path, palette, saved = get_team_brand(team_id) if get_team_brand else (("#0A2A4A","#081E36","#0A2A4A"), None, [], False)
-        logo_img = None
-        if logo_path and os.path.exists(logo_path):
-            from PIL import Image
-            logo_img = Image.open(logo_path).convert("RGBA")
-        return colors, logo_img, palette, saved
-    except Exception as e:
-        _log("[tg] team_brand err", team_id, repr(e))
-        return (("#0A2A4A","#081E36","#0A2A4A"), None, [], False)
-
-# -------- state tags --------
-SETNAME_TAG_RE = re.compile(r"\[setname:(\d+)\]")
-
-def _check_secret(req: Request):
-    s = (req.query_params.get("secret") or "").strip()
-    if not WEBHOOK_SECRET or s != WEBHOOK_SECRET:
-        return PlainTextResponse("bad secret", status_code=401)
-    return None
-
-# -------- GET --------
-@app.get("/api/telegram")
-async def telegram_get(request: Request):
-    bad = _check_secret(request)
-    if bad: return bad
-    action = (request.query_params.get("action") or "").strip().lower()
-    if action == "diag":
-        return JSONResponse({
-            "ok": True,
-            "py": ".".join(map(str, __import__("sys").version_info[:3])),
-            "platform": __import__("platform").system().lower(),
-            "has_bot_token": bool(BOT_TOKEN),
-            "modules": {
-                "data": "ok" if _data_err is None else "error",
-                "graphics": "ok" if _graphics_err is None else "error",
-                "team_brand": "ok" if _brand_err is None else "error",
-            },
-            "errors": {"data": _data_err, "graphics": _graphics_err, "team_brand": _brand_err},
-            "api_origin": API_ORIGIN,
-        })
-    if action == "refresh":
-        try:
-            cnt, src = refresh_players()
-            try:
-                cur = get_players(False); cnt = len(cur) if isinstance(cur, list) else int(cnt)
-            except Exception: pass
-            return JSONResponse({"ok": True, "refreshed": True, "players_indexed": int(cnt),
-                                 "source": ("custom" if src else "none"), "source_url": (src or None)})
-        except Exception as e:
-            return JSONResponse({"ok": False, "refreshed": False, "error": repr(e)}, status_code=500)
-    if action == "test_find":
-        q = request.query_params.get("q") or ""
-        hits = search_players_loose(q)
-        return JSONResponse({"ok": True, "q": q, "players_ready": PLAYERS_READY,
-                             "hits": [{"id": h.get("personId"), "name": h.get("displayName"), "teamId": h.get("teamId")} for h in hits[:10]]})
-    return PlainTextResponse("OK")
-
-HELP = (
-    "Команды:\n"
-    "• /find <имя> — поиск игрока\n"
-    "• /card <имя> | <стата>\n"
-    "• /cards <имя> | <стата> | <надпись справа>\n"
-    "• /card2 <A> | <статаA> || <B> | <статаB>\n"
-    "• /cardbad <имя> | <стата>\n"
-    "• /stop — сбросить контекст\n"
-)
-
-# -------- POST (webhook) --------
-@app.post("/api/telegram")
-async def telegram_post(request: Request):
-    bad = _check_secret(request)
-    if bad: return bad
-
-    rid = f"[RID={int(time.time()*1000)}-{uuid.uuid4().hex[:6]}]"
-    raw = (await request.body()).decode("utf-8","ignore")
-    if DEBUG: _log("[tg] ", rid, "POST", request.url, "\nbody:", raw)
-    try:
-        upd = json.loads(raw)
-    except Exception:
-        return PlainTextResponse("OK")
-
-    # /stop
-    msg = upd.get("message") or upd.get("edited_message")
-    cb  = upd.get("callback_query")
-    if msg and isinstance(msg.get("text"), str) and msg["text"].strip().lower().startswith("/stop"):
-        _tg_send_message(msg["chat"]["id"], "Готово. Контекст сброшен ✅")
-        return PlainTextResponse("OK")
-
-    # обработка ответа с русским именем (reply на вопрос)
-    if msg and msg.get("reply_to_message"):
-        rtxt = (msg["reply_to_message"].get("text") or "") + " " + (msg["reply_to_message"].get("caption") or "")
-        m = SETNAME_TAG_RE.search(rtxt)
-        if m and overrides_save_name_ru:
-            pid = m.group(1)
-            try:
-                overrides_save_name_ru(pid, msg["text"].strip())
-                _tg_send_message(msg["chat"]["id"], f"Сохранил имя для {pid}: {msg['text'].strip()}")
-            except Exception as e:
-                _tg_send_message(msg["chat"]["id"], f"Не удалось сохранить имя: {e!r}")
-            return PlainTextResponse("OK")
-
-    # callback-кнопки цвета (если будут)
-    if cb:
-        data = cb.get("data") or ""
-        if data.startswith("color:"):
-            _tg_post("answerCallbackQuery", {"callback_query_id": cb["id"], "text": "Цвет применён"})
-            return PlainTextResponse("OK")
-
-    if not msg:
-        return PlainTextResponse("OK")
-
-    chat_id = msg["chat"]["id"]
-    text = (msg.get("text") or "").strip()
-    low = text.lower()
-
-    # --- команды ---
-    if low.startswith("/start"):
-        _tg_send_message(chat_id, "Я здесь. Готов работать 💼\n\n"+HELP)
-        return PlainTextResponse("OK")
-    if low.startswith("/help"):
-        _tg_send_message(chat_id, HELP)
-        return PlainTextResponse("OK")
-    if low.startswith("/find"):
-        q = text[5:].strip()
-        hits = search_players_loose(q)
-        if not hits:
-            _tg_send_message(chat_id, "Ничего не нашёл 🤷")
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> List[str]:
+    words = text.replace("\n", " ").split()
+    lines: List[str] = []
+    cur = ""
+    for w in words:
+        test = w if not cur else f"{cur} {w}"
+        wpx,_ = _textsize(draw, test, font)
+        if wpx <= max_width:
+            cur = test
         else:
-            lines = [f"{h.get('displayName')} (id={h.get('personId')}, teamId={h.get('teamId')})" for h in hits[:8]]
-            _tg_send_message(chat_id, "\n".join(lines))
-        return PlainTextResponse("OK")
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
 
-    # ---- /cardbad | /bad ----
-    if low.startswith("/cardbad") or low.startswith("/bad"):
-        args = text.split(" ", 1)[1] if " " in text else ""
-        parts = [p.strip() for p in args.split("|")]
-        if len(parts) < 2:
-            _tg_send_message(chat_id, "Формат: /cardbad <имя> | <стата>")
-            return PlainTextResponse("OK")
-        qname, raw_stats = parts[0], parts[1]
-        stats = parse_stats_list(raw_stats)
+def _paste_centered(img: Image.Image, src: Image.Image, box: Tuple[int,int,int,int]):
+    # Вписываем по центру со сохранением пропорций
+    bx, by, bw, bh = box[0], box[1], box[2]-box[0], box[3]-box[1]
+    if src.width == 0 or src.height == 0:
+        return
+    scale = min(bw/src.width, bh/src.height)
+    sw, sh = max(1, int(src.width*scale)), max(1, int(src.height*scale))
+    src2 = src.resize((sw, sh), Image.LANCZOS)
+    px = bx + (bw - sw)//2
+    py = by + (bh - sh)//2
+    img.alpha_composite(src2, (px, py))
 
-        _tg_send_message(chat_id, "_Ищу игрока…_", parse_mode="Markdown")
-        hits = search_players_loose(qname)
-        if not hits:
-            _tg_send_message(chat_id, f"Не нашёл игрока: {qname}")
-            return PlainTextResponse("OK")
-        p = hits[0]
-        pid = str(p.get("personId") or "")
-        ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
-        if not ru:
-            _tg_send_message(
-                chat_id,
-                f"Как подписать игрока *{p.get('displayName')}* на плашке?\nОтветьте на это сообщение русским именем.\n[setname:{pid}]",
-                reply_to=msg["message_id"], parse_mode="Markdown"
-            )
-            return PlainTextResponse("OK")
+def _round_mask(w: int, h: int, r: int, left: bool, right: bool) -> Image.Image:
+    # Маска для скруглений по сторонам (левые и/или правые углы)
+    mask = Image.new("L", (w,h), 255)
+    if r <= 0:
+        return mask
+    d = ImageDraw.Draw(mask)
 
-        team_id = str(p.get("teamId") or "0")
-        colors, _, _, _ = _team_brand_tuple(team_id)  # игнор — cardbad всегда коричневая в графике
-        head = _ensure_headshot_image(p)
-        if head is None:
-            _tg_send_message(chat_id, "❌ Не удалось получить фото игрока"); return PlainTextResponse("OK")
+    # зальём прозрачным и восстановим прямоугольник по центру — так проще
+    mask.paste(0, (0,0,w,h))
+    rect = Image.new("L", (w,h), 255)
+    mask = ImageChops_overlay(mask, rect)  # заполнить
 
-        try:
-            _tg_send_message(chat_id, "_Готовлю плашку…_", parse_mode="Markdown")
-            img = render_card_bad(ru, "", None, colors, head, stats)  # графика сама поставит 💩 и коричневый
-            png = _img_to_png_bytes(img)
-            _tg_send_png_as_document(chat_id, png, filename=f"cardBAD_{pid}.png")
-        except Exception as e:
-            _tg_send_message(chat_id, f"❌ Ошибка рендера: {e!r}")
-        return PlainTextResponse("OK")
+    # затрём углы при необходимости
+    def cut_corner(cx, cy):
+        corner = Image.new("L", (r*2, r*2), 0)
+        cd = ImageDraw.Draw(corner)
+        cd.pieslice((0,0,r*2,r*2), 0, 360, fill=255)
+        mask.paste(corner, (cx, cy), corner)
 
-    # ---- /cards ----
-    if low.startswith("/cards"):
-        args = text.split(" ", 1)[1] if " " in text else ""
-        parts = [p.strip() for p in args.split("|")]
-        if len(parts) < 3:
-            _tg_send_message(chat_id, "Формат: /cards <имя> | <стата> | <надпись справа>")
-            return PlainTextResponse("OK")
+    # по умолчанию все скруглены, мы хотим selectively
+    # Реализуем как наложение непрозрачности: сначала прямоугольник, затем дорисуем «дырки» квадратами
+    # Проще: вручную рисуем чёрные квадраты там, где НЕ нужно скругление (но мы хотим скругление справа/слева)
+    # Сделаем наоборот: создадим полную маску без скруглений, затем дорисуем скругленные углы.
+    # Чтобы не усложнять — воспользуемся готовой функцией с вычитанием прямых углов.
+    # (Ниже — простой рабочий подход без лишних изысков)
+    mask = Image.new("L", (w,h), 255)
+    d = ImageDraw.Draw(mask)
+    d.rectangle([0,0,w,h], fill=255)
 
-        qname, raw_stats, right_text = parts[0], parts[1], parts[2]
-        stats = parse_stats_list(raw_stats)
+    if right:
+        # правый верхний
+        corner = Image.new("L", (r*2, r*2), 0)
+        cd = ImageDraw.Draw(corner)
+        cd.pieslice((0,0,r*2,r*2), 180, 270, fill=255)
+        mask.paste(corner, (w - 2*r, 0), corner)
+        # правый нижний
+        corner2 = Image.new("L", (r*2, r*2), 0)
+        cd2 = ImageDraw.Draw(corner2)
+        cd2.pieslice((0,0,r*2,r*2), 90, 180, fill=255)
+        mask.paste(corner2, (w - 2*r, h - 2*r), corner2)
+    if left:
+        # левый верхний
+        corner3 = Image.new("L", (r*2, r*2), 0)
+        cd3 = ImageDraw.Draw(corner3)
+        cd3.pieslice((0,0,r*2,r*2), 270, 360, fill=255)
+        mask.paste(corner3, (0, 0), corner3)
+        # левый нижний
+        corner4 = Image.new("L", (r*2, r*2), 0)
+        cd4 = ImageDraw.Draw(corner4)
+        cd4.pieslice((0,0,r*2,r*2), 0, 90, fill=255)
+        mask.paste(corner4, (0, h - 2*r), corner4)
+    return mask
 
-        _tg_send_message(chat_id, "_Ищу игрока…_", parse_mode="Markdown")
-        hits = search_players_loose(qname)
-        if not hits:
-            _tg_send_message(chat_id, f"Не нашёл игрока: {qname}")
-            return PlainTextResponse("OK")
-        p = hits[0]
-        pid = str(p.get("personId") or "")
-        ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
-        if not ru:
-            _tg_send_message(
-                chat_id,
-                f"Как подписать игрока *{p.get('displayName')}* на плашке?\nОтветьте на это сообщение русским именем.\n[setname:{pid}]",
-                reply_to=msg["message_id"], parse_mode="Markdown"
-            )
-            return PlainTextResponse("OK")
+def ImageChops_overlay(a: Image.Image, b: Image.Image) -> Image.Image:
+    # простой overlay fill; в данном файле используем как «присваивание»
+    out = a.copy()
+    out.paste(b)
+    return out
 
-        team_id = str(p.get("teamId") or "0")
-        colors, logo_img, _, _ = _team_brand_tuple(team_id)
-        head = _ensure_headshot_image(p)
-        if head is None:
-            _tg_send_message(chat_id, "❌ Не удалось получить фото игрока"); return PlainTextResponse("OK")
+def _ensure_rgba(img: Optional[Image.Image]) -> Optional[Image.Image]:
+    if img is None: return None
+    if img.mode != "RGBA":
+        return img.convert("RGBA")
+    return img
 
-        try:
-            _tg_send_message(chat_id, "_Готовлю плашку…_", parse_mode="Markdown")
-            # special: слева обычная плашка, справа — блок со ⭐ и переносами
-            img = render_card_special(ru, "", logo_img, colors, head, stats, right_text)
-            png = _img_to_png_bytes(img)
-            _tg_send_png_as_document(chat_id, png, filename=f"cards_{pid}.png")
-        except Exception as e:
-            _tg_send_message(chat_id, f"❌ Ошибка рендера: {e!r}")
-        return PlainTextResponse("OK")
+def _with_circle(img: Image.Image, diameter: int) -> Image.Image:
+    # Обрезать в круг
+    size = (diameter, diameter)
+    img2 = img.resize(size, Image.LANCZOS)
+    mask = Image.new("L", size, 0)
+    d = ImageDraw.Draw(mask)
+    d.ellipse([0,0,diameter,diameter], fill=255)
+    out = Image.new("RGBA", size, (0,0,0,0))
+    out.paste(img2, (0,0), mask)
+    return out
 
-    # ---- /card2 ----
-    if low.startswith("/card2"):
-        args = text.split(" ", 1)[1] if " " in text else ""
-        sides = [s.strip() for s in args.split("||")]
-        if len(sides) != 2:
-            _tg_send_message(chat_id, "Формат: /card2 A | <статаA> || B | <статаB>")
-            return PlainTextResponse("OK")
+def _auto_font_to_fit(draw: ImageDraw.ImageDraw, text: str, min_size: int, max_size: int, max_width: int, bold=False) -> ImageFont.ImageFont:
+    lo, hi = min_size, max_size
+    best = _ensure_font(min_size, bold=bold)
+    while lo <= hi:
+        mid = (lo+hi)//2
+        f = _ensure_font(mid, bold=bold)
+        w,_ = _textsize(draw, text, f)
+        if w <= max_width:
+            best = f
+            lo = mid+1
+        else:
+            hi = mid-1
+    return best
 
-        def _parse_side(s: str) -> Tuple[str, List[Tuple[str,str]]]:
-            parts = [p.strip() for p in s.split("|")]
-            if len(parts) < 2: return s.strip(), []
-            return parts[0], parse_stats_list(parts[1])
+def _compose_base(width: int, height: int, bg=(0,0,0,0)) -> Image.Image:
+    return Image.new("RGBA", (width, height), bg)
 
-        nameA, statsA = _parse_side(sides[0])
-        nameB, statsB = _parse_side(sides[1])
+# ------------------------- Общие параметры -------------------------
 
-        _tg_send_message(chat_id, "_Ищу игроков…_", parse_mode="Markdown")
-        hitsA = search_players_loose(nameA); hitsB = search_players_loose(nameB)
-        if not hitsA: _tg_send_message(chat_id, f"Не нашёл игрока: {nameA}"); return PlainTextResponse("OK")
-        if not hitsB: _tg_send_message(chat_id, f"Не нашёл игрока: {nameB}"); return PlainTextResponse("OK")
+PAD_X = 28
+PAD_Y = 22
+RADIUS = 26  # базовый радиус для скруглений
+LOGO_DIAM = 88
+LOGO_SHIFT_X = -30  # сдвиг логотипа в кружке: левее
+LOGO_SHIFT_Y = -30  # сдвиг вверх
+HEAD_W = 180
+HEAD_H = 180
 
-        pA, pB = hitsA[0], hitsB[0]
-        idA, idB = str(pA.get("personId") or ""), str(pB.get("personId") or "")
+MAIN_H = 220  # базовая высота карточек (может увеличиться для cardS при больших текстах)
 
-        ruA = overrides_get_name_ru(idA) if overrides_get_name_ru else None
-        if not ruA:
-            _tg_send_message(
-                chat_id,
-                f"Как подписать игрока *{pA.get('displayName')}* на плашке?\nОтветьте на это сообщение русским именем.\n[setname:{idA}]",
-                reply_to=msg["message_id"], parse_mode="Markdown")
-            return PlainTextResponse("OK")
-        ruB = overrides_get_name_ru(idB) if overrides_get_name_ru else None
-        if not ruB:
-            _tg_send_message(
-                chat_id,
-                f"Как подписать игрока *{pB.get('displayName')}* на плашке?\nОтветьте на это сообщение русским именем.\n[setname:{idB}]",
-                reply_to=msg["message_id"], parse_mode="Markdown")
-            return PlainTextResponse("OK")
+# ------------------------- Рендеры -------------------------
 
-        colorsA, logoA, _, _ = _team_brand_tuple(str(pA.get("teamId") or "0"))
-        colorsB, logoB, _, _ = _team_brand_tuple(str(pB.get("teamId") or "0"))
-        headA = _ensure_headshot_image(pA); headB = _ensure_headshot_image(pB)
-        if headA is None or headB is None:
-            _tg_send_message(chat_id, "❌ Не удалось получить фото одного из игроков"); return PlainTextResponse("OK")
+def render_card(name_ru: str,
+                subtitle: str,
+                logo_img: Optional[Image.Image],
+                colors: Tuple[str,str,str] | None,
+                head_img: Image.Image,
+                stats: List[Tuple[str,str]]) -> Image.Image:
+    """
+    Обычная плашка: скругления только справа; центрирование имени и статов.
+    """
+    # Цвета
+    c1 = _hex_to_rgb((colors or ("#0A2A4A","#081E36","#0A2A4A"))[0])
+    bg = c1
 
-        try:
-            _tg_send_message(chat_id, "_Готовлю плашку…_", parse_mode="Markdown")
-            img = render_card2(
-                ruA, "", logoA, colorsA, headA, statsA,
-                ruB, "", logoB, colorsB, headB, statsB
-            )
-            png = _img_to_png_bytes(img)
-            _tg_send_png_as_document(chat_id, png, filename=f"card2_{idA}_{idB}.png")
-        except Exception as e:
-            _tg_send_message(chat_id, f"❌ Ошибка рендера: {e!r}")
-        return PlainTextResponse("OK")
+    # Канва
+    W = 1200  # временно макс, потом обрежем по содержимому
+    H = MAIN_H
+    base = _compose_base(W, H)
+    draw = ImageDraw.Draw(base)
 
-    # ---- /card ----
-    if low.startswith("/card"):
-        args = text.split(" ", 1)[1] if " " in text else ""
-        parts = [p.strip() for p in args.split("|")]
-        if len(parts) < 2:
-            _tg_send_message(chat_id, "Формат: /card <имя> | <стата>")
-            return PlainTextResponse("OK")
-        qname, raw_stats = parts[0], parts[1]
-        stats = parse_stats_list(raw_stats)
+    # Шрифты
+    name_font = _ensure_font(52, bold=True)
+    stat_val_font = _ensure_font(48, bold=True)
+    stat_lab_font = _ensure_font(28, bold=False)
 
-        _tg_send_message(chat_id, "_Ищу игрока…_", parse_mode="Markdown")
-        hits = search_players_loose(qname)
-        if not hits:
-            _tg_send_message(chat_id, f"Не нашёл игрока: {qname}")
-            return PlainTextResponse("OK")
-        p = hits[0]
-        pid = str(p.get("personId") or "")
-        ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
-        if not ru:
-            _tg_send_message(
-                chat_id,
-                f"Как подписать игрока *{p.get('displayName')}* на плашке?\n"
-                f"Ответьте на это сообщение русским именем.\n[setname:{pid}]",
-                reply_to=msg["message_id"], parse_mode="Markdown")
-            return PlainTextResponse("OK")
+    # Измерим ширину по контенту
+    name_w, name_h = _textsize(draw, name_ru, name_font)
+    stat_blocks = []
+    sb_w_total = 0
+    gap_stat = 26
+    for val, lab in stats[:4]:  # 4 столбца максимум для компактности
+        vw, vh = _textsize(draw, str(val), stat_val_font)
+        lw, lh = _textsize(draw, str(lab), stat_lab_font)
+        bw = max(vw, lw) + 12
+        bh = vh + 6 + lh
+        stat_blocks.append((bw,bh,vw,vh,lw,lh,val,lab))
+        sb_w_total += bw
+    inner_w = max(name_w, sb_w_total + gap_stat*(max(0, len(stat_blocks)-1)))
+    inner_w += PAD_X*2 + HEAD_W + 40 + LOGO_DIAM  # место под аватар и логотип
+    W_eff = min(W, inner_w)
 
-        team_id = str(p.get("teamId") or "0")
-        colors, logo_img, _, _ = _team_brand_tuple(team_id)
-        head = _ensure_headshot_image(p)
-        if head is None:
-            _tg_send_message(chat_id, "❌ Не удалось получить фото игрока"); return PlainTextResponse("OK")
+    # Фон с правым скруглением
+    bg_layer = Image.new("RGBA", (W_eff, H), (*bg, 255))
+    mask = _round_mask(W_eff, H, RADIUS, left=False, right=True)
+    card = Image.new("RGBA", (W_eff, H), (0,0,0,0))
+    card.paste(bg_layer, (0,0), mask)
+    base.alpha_composite(card, (0,0))
 
-        try:
-            _tg_send_message(chat_id, "_Готовлю плашку…_", parse_mode="Markdown")
-            img = render_card(ru, "", logo_img, colors, head, stats)
-            png = _img_to_png_bytes(img)
-            _tg_send_png_as_document(chat_id, png, filename=f"card_{pid}.png")
-        except Exception as e:
-            _tg_send_message(chat_id, f"❌ Ошибка рендера: {e!r}")
-        return PlainTextResponse("OK")
+    # Логотип (круг) поверх
+    if logo_img:
+        logo_img = _ensure_rgba(logo_img)
+        circ = _with_circle(logo_img, LOGO_DIAM)
+        base.alpha_composite(circ, (PAD_X + LOGO_SHIFT_X, PAD_Y + LOGO_SHIFT_Y))
 
-    # fallback
-    _tg_send_message(chat_id, HELP)
-    return PlainTextResponse("OK")
+    # Имя и статы: центрируем по вертикали между верхним и нижним бордерами
+    content_x = PAD_X + LOGO_DIAM + 20
+    head_box = (content_x, (H-HEAD_H)//2, content_x+HEAD_W, (H-HEAD_H)//2+HEAD_H)
+
+    # Текст слева от head? Нет, по ТЗ голова справа/слева? Берём голову слева, текст — справа
+    text_x = head_box[2] + 30
+    top_y = PAD_Y
+    draw.text((text_x, top_y), name_ru, font=name_font, fill=(255,255,255,255))
+    top_y += name_h + 8
+
+    # Рисуем столбики статов по центру строки
+    x = text_x
+    y_val = top_y
+    for i,(bw,bh,vw,vh,lw,lh,val,lab) in enumerate(stat_blocks):
+        vx = x + (bw - vw)//2
+        draw.text((vx, y_val), str(val), font=stat_val_font, fill=(255,255,255,255))
+        ly = y_val + vh + 6
+        lx = x + (bw - lw)//2
+        draw.text((lx, ly), str(lab), font=stat_lab_font, fill=(230,230,230,255))
+        x += bw + gap_stat
+
+    # Фото игрока поверх всех
+    head_img = _ensure_rgba(head_img)
+    if head_img:
+        _paste_centered(base, head_img, head_box)
+
+    return base.crop((0,0,W_eff,H))
+
+
+def render_card2(name_a: str, subtitle_a: str, logo_a: Optional[Image.Image], colors_a: Tuple[str,str,str] | None, head_a: Image.Image, stats_a: List[Tuple[str,str]],
+                 name_b: str, subtitle_b: str, logo_b: Optional[Image.Image], colors_b: Tuple[str,str,str] | None, head_b: Image.Image, stats_b: List[Tuple[str,str]]) -> Image.Image:
+    """
+    Двойная плашка без скруглений вообще.
+    Размер шрифта имён >= размера статистики (на 2pt больше). Автоподгон имён.
+    """
+    H = MAIN_H
+    # Цвета
+    ca = _hex_to_rgb((colors_a or ("#0A2A4A","#081E36","#0A2A4A"))[0])
+    cb = _hex_to_rgb((colors_b or ("#0A2A4A","#081E36","#0A2A4A"))[0])
+
+    # Канва пока широкая
+    W = 1600
+    base = _compose_base(W, H)
+    draw = ImageDraw.Draw(base)
+
+    # Авто-шрифт имен: максимальная ширина каждой половины
+    half_w = (W - PAD_X*2 - 40)//2
+    name_font_a = _auto_font_to_fit(draw, name_a, 36, 64, half_w - HEAD_W - LOGO_DIAM - 40, bold=True)
+    name_font_b = _auto_font_to_fit(draw, name_b, 36, 64, half_w - HEAD_W - LOGO_DIAM - 40, bold=True)
+
+    # Шрифт статистики на 2pt меньше, чем имя (но не меньше 20)
+    stat_val_font_a = _ensure_font(max(20, name_font_a.size - 2), bold=True)
+    stat_val_font_b = _ensure_font(max(20, name_font_b.size - 2), bold=True)
+    stat_lab_font = _ensure_font( max(16, min(stat_val_font_a.size, stat_val_font_b.size) - 12), bold=False )
+
+    # Блок А фон
+    Aw = half_w
+    Abg = Image.new("RGBA", (Aw, H), (*ca, 255))
+    base.alpha_composite(Abg, (0,0))
+    # Блок B фон
+    Bw = half_w
+    Bbg = Image.new("RGBA", (Bw, H), (*cb, 255))
+    base.alpha_composite(Bbg, (Aw, 0))
+
+    # Логотипы
+    if logo_a:
+        circ_a = _with_circle(_ensure_rgba(logo_a), LOGO_DIAM)
+        base.alpha_composite(circ_a, (PAD_X + LOGO_SHIFT_X, PAD_Y + LOGO_SHIFT_Y))
+    if logo_b:
+        circ_b = _with_circle(_ensure_rgba(logo_b), LOGO_DIAM)
+        base.alpha_composite(circ_b, (Aw + PAD_X + LOGO_SHIFT_X, PAD_Y + LOGO_SHIFT_Y))
+
+    # Текст и статы — одинаковое выравнивание по обеим сторонам
+    gap_stat = 26
+
+    def draw_side(x0: int, name: str, name_font, head_img, stats):
+        draw.text((x0 + PAD_X + LOGO_DIAM + 20 + HEAD_W + 30, PAD_Y), name, font=name_font, fill=(255,255,255,255))
+        # статы
+        sx = x0 + PAD_X + LOGO_DIAM + 20 + HEAD_W + 30
+        y0 = PAD_Y + _textsize(draw, name, name_font)[1] + 8
+        # столбцы
+        for val, lab in (stats or [])[:4]:
+            vw, vh = _textsize(draw, str(val), stat_val_font_a if name_font is name_font_a else stat_val_font_b)
+            lw, lh = _textsize(draw, str(lab), stat_lab_font)
+            bw = max(vw, lw) + 12
+            vx = sx + (bw - vw)//2
+            draw.text((vx, y0), str(val), font=(stat_val_font_a if name_font is name_font_a else stat_val_font_b), fill=(255,255,255,255))
+            draw.text((sx + (bw - lw)//2, y0 + vh + 6), str(lab), font=stat_lab_font, fill=(230,230,230,255))
+            sx += bw + gap_stat
+
+        # head поверх
+        hb = (x0 + PAD_X + LOGO_DIAM + 20, (H-HEAD_H)//2, x0 + PAD_X + LOGO_DIAM + 20 + HEAD_W, (H-HEAD_H)//2 + HEAD_H)
+        _paste_centered(base, _ensure_rgba(head_img), hb)
+
+    draw_side(0, name_a, name_font_a, head_a, stats_a)
+    draw_side(Aw, name_b, name_font_b, head_b, stats_b)
+
+    return base.crop((0,0,Aw+Bw,H))
+
+
+def render_card_bad(name_ru: str,
+                    subtitle: str,
+                    logo_img: Optional[Image.Image],
+                    colors_ignored: Tuple[str,str,str] | None,
+                    head_img: Image.Image,
+                    stats: List[Tuple[str,str]]) -> Image.Image:
+    """
+    Плашка BAD: всегда коричневая; скругления только справа; рядом с именем — какашка.
+    """
+    H = MAIN_H
+    W = 1200
+    base = _compose_base(W, H)
+    draw = ImageDraw.Draw(base)
+
+    brown = (92, 64, 51)  # плохой коричневый
+    bg_layer = Image.new("RGBA", (W, H), (*brown, 255))
+    mask = _round_mask(W, H, RADIUS, left=False, right=True)
+    card = Image.new("RGBA", (W, H), (0,0,0,0))
+    card.paste(bg_layer, (0,0), mask)
+    base.alpha_composite(card, (0,0))
+
+    # имя
+    name_font = _ensure_font(56, bold=True)
+    name_w, name_h = _textsize(draw, name_ru, name_font)
+    nx = PAD_X + LOGO_DIAM + 20 + HEAD_W + 30
+    ny = PAD_Y
+    draw.text((nx, ny), name_ru, font=name_font, fill=(255,255,255,255))
+
+    # 💩 справа от имени, по нижней границе имени
+    poop = "💩"
+    emoji_font = _ensure_font(name_font.size, bold=False)
+    pw, ph = _textsize(draw, poop, emoji_font)
+    draw.text((nx + name_w + 12, ny + max(0, name_h - ph) - 18), poop, font=emoji_font, fill=(255,255,255,255))
+
+    # статы
+    stat_val_font = _ensure_font(46, bold=True)
+    stat_lab_font = _ensure_font(28, bold=False)
+    y0 = ny + name_h + 8
+    sx = nx
+    gap_stat = 26
+    for val, lab in (stats or [])[:4]:
+        vw, vh = _textsize(draw, str(val), stat_val_font)
+        lw, lh = _textsize(draw, str(lab), stat_lab_font)
+        bw = max(vw, lw) + 12
+        draw.text((sx + (bw - vw)//2, y0), str(val), font=stat_val_font, fill=(255,255,255,255))
+        draw.text((sx + (bw - lw)//2, y0 + vh + 6), str(lab), font=stat_lab_font, fill=(230,230,230,255))
+        sx += bw + gap_stat
+
+    # фото и логотип
+    if logo_img:
+        circ = _with_circle(_ensure_rgba(logo_img), LOGO_DIAM)
+        base.alpha_composite(circ, (PAD_X + LOGO_SHIFT_X, PAD_Y + LOGO_SHIFT_Y))
+    _paste_centered(base, _ensure_rgba(head_img), (PAD_X + LOGO_DIAM + 20, (H-HEAD_H)//2, PAD_X + LOGO_DIAM + 20 + HEAD_W, (H-HEAD_H)//2+HEAD_H))
+
+    # обрезка по реальной ширине
+    used_w = max(nx + name_w + 12 + pw + PAD_X, sx)
+    used_w = min(W, max(used_w, 700))
+    return base.crop((0,0,used_w,H))
+
+
+def render_card_special(name_ru: str,
+                        subtitle: str,
+                        logo_img: Optional[Image.Image],
+                        colors: Tuple[str,str,str] | None,
+                        head_img: Image.Image,
+                        stats: List[Tuple[str,str]],
+                        right_text: str) -> Image.Image:
+    """
+    Левая — как card (правые скругления). Правая узкая панель со ⭐, со скруглениями слева+справа.
+    Последняя строка не обрезается: добавляем нижний внутренний паддинг.
+    """
+    H = MAIN_H
+    base_W = 1500
+    base = _compose_base(base_W, H)
+    draw = ImageDraw.Draw(base)
+
+    # Левая
+    left = render_card(name_ru, subtitle, logo_img, colors, head_img, stats)
+    lw, lh = left.size
+    base.alpha_composite(left, (0,0))
+
+    # Правая панель
+    star = "⭐"
+    right_pad_x = 24
+    right_pad_y = 20
+    right_w = max(420, int(lw*0.42))
+    right_x = lw + 10
+    c2 = _hex_to_rgb((colors or ("#0A2A4A","#081E36","#0A2A4A"))[1])
+    layer = Image.new("RGBA", (right_w, H), (*c2, 255))
+    mask = _round_mask(right_w, H, RADIUS, left=True, right=True)
+    panel = Image.new("RGBA", (right_w, H), (0,0,0,0))
+    panel.paste(layer, (0,0), mask)
+    base.alpha_composite(panel, (right_x, 0))
+
+    # Текст: звёздочка, затем переносы, низ — с доп. паддингом
+    title_font = _ensure_font(40, bold=True)
+    body_font  = _ensure_font(32, bold=False)
+
+    # первая строка со звёздой
+    sx = right_x + right_pad_x
+    sy = right_pad_y
+    draw.text((sx, sy), star, font=title_font, fill=(255,255,255,255))
+    sw,_ = _textsize(draw, star, title_font)
+    sx_text = sx + sw + 10
+
+    max_text_w = right_x + right_w - right_pad_x - sx_text
+    lines = _wrap_text(draw, right_text, body_font, max_text_w)
+    # рисуем текст; добавляем пустую строку внизу (анти-обрезание)
+    ty = sy
+    for i, line in enumerate(lines):
+        if i == 0:
+            # первую строку — рядом со звездой
+            draw.text((sx_text, ty+6), line, font=body_font, fill=(255,255,255,255))
+        else:
+            draw.text((right_x + right_pad_x, ty), line, font=body_font, fill=(255,255,255,255))
+        _, lh2 = _textsize(draw, line, body_font)
+        ty += lh2 + 6
+    # нижний отступ
+    ty += int(body_font.size * 0.8)
+
+    # Общее изображение
+    total_w = right_x + right_w
+    return base.crop((0,0,total_w,H))
