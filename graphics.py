@@ -57,8 +57,6 @@ if _graphics_err and DEBUG: _log("[boot] graphics import error:", _graphics_err)
 app = FastAPI()
 
 # -------- Telegram HTTP --------
-def _tg_url(method: str) -> str:
-    return f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
 
 def _http_json(url: str, payload: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
