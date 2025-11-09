@@ -1,5 +1,6 @@
 # api/telegram.py
-# Webhook FastAPI для Телеграма. Поддержка: /start /help /stop /find /card /cards /card2 /cardbad(/bad)
+# Webhook FastAPI для Телеграма. Поддержка: /start /help /stop /find
+# /card, /cards, /card2, /cardbad (/bad). Автопродолжение после setname.
 
 from __future__ import annotations
 import os, io, re, json, time, unicodedata, uuid
@@ -134,17 +135,34 @@ def _tg_send_png_as_document(chat_id: int, png_bytes: bytes, filename: str="card
 # -------- helpers domain --------
 PLAYERS_READY = False
 
+# Простое состояние на время диалога (держим в памяти одной инстанции)
+PENDING: Dict[int, Dict[str, Any]] = {}
+PENDING_TTL = 600  # секунд
+
+def _state_set(chat_id: int, payload: Dict[str, Any]) -> None:
+    payload["ts"] = time.time()
+    PENDING[chat_id] = payload
+
+def _state_get(chat_id: int) -> Optional[Dict[str, Any]]:
+    d = PENDING.get(chat_id)
+    if not d: return None
+    if time.time() - d.get("ts", 0) > PENDING_TTL:
+        PENDING.pop(chat_id, None); return None
+    return d
+
+def _state_clear(chat_id: int) -> None:
+    PENDING.pop(chat_id, None)
+
 def _normalize(s: str) -> str:
     s = (s or "").strip().lower()
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.replace("ё","е")
-    keep = "abcdefghijklmnopqrstuvwxyzабвгдеёжзийклмнопрстуфхцчшщьыъэюя -'/"
+    keep = "abcdefghijklmnopqrstuvwxyzабвгдеёжзийклмнопрстуфхцчшщьыъэюя -'/"  # допускаем слэш для 3/5
     s = "".join(ch for ch in s if ch in keep)
     return " ".join(s.split())
 
 def _img_to_png_bytes(obj: Any) -> bytes:
-    # принимает: PIL.Image, bytes/bytearray/memoryview, путь
     from PIL import Image
     if obj is None:
         raise TypeError("graphics renderer returned None")
@@ -155,12 +173,7 @@ def _img_to_png_bytes(obj: Any) -> bytes:
         bio = io.BytesIO(); im.save(bio, "PNG"); return bio.getvalue()
     if getattr(obj, "save", None):
         bio = io.BytesIO()
-        try:
-            obj.save(bio, "PNG")
-        except Exception:
-            # на случай если obj не PIL.Image, но совместим
-            obj = Image.open(io.BytesIO(bytes(obj))).convert("RGBA")
-            obj.save(bio, "PNG")
+        obj.save(bio, "PNG")
         return bio.getvalue()
     raise TypeError(f"unexpected renderer return type: {type(obj)}")
 
@@ -283,13 +296,75 @@ def _team_brand_tuple(team_id: str):
         _log("[tg] team_brand err", team_id, repr(e))
         return (("#0A2A4A","#081E36","#0A2A4A"), None, [], False)
 
-SETNAME_TAG_RE = re.compile(r"\[setname:(\d+)\]")
+# ловим и [setname:123] и setname:123
+SETNAME_ANY_RE = re.compile(r"(?:\[setname:(\d+)\]|setname:(\d+))", re.I)
 
 def _check_secret(req: Request):
     s = (req.query_params.get("secret") or "").strip()
     if not WEBHOOK_SECRET or s != WEBHOOK_SECRET:
         return PlainTextResponse("bad secret", status_code=401)
     return None
+
+# ===== Переиспользуемый рендер по состоянию =====
+def _render_from_state(chat_id: int) -> None:
+    st = _state_get(chat_id)
+    if not st: return
+
+    cmd = st.get("cmd")
+    try:
+        if cmd == "card":
+            p = st["p"]; pid = st["pid"]; ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
+            if not ru: return
+            team_id = st["team_id"]
+            colors, logo_img, _, _ = _team_brand_tuple(team_id)
+            head = _ensure_headshot_image(p)
+            _ensure_callable(render_card, "render_card")
+            img = render_card(ru, "", logo_img, colors, head, st["stats"])
+            png = _img_to_png_bytes(img)
+            _tg_send_png_as_document(chat_id, png, filename=f"card_{pid}.png")
+            _state_clear(chat_id)
+        elif cmd == "cards":
+            p = st["p"]; pid = st["pid"]; ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
+            if not ru: return
+            team_id = st["team_id"]
+            colors, logo_img, _, _ = _team_brand_tuple(team_id)
+            head = _ensure_headshot_image(p)
+            _ensure_callable(render_card_special, "render_card_special")
+            img = render_card_special(ru, "", logo_img, colors, head, st["stats"], st["right_text"])
+            png = _img_to_png_bytes(img)
+            _tg_send_png_as_document(chat_id, png, filename=f"cards_{pid}.png")
+            _state_clear(chat_id)
+        elif cmd == "cardbad":
+            p = st["p"]; pid = st["pid"]; ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
+            if not ru: return
+            team_id = st["team_id"]
+            colors, _, _, _ = _team_brand_tuple(team_id)
+            head = _ensure_headshot_image(p)
+            _ensure_callable(render_card_bad, "render_card_bad")
+            img = render_card_bad(ru, "", None, colors, head, st["stats"])
+            png = _img_to_png_bytes(img)
+            _tg_send_png_as_document(chat_id, png, filename=f"cardBAD_{pid}.png")
+            _state_clear(chat_id)
+        elif cmd == "card2":
+            A = st["A"]; B = st["B"]
+            ruA = overrides_get_name_ru(A["pid"]) if overrides_get_name_ru else None
+            ruB = overrides_get_name_ru(B["pid"]) if overrides_get_name_ru else None
+            if not (ruA and ruB): return
+            colorsA, logoA, _, _ = _team_brand_tuple(A["team_id"])
+            colorsB, logoB, _, _ = _team_brand_tuple(B["team_id"])
+            headA = _ensure_headshot_image(A["p"])
+            headB = _ensure_headshot_image(B["p"])
+            _ensure_callable(render_card2, "render_card2")
+            img = render_card2(
+                ruA, "", logoA, colorsA, headA, A["stats"],
+                ruB, "", logoB, colorsB, headB, B["stats"]
+            )
+            png = _img_to_png_bytes(img)
+            _tg_send_png_as_document(chat_id, png, filename=f"card2_{A['pid']}_{B['pid']}.png")
+            _state_clear(chat_id)
+    except Exception as e:
+        _tg_send_message(chat_id, f"❌ Ошибка рендера: {e!r}")
+        _state_clear(chat_id)
 
 # -------- GET --------
 @app.get("/api/telegram")
@@ -363,20 +438,24 @@ async def telegram_post(request: Request):
 
     # /stop
     if msg and isinstance(msg.get("text"), str) and msg["text"].strip().lower().startswith("/stop"):
+        _state_clear(msg["chat"]["id"])
         _tg_send_message(msg["chat"]["id"], "Готово. Контекст сброшен ✅")
         return PlainTextResponse("OK")
 
     # ответ с русским именем
     if msg and msg.get("reply_to_message"):
         rtxt = (msg["reply_to_message"].get("text") or "") + " " + (msg["reply_to_message"].get("caption") or "")
-        m = SETNAME_TAG_RE.search(rtxt)
+        m = SETNAME_ANY_RE.search(rtxt)
         if m and overrides_save_name_ru:
-            pid = m.group(1)
+            pid = m.group(1) or m.group(2)
             try:
-                overrides_save_name_ru(pid, msg["text"].strip())
-                _tg_send_message(msg["chat"]["id"], f"Сохранил имя для {pid}: {msg['text'].strip()}")
+                overrides_save_name_ru(pid, (msg["text"] or "").strip())
+                _tg_send_message(msg["chat"]["id"], f"Сохранил имя для {pid}: {(msg['text'] or '').strip()}")
             except Exception as e:
                 _tg_send_message(msg["chat"]["id"], f"Не удалось сохранить имя: {e!r}")
+                return PlainTextResponse("OK")
+            # пробуем продолжить начатую плашку
+            _render_from_state(msg["chat"]["id"])
             return PlainTextResponse("OK")
 
     # callback-кнопки (если будут)
@@ -395,11 +474,9 @@ async def telegram_post(request: Request):
 
     # --- команды ---
     if low.startswith("/start"):
-        _tg_send_message(chat_id, "Я здесь. Готов работать 💼\n\n"+HELP)
-        return PlainTextResponse("OK")
+        _tg_send_message(chat_id, "Я здесь. Готов работать 💼\n\n"+HELP); return PlainTextResponse("OK")
     if low.startswith("/help"):
-        _tg_send_message(chat_id, HELP)
-        return PlainTextResponse("OK")
+        _tg_send_message(chat_id, HELP); return PlainTextResponse("OK")
     if low.startswith("/find"):
         q = text[5:].strip()
         hits = search_players_loose(q)
@@ -415,33 +492,27 @@ async def telegram_post(request: Request):
         args = text.split(" ", 1)[1] if " " in text else ""
         parts = [p.strip() for p in args.split("|")]
         if len(parts) < 2:
-            _tg_send_message(chat_id, "Формат: /cardbad <имя> | <стата>")
-            return PlainTextResponse("OK")
+            _tg_send_message(chat_id, "Формат: /cardbad <имя> | <стата>"); return PlainTextResponse("OK")
         qname, raw_stats = parts[0], parts[1]
         stats = parse_stats_list(raw_stats)
 
         _tg_send_message(chat_id, "_Ищу игрока…_", parse_mode="Markdown")
         hits = search_players_loose(qname)
-        if not hits:
-            _tg_send_message(chat_id, f"Не нашёл игрока: {qname}")
-            return PlainTextResponse("OK")
-        p = hits[0]
-        pid = str(p.get("personId") or "")
+        if not hits: _tg_send_message(chat_id, f"Не нашёл игрока: {qname}"); return PlainTextResponse("OK")
+
+        p = hits[0]; pid = str(p.get("personId") or ""); team_id = str(p.get("teamId") or "0")
         ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
         if not ru:
-            _tg_send_message(
-                chat_id,
-                f"Как подписать игрока *{p.get('displayName')}* на плашке?\nОтветьте на это сообщение русским именем.\n[setname:{pid}]",
-                reply_to=msg["message_id"], parse_mode="Markdown"
-            )
+            # сохраняем состояние и спрашиваем имя
+            _state_set(chat_id, {"cmd":"cardbad","p":p,"pid":pid,"team_id":team_id,"stats":stats})
+            _tg_send_message(chat_id, f"Как подписать игрока *{p.get('displayName')}* на плашке?\n"
+                                      f"Ответьте на это сообщение русским именем.\nsetname:{pid}",
+                             reply_to=msg["message_id"], parse_mode="Markdown")
             return PlainTextResponse("OK")
 
-        team_id = str(p.get("teamId") or "0")
-        colors, _logo, _pal, _sav = _team_brand_tuple(team_id)  # цвет игнорируется графикой BAD
+        colors, _, _, _ = _team_brand_tuple(team_id)
         head = _ensure_headshot_image(p)
-        if head is None:
-            _tg_send_message(chat_id, "❌ Не удалось получить фото игрока"); return PlainTextResponse("OK")
-
+        if head is None: _tg_send_message(chat_id, "❌ Не удалось получить фото игрока"); return PlainTextResponse("OK")
         try:
             _ensure_callable(render_card_bad, "render_card_bad")
             _tg_send_message(chat_id, "_Готовлю плашку…_", parse_mode="Markdown")
@@ -465,26 +536,20 @@ async def telegram_post(request: Request):
 
         _tg_send_message(chat_id, "_Ищу игрока…_", parse_mode="Markdown")
         hits = search_players_loose(qname)
-        if not hits:
-            _tg_send_message(chat_id, f"Не нашёл игрока: {qname}")
-            return PlainTextResponse("OK")
-        p = hits[0]
-        pid = str(p.get("personId") or "")
+        if not hits: _tg_send_message(chat_id, f"Не нашёл игрока: {qname}"); return PlainTextResponse("OK")
+
+        p = hits[0]; pid = str(p.get("personId") or ""); team_id = str(p.get("teamId") or "0")
         ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
         if not ru:
-            _tg_send_message(
-                chat_id,
-                f"Как подписать игрока *{p.get('displayName')}* на плашке?\nОтветьте на это сообщение русским именем.\n[setname:{pid}]",
-                reply_to=msg["message_id"], parse_mode="Markdown"
-            )
+            _state_set(chat_id, {"cmd":"cards","p":p,"pid":pid,"team_id":team_id,"stats":stats,"right_text": right_text})
+            _tg_send_message(chat_id, f"Как подписать игрока *{p.get('displayName')}* на плашке?\n"
+                                      f"Ответьте на это сообщение русским именем.\nsetname:{pid}",
+                             reply_to=msg["message_id"], parse_mode="Markdown")
             return PlainTextResponse("OK")
 
-        team_id = str(p.get("teamId") or "0")
-        colors, logo_img, _pal, _sav = _team_brand_tuple(team_id)
+        colors, logo_img, _, _ = _team_brand_tuple(team_id)
         head = _ensure_headshot_image(p)
-        if head is None:
-            _tg_send_message(chat_id, "❌ Не удалось получить фото игрока"); return PlainTextResponse("OK")
-
+        if head is None: _tg_send_message(chat_id, "❌ Не удалось получить фото игрока"); return PlainTextResponse("OK")
         try:
             _ensure_callable(render_card_special, "render_card_special")
             _tg_send_message(chat_id, "_Готовлю плашку…_", parse_mode="Markdown")
@@ -518,22 +583,31 @@ async def telegram_post(request: Request):
 
         pA, pB = hitsA[0], hitsB[0]
         idA, idB = str(pA.get("personId") or ""), str(pB.get("personId") or "")
+        teamA, teamB = str(pA.get("teamId") or "0"), str(pB.get("teamId") or "0")
 
         ruA = overrides_get_name_ru(idA) if overrides_get_name_ru else None
-        if not ruA:
-            _tg_send_message(chat_id, f"Как подписать игрока *{pA.get('displayName')}* на плашке?\nОтветьте на это сообщение русским именем.\n[setname:{idA}]",
-                             reply_to=msg["message_id"], parse_mode="Markdown"); return PlainTextResponse("OK")
         ruB = overrides_get_name_ru(idB) if overrides_get_name_ru else None
-        if not ruB:
-            _tg_send_message(chat_id, f"Как подписать игрока *{pB.get('displayName')}* на плашке?\nОтветьте на это сообщение русским именем.\n[setname:{idB}]",
-                             reply_to=msg["message_id"], parse_mode="Markdown"); return PlainTextResponse("OK")
 
-        colorsA, logoA, _p1, _s1 = _team_brand_tuple(str(pA.get("teamId") or "0"))
-        colorsB, logoB, _p2, _s2 = _team_brand_tuple(str(pB.get("teamId") or "0"))
+        # если хотя бы одно имя не известно — сохраняем состояние и спрашиваем по очереди
+        if not (ruA and ruB):
+            _state_set(chat_id, {
+                "cmd":"card2",
+                "A":{"pid":idA,"p":pA,"team_id":teamA,"stats":statsA},
+                "B":{"pid":idB,"p":pB,"team_id":teamB,"stats":statsB},
+            })
+            ask_pid = idA if not ruA else idB
+            ask_disp = pA.get("displayName") if not ruA else pB.get("displayName")
+            _tg_send_message(chat_id,
+                f"Как подписать игрока *{ask_disp}* на плашке?\n"
+                f"Ответьте на это сообщение русским именем.\nsetname:{ask_pid}",
+                reply_to=msg["message_id"], parse_mode="Markdown")
+            return PlainTextResponse("OK")
+
+        colorsA, logoA, _, _ = _team_brand_tuple(teamA)
+        colorsB, logoB, _, _ = _team_brand_tuple(teamB)
         headA = _ensure_headshot_image(pA); headB = _ensure_headshot_image(pB)
         if headA is None or headB is None:
             _tg_send_message(chat_id, "❌ Не удалось получить фото одного из игроков"); return PlainTextResponse("OK")
-
         try:
             _ensure_callable(render_card2, "render_card2")
             _tg_send_message(chat_id, "_Готовлю плашку…_", parse_mode="Markdown")
@@ -559,26 +633,20 @@ async def telegram_post(request: Request):
 
         _tg_send_message(chat_id, "_Ищу игрока…_", parse_mode="Markdown")
         hits = search_players_loose(qname)
-        if not hits:
-            _tg_send_message(chat_id, f"Не нашёл игрока: {qname}")
-            return PlainTextResponse("OK")
-        p = hits[0]
-        pid = str(p.get("personId") or "")
+        if not hits: _tg_send_message(chat_id, f"Не нашёл игрока: {qname}"); return PlainTextResponse("OK")
+        p = hits[0]; pid = str(p.get("personId") or ""); team_id = str(p.get("teamId") or "0")
+
         ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
         if not ru:
-            _tg_send_message(
-                chat_id,
-                f"Как подписать игрока *{p.get('displayName')}* на плашке?\n"
-                f"Ответьте на это сообщение русским именем.\n[setname:{pid}]",
-                reply_to=msg["message_id"], parse_mode="Markdown")
+            _state_set(chat_id, {"cmd":"card","p":p,"pid":pid,"team_id":team_id,"stats":stats})
+            _tg_send_message(chat_id, f"Как подписать игрока *{p.get('displayName')}* на плашке?\n"
+                                      f"Ответьте на это сообщение русским именем.\nsetname:{pid}",
+                             reply_to=msg["message_id"], parse_mode="Markdown")
             return PlainTextResponse("OK")
 
-        team_id = str(p.get("teamId") or "0")
-        colors, logo_img, _pal, _sav = _team_brand_tuple(team_id)
+        colors, logo_img, _, _ = _team_brand_tuple(team_id)
         head = _ensure_headshot_image(p)
-        if head is None:
-            _tg_send_message(chat_id, "❌ Не удалось получить фото игрока"); return PlainTextResponse("OK")
-
+        if head is None: _tg_send_message(chat_id, "❌ Не удалось получить фото игрока"); return PlainTextResponse("OK")
         try:
             _ensure_callable(render_card, "render_card")
             _tg_send_message(chat_id, "_Готовлю плашку…_", parse_mode="Markdown")
@@ -589,5 +657,6 @@ async def telegram_post(request: Request):
             _tg_send_message(chat_id, f"❌ Ошибка рендера: {e!r}")
         return PlainTextResponse("OK")
 
+    # Неизвестный ввод — подсказываем команды
     _tg_send_message(chat_id, HELP)
     return PlainTextResponse("OK")
