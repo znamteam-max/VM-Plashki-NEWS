@@ -8,17 +8,29 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 # Paths & fonts
 # ---------------------------------------------------------------------------
 HERE = os.path.dirname(__file__)
-FONT_DIR = os.path.join(HERE, "fonts")
+FONT_DIR = os.path.join(HERE, "fonts")  # ожидаем шрифты в api/fonts
 
 def _font_try(path: str, size: int):
+    """
+    Пытаемся открыть переданный путь, затем пробуем assets/fonts как запасной вариант,
+    затем — системный DejaVuSans-Bold.
+    """
+    # 1) как есть
     try:
         return ImageFont.truetype(path, size=size)
     except Exception:
-        # максимально близкие фоллбэки
-        try:
-            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size=size)
-        except Exception:
-            return ImageFont.load_default()
+        pass
+    # 2) запасной путь в assets/fonts
+    try:
+        alt = os.path.join(HERE, "assets", "fonts", os.path.basename(path))
+        return ImageFont.truetype(alt, size=size)
+    except Exception:
+        pass
+    # 3) системный фоллбэк
+    try:
+        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size=size)
+    except Exception:
+        return ImageFont.load_default()
 
 def _font_exo_b(size: int):  # Имя игрока
     return _font_try(os.path.join(FONT_DIR, "Exo2-Bold.ttf"), size)
@@ -34,7 +46,7 @@ def _font_mont_sb(size: int):  # Лейблы
 # ---------------------------------------------------------------------------
 CANVAS_W, CANVAS_H = 1920, 1080
 BAR_H = 300               # высота «шторы» снизу
-RADIUS = 32               # скругления карточек
+RADIUS = 32               # радиус (не используется в no-round версии, оставлен для совместимости)
 PADDING = 32
 
 def _to_png_bytes(img: Image.Image) -> bytes:
@@ -53,6 +65,14 @@ def _grad_lr(size: Tuple[int,int], c1: str, c2: str) -> Image.Image:
         md.point((x,0), int(255*x/(w-1)))
     mask = mask.resize((w,h))
     return Image.composite(top, base, mask)
+
+def _rounded_rect(w: int, h: int, r: int, round_left=True, round_right=True) -> Image.Image:
+    """
+    NO-ROUND версия: возвращает полностью белую маску того же размера.
+    Любые «скругления» выключены. Эта заглушка нужна, чтобы
+    все карточки были с прямыми углами и чтобы избежать NameError.
+    """
+    return Image.new("L", (w, h), 255)
 
 def _paste_card(canvas: Image.Image, card: Image.Image, bottom: int = CANVAS_H) -> Tuple[int,int]:
     """Приклеить плашку к нижней границе."""
@@ -120,7 +140,6 @@ def _stats_layout(draw: ImageDraw.ImageDraw, base_x: int, base_y: int, col_w: in
                   stats: List[Tuple[str,str]], num_font_loader, cap_font_loader,
                   num_sz: int, cap_sz: int, color=(255,255,255,255), max_cols: int=3):
     """Рисуем до 3 метрик: число крупно, подпись ниже мелко."""
-    shown = 0
     for i, (value, label) in enumerate(stats[:max_cols]):
         x = base_x + i*col_w
         # число
@@ -146,11 +165,10 @@ def render_card(
 ) -> bytes:
     canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0,0,0,0))
 
-    # нижняя шторка во всю ширину
+    # нижняя шторка во всю ширину (без скруглений)
     c1, c2 = colors[0], colors[1] if len(colors) > 1 else colors[0]
     bar = _grad_lr((CANVAS_W, BAR_H), c1, c2).convert("RGBA")
-
-    # скругляем только правую сторону (как в твоих шаблонах)
+    # маска — сплошной прямоугольник
     mask = _rounded_rect(CANVAS_W, BAR_H, RADIUS, round_left=False, round_right=True)
     bar_rgba = Image.new("RGBA", (CANVAS_W, BAR_H), (0,0,0,0))
     bar_rgba.paste(bar, (0,0), mask)
@@ -168,7 +186,6 @@ def render_card(
         canvas.alpha_composite(disc, (PADDING, CANVAS_H - PADDING - LOGO_D))
         # впишем логотип внутрь
         lg = team_logo_img.convert("RGBA")
-        # чуть меньше, чтобы оставить белое поле
         lg_d = int(LOGO_D*0.76)
         lg = lg.resize((lg_d, lg_d), Image.LANCZOS)
         off = (PADDING + (LOGO_D-lg_d)//2, CANVAS_H - PADDING - LOGO_D + (LOGO_D-lg_d)//2)
@@ -189,7 +206,6 @@ def render_card(
     draw.text((name_x, name_y), player_name_ru.upper(), font=f_name, fill=(255,255,255,255))
 
     # числа/подписи
-    # три колонки, начиная примерно от имени
     stats_y = name_y + draw.textbbox((0,0), "Hg", font=f_name)[3] - name_y + 20
     col_w = 220
     _stats_layout(draw, base_x=name_x, base_y=stats_y, col_w=col_w,
@@ -209,14 +225,14 @@ def render_card2(
     canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0,0,0,0))
 
     half_w = CANVAS_W // 2
-    # левая половина
+    # левая половина (без скруглений)
     bar1 = _grad_lr((half_w, BAR_H), colors1[0], colors1[1] if len(colors1)>1 else colors1[0]).convert("RGBA")
     mask1 = _rounded_rect(half_w, BAR_H, RADIUS, round_left=True, round_right=False)
     bar1_rgba = Image.new("RGBA", (half_w, BAR_H), (0,0,0,0))
     bar1_rgba.paste(bar1, (0,0), mask1)
     canvas.alpha_composite(bar1_rgba, (0, CANVAS_H - BAR_H))
 
-    # правая половина
+    # правая половина (без скруглений)
     bar2 = _grad_lr((half_w, BAR_H), colors2[0], colors2[1] if len(colors2)>1 else colors2[0]).convert("RGBA")
     mask2 = _rounded_rect(half_w, BAR_H, RADIUS, round_left=False, round_right=True)
     bar2_rgba = Image.new("RGBA", (half_w, BAR_H), (0,0,0,0))
@@ -268,14 +284,14 @@ def render_card_special(
     main_w = int(CANVAS_W*0.66)
     right_w = CANVAS_W - main_w
 
-    # левая часть
+    # левая часть (без скруглений)
     left_bar = _grad_lr((main_w, BAR_H), colors[0], colors[1] if len(colors)>1 else colors[0]).convert("RGBA")
     left_mask = _rounded_rect(main_w, BAR_H, RADIUS, round_left=False, round_right=True)
     left_rgba = Image.new("RGBA", (main_w, BAR_H), (0,0,0,0))
     left_rgba.paste(left_bar, (0,0), left_mask)
     canvas.alpha_composite(left_rgba, (0, CANVAS_H - BAR_H))
 
-    # правая колонка — отдельный блок с обоими скруглениями
+    # правая колонка — отдельный блок (без скруглений)
     right_bar = _grad_lr((right_w, BAR_H), colors[1] if len(colors)>1 else colors[0], colors[0]).convert("RGBA")
     right_mask = _rounded_rect(right_w, BAR_H, RADIUS, round_left=True, round_right=True)
     right_rgba = Image.new("RGBA", (right_w, BAR_H), (0,0,0,0))
@@ -290,7 +306,7 @@ def render_card_special(
         disc = _white_disc(LOGO_D)
         canvas.alpha_composite(disc, (PADDING, CANVAS_H - PADDING - LOGO_D))
         lg = logo.convert("RGBA").resize((int(LOGO_D*0.76), int(LOGO_D*0.76)), Image.LANCZOS)
-        off = (PADDING + (LOGO_D-lg.width)//2, CANVAS_H - PADDING - LOGO_D + (LOGO_D-lg.height)//2)
+        off = (PADDING + (LOGO_D-lg.width)//2, CANVAS_H - PADDING - LOGО_D + (LOGО_D-lg.height)//2)
         canvas.alpha_composite(lg, off)
 
     # лицо
@@ -323,7 +339,6 @@ def render_card_special(
         if not paragraph:
             lines.append("")
             continue
-        # подбираем ширину
         words = paragraph.split()
         cur = ""
         for w in words:
@@ -357,7 +372,7 @@ def render_card_bad(
 
     draw = ImageDraw.Draw(canvas)
 
-    # какахи-эмодзи (минимал) — просто звездочка оранжевая слева как маркер
+    # маркер слева
     d = ImageDraw.Draw(canvas)
     d.ellipse((PADDING, CANVAS_H - BAR_H + 32, PADDING+18, CANVAS_H - BAR_H + 50), fill=(255,200,0,255))
 
@@ -382,10 +397,10 @@ def render_card_bad(
     if team_logo_img is not None:
         LOGO_D = 112
         disc = _white_disc(LOGO_D)
-        canvas.alpha_composite(disc, (CANVAS_W - PADDING - LOGO_D, CANVAS_H - PADDING - LOGO_D))
-        lg = team_logo_img.convert("RGBA").resize((int(LOGO_D*0.76), int(LOGO_D*0.76)), Image.LANCZOS)
-        off = (CANVAS_W - PADDING - LOGO_D + (LOGO_D-lg.width)//2,
-               CANVAS_H - PADDING - LOGO_D + (LOGO_D-lg.height)//2)
+        canvas.alpha_composite(disc, (CANVAS_W - PADDING - LOGО_D, CANVAS_H - PADDING - LOGО_D))
+        lg = team_logo_img.convert("RGBA").resize((int(LOGО_D*0.76), int(LOGО_D*0.76)), Image.LANCZOS)
+        off = (CANVAS_W - PADDING - LOGО_D + (LOGО_D-lg.width)//2,
+               CANVAS_H - PADDING - LOGО_D + (LOGО_D-lg.height)//2)
         canvas.alpha_composite(lg, off)
 
     return _to_png_bytes(canvas)
