@@ -1,403 +1,416 @@
-# graphics.py — 1920x1080, bottom-anchored cards, Cyrillic fonts, gradients
+# api/graphics.py
 from __future__ import annotations
-import os, io, math
+import io, os, math, textwrap
 from typing import List, Tuple, Optional
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-W, H = 1920, 1080
-BAR_H_SINGLE = 220          # /card, /cardbad
-BAR_H_DUO = 220             # /card2
-BAR_H_SPECIAL = 240         # /cards (с правой колонкой)
-PAD = 32
+# ---------------------------------------------------------------------------
+# Paths & fonts
+# ---------------------------------------------------------------------------
+HERE = os.path.dirname(__file__)
+FONT_DIR = os.path.join(HERE, "fonts")
 
-# --------- шрифты ---------
-_DEF_FONT = None
-_DEF_FONT_B = None
-
-def _font_path_candidates():
-    # можно переопределить путём через ENV
-    p1 = os.getenv("FONT_PATH_PRIMARY")
-    p2 = os.getenv("FONT_PATH_SECONDARY")
-    cands = []
-    for p in (p1, p2):
-        if p and os.path.exists(p): cands.append(p)
-    # несколько распространённых кириллических
-    cands += [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/ttf-dejavu/DejaVuSans.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-    ]
-    return cands
-
-def _load_fonts():
-    global _DEF_FONT, _DEF_FONT_B
-    # по умолчанию — DejaVuSans (крилица)
-    reg_path = None
-    bold_path = None
-    # если заданы FONT_PATH_* — берём их
-    fp = os.getenv("FONT_PATH_PRIMARY")
-    fb = os.getenv("FONT_PATH_BOLD") or os.getenv("FONT_PATH_SECONDARY")
-    if fp and os.path.exists(fp): reg_path = fp
-    if fb and os.path.exists(fb): bold_path = fb
-    # иначе ищем среди кандидатов
-    if not reg_path or not os.path.exists(reg_path):
-        for c in _font_path_candidates():
-            if c.lower().endswith("dejavusans.ttf") and os.path.exists(c):
-                reg_path = c; break
-    if not bold_path or not os.path.exists(bold_path):
-        for c in _font_path_candidates():
-            lc = c.lower()
-            if ("dejavusans-bold.ttf" in lc or "dejavusans.ttf" in lc) and os.path.exists(c):
-                bold_path = c; break
-    # финально
-    _DEF_FONT = reg_path
-    _DEF_FONT_B = bold_path or reg_path
-
-def _font(size:int, bold:bool=False) -> ImageFont.FreeTypeFont:
-    if _DEF_FONT is None: _load_fonts()
-    path = _DEF_FONT_B if bold else _DEF_FONT
+def _font_try(path: str, size: int):
     try:
         return ImageFont.truetype(path, size=size)
     except Exception:
-        # жёсткий фолбэк
-        return ImageFont.load_default()
+        # максимально близкие фоллбэки
+        try:
+            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size=size)
+        except Exception:
+            return ImageFont.load_default()
 
-# --------- утилиты рисования ----------
-def _hex_to_rgb(hx:str)->Tuple[int,int,int]:
-    hx = (hx or "#000000").strip()
-    if not hx.startswith("#"): hx = "#" + hx
-    hx = hx.lstrip("#")
-    if len(hx)==3:
-        hx = "".join([c*2 for c in hx])
-    r = int(hx[0:2],16); g=int(hx[2:4],16); b=int(hx[4:6],16)
-    return (r,g,b)
+def _font_exo_b(size: int):  # Имя игрока
+    return _font_try(os.path.join(FONT_DIR, "Exo2-Bold.ttf"), size)
 
-def _darken(c:Tuple[int,int,int], k:float=0.75)->Tuple[int,int,int]:
-    return (int(c[0]*k), int(c[1]*k), int(c[2]*k))
+def _font_mont_b(size: int):  # Цифры
+    return _font_try(os.path.join(FONT_DIR, "Montserrat-Bold.ttf"), size)
 
-def _h_grad(size:Tuple[int,int], c1:str, c2:Optional[str]=None) -> Image.Image:
-    """Горизонтальный градиент слева направо."""
+def _font_mont_sb(size: int):  # Лейблы
+    return _font_try(os.path.join(FONT_DIR, "Montserrat-SemiBold.ttf"), size)
+
+# ---------------------------------------------------------------------------
+# Helpers: geometry, drawing, gradients
+# ---------------------------------------------------------------------------
+CANVAS_W, CANVAS_H = 1920, 1080
+BAR_H = 300               # высота «шторы» снизу
+RADIUS = 32               # скругления карточек
+PADDING = 32
+
+def _to_png_bytes(img: Image.Image) -> bytes:
+    bio = io.BytesIO()
+    img.save(bio, format="PNG")
+    return bio.getvalue()
+
+def _grad_lr(size: Tuple[int,int], c1: str, c2: str) -> Image.Image:
+    """Простой горизонтальный градиент слева-направо."""
     w,h = size
-    base = Image.new("RGB", (w,h), (0,0,0))
-    if not c2: c2 = "#000000"
-    a = _hex_to_rgb(c1); b = _hex_to_rgb(c2)
-    grad = Image.new("RGB", (w,1), 0)
-    dr = (b[0]-a[0])/max(1,w-1)
-    dg = (b[1]-a[1])/max(1,w-1)
-    db = (b[2]-a[2])/max(1,w-1)
-    px = grad.load()
-    r,g,bl = a
-    for x in range(w):
-        px[x,0] = (int(r), int(g), int(bl))
-        r += dr; g += dg; bl += db
-    return grad.resize((w,h))
-
-def _paste_circle(img:Image.Image, source:Image.Image, center_xy:Tuple[int,int], radius:int, bottom_snap:bool=True, stroke:int=0, stroke_color=(255,255,255)):
-    """Вклеивает source по круглой маске. Если bottom_snap=True — круг касается нижней кромки."""
-    d = radius*2
-    x,y = center_xy
-    # координаты круга
-    cx = int(x - radius)
-    cy = int(y - radius)
-    if bottom_snap:
-        # сдвигаем так, чтобы круг касался нижней границы изображения
-        cy = img.height - d - PAD
-
-    # подготовка маски
-    mask = Image.new("L", (d,d), 0)
+    base = Image.new("RGB", (w,h), c1)
+    top = Image.new("RGB", (w,h), c2)
+    mask = Image.new("L", (w,1))
     md = ImageDraw.Draw(mask)
-    md.ellipse((0,0,d-1,d-1), fill=255)
+    for x in range(w):
+        md.point((x,0), int(255*x/(w-1)))
+    mask = mask.resize((w,h))
+    return Image.composite(top, base, mask)
 
-    # подготовка исходника (вписываем так, чтобы лицо было крупным)
-    # увеличим до диаметра по меньшей стороне
-    src = source.copy()
-    # Немного увеличим масштаб, чтобы «срез по нижней кромке» выглядел как в примерах
-    scale = max(d/src.width, d/src.height) * 1.15
-    nw, nh = int(src.width*scale), int(src.height*scale)
-    src = src.resize((nw, nh), Image.LANCZOS)
-    # вырезаем центральную часть по X и нижнюю по Y
-    left = max(0, (nw - d)//2)
-    top = max(0, nh - d)  # упор снизу
-    crop = src.crop((left, top, left + d, top + d))
+def _rounded_rect(w: int, h: int, r: int, round_left=True, round_right=True) -> Image.Image:
+    """Альфа-маска для скругленных прямоугольников."""
+    r = max(0, min(r, min(w,h)//2))
+    mask = Image.new("L", (w,h), 0)
+    d = ImageDraw.Draw(mask)
+    # основной прямоугольник
+    d.rectangle((0,0,w,h), fill=255)
+    # стираем углы, которые НЕ должны быть скруглены
+    if not round_left:
+        d.rectangle((0,0,r,r), fill=255)
+        d.rectangle((0,h-r,r,h), fill=255)
+    if not round_right:
+        d.rectangle((w-r,0,w,r), fill=255)
+        d.rectangle((w-r,h-r,w,h), fill=255)
+    # рисуем скругления на нужных сторонах
+    if round_left:
+        d.pieslice((0,0,2*r,2*r), 180, 270, fill=0)
+        d.pieslice((0,h-2*r,2*r,h), 90, 180, fill=0)
+    if round_right:
+        d.pieslice((w-2*r,0,w,2*r), 270, 360, fill=0)
+        d.pieslice((w-2*r,h-2*r,w,h), 0, 90, fill=0)
+    # инвертируем (нам нужна белая фигура)
+    mask = Image.eval(mask, lambda p: 255 - p)
+    return mask
 
-    # подложка под круг (если нужен stroke = белое кольцо под логотипы)
-    if stroke>0:
-        ring = Image.new("RGBA", (d+stroke*2, d+stroke*2), (0,0,0,0))
-        rd = ImageDraw.Draw(ring)
-        rd.ellipse((0,0,d+stroke*2-1,d+stroke*2-1), fill=stroke_color+(255,))
-        img.alpha_composite(ring, (cx-stroke, cy-stroke))
+def _paste_card(canvas: Image.Image, card: Image.Image, bottom: int = CANVAS_H) -> Tuple[int,int]:
+    """Приклеить плашку к нижней границе."""
+    x = 0
+    y = bottom - card.height
+    canvas.alpha_composite(card, (x,y))
+    return (x,y)
 
-    img.paste(crop, (cx, cy), mask)
+def _fit_text(draw: ImageDraw.ImageDraw, text: str, font_loader, max_w: int, start_sz: int, min_sz: int=24):
+    """Уменьшаем шрифт до влезания в ширину."""
+    sz = start_sz
+    while sz >= min_sz:
+        f = font_loader(sz)
+        w, _ = draw.textbbox((0,0), text, font=f)[2:]
+        if w <= max_w:
+            return f
+        sz -= 2
+    return font_loader(min_sz)
 
-def _rounded_rect_mask(sz:Tuple[int,int], r:int)->Image.Image:
-    w,h = sz
-    m = Image.new("L", (w,h), 0)
-    d = ImageDraw.Draw(m)
-    if r<=0:
-        d.rectangle((0,0,w,h), fill=255)
-        return m
-    d.rounded_rectangle((0,0,w-1,h-1), radius=r, fill=255)
-    return m
+def _white_disc(diam: int) -> Image.Image:
+    im = Image.new("RGBA", (diam,diam), (0,0,0,0))
+    d = ImageDraw.Draw(im)
+    d.ellipse((0,0,diam,diam), fill=(255,255,255,255))
+    return im
 
-def _text(img:Image.Image, xy:Tuple[int,int], text:str, size:int, bold=False, fill=(255,255,255,255)):
-    d = ImageDraw.Draw(img)
-    d.text(xy, text, font=_font(size, bold=bold), fill=fill)
-
-def _textbox_center(img:Image.Image, cx:int, y:int, text:str, size:int, bold=False, fill=(255,255,255,255)):
-    f = _font(size, bold=bold)
-    tw, th = f.getbbox(text)[2:]
-    _text(img, (int(cx - tw/2), int(y)), text, size, bold, fill)
-
-def _stats_line(img:Image.Image, left:int, y:int, stats:List[Tuple[str,str]], per_cell:int=3, cell_w:int=220):
-    """Рисуем числа крупно, подписи меньшим кеглем, сетка."""
-    stats = stats or []
-    stats = stats[:per_cell]
-    x = int(left)
-    for val,lbl in stats:
-        v = str(val).strip()
-        l = str(lbl or "").strip().upper()
-        _textbox_center(img, x + cell_w//2, y, v, 64, bold=True)
-        _textbox_center(img, x + cell_w//2, y + 64 + 8, l, 28, bold=False, fill=(255,255,255,200))
-        x += cell_w
-
-# --------- публичные рендеры ----------
-def render_card(mode:str, ru_name:str, subtitle:str, team_logo_img:Optional[Image.Image],
-                team_colors:Tuple[str,str,str], head_img:Image.Image, stats:List[Tuple[str,str]],
-                round_all=False, no_round=False, round_left=False, round_right=True,
-                left_radius=0, radius=0, radius_left=0, radius_right=16,
-                name_stat_center=True, text_topmost=True) -> bytes:
+def _circle_crop_bottom(img: Image.Image, diam: int) -> Image.Image:
     """
-    /card — одиночная: плашка снизу слева, ширина ~1040, высота BAR_H_SINGLE.
+    Круглая вырезка лица БЕЗ обводки.
+    Кадрируем по нижней кромке круга — «якоримся» вниз, чтобы плечи попадали в нижнюю дугу.
     """
-    canvas = Image.new("RGBA", (W,H), (0,0,0,0))
-    bar_w = 1040
-    bar_h = BAR_H_SINGLE
-    r = 20 if not no_round else 0
-    bar = Image.new("RGBA", (bar_w, bar_h), (0,0,0,0))
+    # Скейлим по высоте так, чтобы нижняя часть (плечи) легла в круг
+    target_h = int(diam*1.25)  # чуть выше круга, чтобы лицо централизовалось
+    scale = target_h / img.height
+    new_w = max(1, int(img.width * scale))
+    new_h = max(1, int(img.height * scale))
+    head = img.resize((new_w, new_h), Image.LANCZOS)
 
-    # фон-градиент
-    c1 = team_colors[0]; c2 = team_colors[1] if team_colors and team_colors[1] else None
-    if not c2: c2 = "#101010"
-    grad = _h_grad((bar_w, bar_h), c1, c2)
-    bar.paste(grad, (0,0))
+    # вырезаем прямоугольник по ширине круга; центрируем по X
+    if new_w < diam:
+        pad = (diam - new_w)//2
+        head_pad = Image.new("RGBA", (diam, new_h), (0,0,0,0))
+        head_pad.alpha_composite(head, (pad,0))
+        head = head_pad
+    else:
+        left = (new_w - diam)//2
+        head = head.crop((left, 0, left+diam, new_h))
 
-    # скругления только справа (как было)
-    mask = _rounded_rect_mask((bar_w, bar_h), r if round_right else (0 if no_round else r))
-    bar.putalpha(mask)
+    # берём только нижнюю часть высотой diam
+    if head.height < diam:
+        # добиваем прозрачностью сверху
+        pad = Image.new("RGBA", (diam, diam), (0,0,0,0))
+        pad.alpha_composite(head, (0, diam - head.height))
+        head = pad
+    else:
+        head = head.crop((0, head.height - diam, diam, head.height))
 
-    # размещаем плашку внизу слева
-    bx = PAD; by = H - bar_h - PAD
-    canvas.alpha_composite(bar, (bx, by))
+    # круглая маска
+    mask = Image.new("L", (diam,diam), 0)
+    ImageDraw.Draw(mask).ellipse((0,0,diam,diam), fill=255)
+    out = Image.new("RGBA", (diam,diam), (0,0,0,0))
+    out.paste(head, (0,0), mask)
+    return out
 
-    # логотип в белом кружке
+def _stats_layout(draw: ImageDraw.ImageDraw, base_x: int, base_y: int, col_w: int,
+                  stats: List[Tuple[str,str]], num_font_loader, cap_font_loader,
+                  num_sz: int, cap_sz: int, color=(255,255,255,255), max_cols: int=3):
+    """Рисуем до 3 метрик: число крупно, подпись ниже мелко."""
+    shown = 0
+    for i, (value, label) in enumerate(stats[:max_cols]):
+        x = base_x + i*col_w
+        # число
+        f_num = num_font_loader(num_sz)
+        tw, th = draw.textbbox((0,0), str(value), font=f_num)[2:]
+        draw.text((x, base_y), str(value), font=f_num, fill=color)
+        # подпись
+        f_cap = cap_font_loader(cap_sz)
+        draw.text((x, base_y + th + 8), label.upper(), font=f_cap, fill=color)
+
+# ---------------------------------------------------------------------------
+# Single card
+# ---------------------------------------------------------------------------
+def render_card(
+    mode: str,            # "single"
+    player_name_ru: str,
+    subtitle: str,        # не используем (совместимость)
+    team_logo_img: Optional[Image.Image],
+    colors: Tuple[str,str,str],   # (primary, darker, accent) — используем первые два
+    headshot_img: Image.Image,
+    stats: List[Tuple[str,str]],
+    **kwargs
+) -> bytes:
+    canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0,0,0,0))
+
+    # нижняя шторка во всю ширину
+    c1, c2 = colors[0], colors[1] if len(colors) > 1 else colors[0]
+    bar = _grad_lr((CANVAS_W, BAR_H), c1, c2).convert("RGBA")
+
+    # скругляем только правую сторону (как в твоих шаблонах)
+    mask = _rounded_rect(CANVAS_W, BAR_H, RADIUS, round_left=False, round_right=True)
+    bar_rgba = Image.new("RGBA", (CANVAS_W, BAR_H), (0,0,0,0))
+    bar_rgba.paste(bar, (0,0), mask)
+
+    # накладываем
+    y_bar = CANVAS_H - BAR_H
+    canvas.alpha_composite(bar_rgba, (0, y_bar))
+
+    draw = ImageDraw.Draw(canvas)
+
+    # логотип команды в белом круге
     if team_logo_img is not None:
-        lg_d = 92
-        lg = team_logo_img.convert("RGBA").resize((int(lg_d*0.9), int(lg_d*0.9)), Image.LANCZOS)
-        # белый круг
-        circ = Image.new("RGBA", (lg_d, lg_d), (255,255,255,255))
-        mask_l = _rounded_rect_mask((lg_d, lg_d), lg_d//2)
-        circ.putalpha(mask_l)
-        # внутрь — логотип
-        tmp = Image.new("RGBA", (lg_d, lg_d), (0,0,0,0))
-        tmp.alpha_composite(lg, (int((lg_d-lg.width)/2), int((lg_d-lg.height)/2)))
-        circ = Image.alpha_composite(circ, tmp)
-        canvas.alpha_composite(circ, (bx + PAD, by + bar_h - lg_d - PAD))
+        LOGO_D = 128
+        disc = _white_disc(LOGO_D)
+        canvas.alpha_composite(disc, (PADDING, CANVAS_H - PADDING - LOGO_D))
+        # впишем логотип внутрь
+        lg = team_logo_img.convert("RGBA")
+        # чуть меньше, чтобы оставить белое поле
+        lg_d = int(LOGO_D*0.76)
+        lg = lg.resize((lg_d, lg_d), Image.LANCZOS)
+        off = (PADDING + (LOGO_D-lg_d)//2, CANVAS_H - PADDING - LOGO_D + (LOGO_D-lg_d)//2)
+        canvas.alpha_composite(lg, off)
 
-    # голова игрока — круг без кольца, «срез снизу»
-    _paste_circle(canvas, head_img, center_xy=(bx + 220, 0), radius=88, bottom_snap=True, stroke=0)
+    # фото игрока — круг без обводки, «сидит» на нижней кромке
+    FACE_D = 260
+    face = _circle_crop_bottom(headshot_img, FACE_D)
+    face_x = PADDING + 96  # немного после логотипа
+    face_y = CANVAS_H - PADDING - FACE_D + 8  # чутка опускаем внутрь бара
+    canvas.alpha_composite(face, (face_x, face_y))
 
-    # имя и статы
-    name_x = bx + 320
-    name_y = by + 40
-    _text(canvas, (name_x, name_y), (ru_name or "").upper(), 64, bold=True)
-    _stats_line(canvas, name_x, by + 112, stats, per_cell=4, cell_w=200)
+    # имя игрока
+    name_x = face_x + FACE_D + 32
+    name_y = CANVAS_H - BAR_H + 40
+    max_name_w = CANVAS_W - name_x - PADDING - 24
+    f_name = _fit_text(draw, player_name_ru.upper(), _font_exo_b, max_name_w, start_sz=88, min_sz=48)
+    draw.text((name_x, name_y), player_name_ru.upper(), font=f_name, fill=(255,255,255,255))
 
-    out = io.BytesIO()
-    canvas.save(out, "PNG")
-    return out.getvalue()
+    # числа/подписи
+    # три колонки, начиная примерно от имени
+    stats_y = name_y + draw.textbbox((0,0), "Hg", font=f_name)[3] - name_y + 20
+    col_w = 220
+    _stats_layout(draw, base_x=name_x, base_y=stats_y, col_w=col_w,
+                  stats=stats, num_font_loader=_font_mont_b, cap_font_loader=_font_mont_sb,
+                  num_sz=64, cap_sz=26, color=(255,255,255,255), max_cols=3)
 
-def render_card_bad(ru_name:str, head_img:Image.Image, stats:List[Tuple[str,str]],
-                    team_logo_img:Optional[Image.Image]=None,
-                    round_all=False, no_round=False, round_left=False, round_right=True,
-                    left_radius=0, radius=0, radius_left=0, radius_right=16,
-                    poop_larger=True, poop_lower=20, name_stat_center=True) -> bytes:
-    """BAD-версия: коричневый градиент, прижат снизу слева."""
-    canvas = Image.new("RGBA", (W,H), (0,0,0,0))
-    bar_w = 1040; bar_h = BAR_H_SINGLE
-    bar = Image.new("RGBA", (bar_w, bar_h), (0,0,0,0))
-    grad = _h_grad((bar_w, bar_h), "#7A4E2D", "#4E2F1B")
-    bar.paste(grad, (0,0))
-    r = 20 if not no_round else 0
-    mask = _rounded_rect_mask((bar_w, bar_h), r if round_right else (0 if no_round else r))
-    bar.putalpha(mask)
-    bx = PAD; by = H - bar_h - PAD
-    canvas.alpha_composite(bar, (bx, by))
+    return _to_png_bytes(canvas)
 
-    if team_logo_img is not None:
-        lg_d = 92
-        lg = team_logo_img.convert("RGBA").resize((int(lg_d*0.9), int(lg_d*0.9)), Image.LANCZOS)
-        circ = Image.new("RGBA", (lg_d, lg_d), (255,255,255,255))
-        mask_l = _rounded_rect_mask((lg_d, lg_d), lg_d//2)
-        circ.putalpha(mask_l)
-        tmp = Image.new("RGBA", (lg_d, lg_d), (0,0,0,0))
-        tmp.alpha_composite(lg, (int((lg_d-lg.width)/2), int((lg_d-lg.height)/2)))
-        circ = Image.alpha_composite(circ, tmp)
-        canvas.alpha_composite(circ, (bx + PAD, by + bar_h - lg_d - PAD))
+# ---------------------------------------------------------------------------
+# Duo card (двойная)
+# ---------------------------------------------------------------------------
+def render_card2(
+    name1: str, logo1: Optional[Image.Image], colors1: Tuple[str,str,str], head1: Image.Image, stats1: List[Tuple[str,str]],
+    name2: str, logo2: Optional[Image.Image], colors2: Tuple[str,str,str], head2: Image.Image, stats2: List[Tuple[str,str]],
+    **kwargs
+) -> bytes:
+    canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0,0,0,0))
 
-    _paste_circle(canvas, head_img, center_xy=(bx + 220, 0), radius=88, bottom_snap=True, stroke=0)
-    _text(canvas, (bx + 320, by + 40), (ru_name or "").upper(), 64, bold=True)
-    _stats_line(canvas, bx + 320, by + 112, stats, per_cell=4, cell_w=200)
-
-    out = io.BytesIO()
-    canvas.save(out, "PNG")
-    return out.getvalue()
-
-def render_card2(ru1:str, logo1_img:Optional[Image.Image], colors1:Tuple[str,str,str], head1_img:Image.Image, stats1:List[Tuple[str,str]],
-                 ru2:str, logo2_img:Optional[Image.Image], colors2:Tuple[str,str,str], head2_img:Image.Image, stats2:List[Tuple[str,str]],
-                 round_all=False, no_round=True, round_left=False, round_right=False,
-                 left_radius=0, right_radius=0, radius=0, radius_left=0, radius_right=0,
-                 name_stat_center=True, duo_name_stat_center=True,
-                 duo_autofit_names=True, duo_sync_fit=True, duo_lock_ratio=True,
-                 duo_name_delta_plus=2, duo_stat_delta_minus=2, duo_min_name_vs_stat=True) -> bytes:
-    """
-    /card2 — широкая плашка на всю ширину, прижата снизу, две половины.
-    """
-    canvas = Image.new("RGBA", (W,H), (0,0,0,0))
-    bar_h = BAR_H_DUO
+    half_w = CANVAS_W // 2
     # левая половина
-    left_w = W//2
-    left = Image.new("RGBA", (left_w, bar_h), (0,0,0,0))
-    g1 = _h_grad((left_w, bar_h), colors1[0], colors1[1] if colors1 and colors1[1] else "#0E0E18")
-    left.paste(g1, (0,0))
-    # правая
-    right_w = W - left_w
-    right = Image.new("RGBA", (right_w, bar_h), (0,0,0,0))
-    g2 = _h_grad((right_w, bar_h), colors2[0], colors2[1] if colors2 and colors2[1] else "#0B1930")
-    right.paste(g2, (0,0))
+    bar1 = _grad_lr((half_w, BAR_H), colors1[0], colors1[1] if len(colors1)>1 else colors1[0]).convert("RGBA")
+    mask1 = _rounded_rect(half_w, BAR_H, RADIUS, round_left=True, round_right=False)
+    bar1_rgba = Image.new("RGBA", (half_w, BAR_H), (0,0,0,0))
+    bar1_rgba.paste(bar1, (0,0), mask1)
+    canvas.alpha_composite(bar1_rgba, (0, CANVAS_H - BAR_H))
 
-    by = H - bar_h - PAD
-    canvas.alpha_composite(left, (0, by))
-    canvas.alpha_composite(right, (left_w, by))
+    # правая половина
+    bar2 = _grad_lr((half_w, BAR_H), colors2[0], colors2[1] if len(colors2)>1 else colors2[0]).convert("RGBA")
+    mask2 = _rounded_rect(half_w, BAR_H, RADIUS, round_left=False, round_right=True)
+    bar2_rgba = Image.new("RGBA", (half_w, BAR_H), (0,0,0,0))
+    bar2_rgba.paste(bar2, (0,0), mask2)
+    canvas.alpha_composite(bar2_rgba, (half_w, CANVAS_H - BAR_H))
 
-    # центральный белый круг-делитель
-    divider_d = 96
-    divider = Image.new("RGBA", (divider_d, divider_d), (255,255,255,255))
-    divider.putalpha(_rounded_rect_mask((divider_d,divider_d), divider_d//2))
-    canvas.alpha_composite(divider, (int(W/2 - divider_d/2), int(by + (bar_h - divider_d)/2)))
+    draw = ImageDraw.Draw(canvas)
 
-    # логотипы в белых кружках по краям
-    def _paste_logo(logo_img, x):
-        if logo_img is None: return
-        d = 92
-        circ = Image.new("RGBA", (d,d), (255,255,255,255))
-        circ.putalpha(_rounded_rect_mask((d,d), d//2))
-        lg = logo_img.convert("RGBA").resize((int(d*0.9), int(d*0.9)), Image.LANCZOS)
-        tmp = Image.new("RGBA", (d,d), (0,0,0,0))
-        tmp.alpha_composite(lg, (int((d-lg.width)/2), int((d-lg.height)/2)))
-        circ = Image.alpha_composite(circ, tmp)
-        canvas.alpha_composite(circ, (int(x), int(by + bar_h - d - PAD)))
-    _paste_logo(logo1_img, PAD)
-    _paste_logo(logo2_img, W - PAD - 92)
+    def side(x0: int, name: str, logo: Optional[Image.Image], head: Image.Image, stats: List[Tuple[str,str]]):
+        # логотип
+        if logo is not None:
+            LOGO_D = 112
+            disc = _white_disc(LOGO_D)
+            canvas.alpha_composite(disc, (x0 + PADDING, CANVAS_H - PADDING - LOGO_D))
+            lg = logo.convert("RGBA").resize((int(LOGO_D*0.76), int(LOGO_D*0.76)), Image.LANCZOS)
+            off = (x0 + PADDING + (LOGO_D-lg.width)//2, CANVAS_H - PADDING - LOGO_D + (LOGO_D-lg.height)//2)
+            canvas.alpha_composite(lg, off)
 
-    # головы — по кругу, снизу
-    _paste_circle(canvas, head1_img, center_xy=(PAD + 220, 0), radius=88, bottom_snap=True)
-    _paste_circle(canvas, head2_img, center_xy=(W - PAD - 220, 0), radius=88, bottom_snap=True)
+        FACE_D = 236
+        face = _circle_crop_bottom(head, FACE_D)
+        face_x = x0 + PADDING + 96
+        face_y = CANVAS_H - PADDING - FACE_D + 8
+        canvas.alpha_composite(face, (face_x, face_y))
 
-    # имена и статы
-    name_y = by + 36
-    stats_y = by + 112
-    # левая зона
-    _text(canvas, (PAD + 320, name_y), (ru1 or "").upper(), 56, bold=True)
-    _stats_line(canvas, PAD + 320, stats_y, stats1, per_cell=4, cell_w=190)
-    # правая зона (выровняем справа)
-    # для простоты — зеркальная разметка
-    right_start = W - PAD - 320 - 4*190
-    _text(canvas, (right_start, name_y), (ru2 or "").upper(), 56, bold=True)
-    _stats_line(canvas, right_start, stats_y, stats2, per_cell=4, cell_w=190)
+        name_x = face_x + FACE_D + 24
+        name_y = CANVAS_H - BAR_H + 36
+        max_w = x0 + half_w - PADDING - name_x
+        f_name = _fit_text(draw, name.upper(), _font_exo_b, max_w, start_sz=72, min_sz=44)
+        draw.text((name_x, name_y), name.upper(), font=f_name, fill=(255,255,255,255))
 
-    out = io.BytesIO()
-    canvas.save(out, "PNG")
-    return out.getvalue()
+        stats_y = name_y + draw.textbbox((0,0), "Hg", font=f_name)[3] - name_y + 16
+        col_w = 200
+        _stats_layout(draw, name_x, stats_y, col_w, stats, _font_mont_b, _font_mont_sb, 56, 24)
 
-def render_card_special(ru_name:str, team_logo_img:Optional[Image.Image], team_colors:Tuple[str,str,str],
-                        head_img:Image.Image, stats:List[Tuple[str,str]], right_text:str,
-                        round_all=False, no_round=False, round_left=False, round_right=True,
-                        left_radius=0, radius=0, radius_left=0, radius_right=16,
-                        right_round_left=True, right_round_right=True,
-                        right_radius_left=16, right_radius_right=16,
-                        right_panel_half_width=True, right_panel_width_ratio=0.5,
-                        right_wrap=True, text_topmost=True, right_text_pad_bottom=14,
-                        name_stat_center=True) -> bytes:
-    """
-    /cards — правая колонка + левая плашка; всё прижато к низу; правая уже.
-    """
-    canvas = Image.new("RGBA", (W,H), (0,0,0,0))
-    bar_h = BAR_H_SPECIAL
-    # ширины
-    right_w = int(W * (0.42 if right_panel_half_width else right_panel_width_ratio))
-    left_w  = W - right_w - PAD*3
+    side(0, name1, logo1, head1, stats1)
+    side(half_w, name2, logo2, head2, stats2)
+    return _to_png_bytes(canvas)
 
-    # левая плашка
-    left = Image.new("RGBA", (left_w, bar_h), (0,0,0,0))
-    c1 = team_colors[0]; c2 = team_colors[1] if team_colors and team_colors[1] else None
-    grad = _h_grad((left_w, bar_h), c1, c2 or "#141414")
-    left.paste(grad, (0,0))
-    left.putalpha(_rounded_rect_mask((left_w, bar_h), 20))
-    by = H - bar_h - PAD
-    bx = PAD
-    canvas.alpha_composite(left, (bx, by))
+# ---------------------------------------------------------------------------
+# Special card (с правой колонкой)
+# ---------------------------------------------------------------------------
+def render_card_special(
+    name: str, logo: Optional[Image.Image], colors: Tuple[str,str,str], head: Image.Image,
+    stats: List[Tuple[str,str]], right_text: str, **kwargs
+) -> bytes:
+    canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0,0,0,0))
 
-    # правая колонка
-    rx = bx + left_w + PAD
-    right = Image.new("RGBA", (right_w, bar_h), (0,0,0,0))
-    grad_r = _h_grad((right_w, bar_h), _darken(_hex_to_rgb(c1),0.85), _darken(_hex_to_rgb(c1),0.65))
-    right_rgb = Image.new("RGB", (right_w, bar_h), (0,0,0))
-    right_rgb.paste(grad_r, (0,0))
-    right = right_rgb.convert("RGBA")
-    right.putalpha(_rounded_rect_mask((right_w, bar_h), 20))
-    canvas.alpha_composite(right, (rx, by))
+    # основная шторка слева 2/3 + правая панель 1/3
+    main_w = int(CANVAS_W*0.66)
+    right_w = CANVAS_W - main_w
 
-    # логотип в белом круге на левой
-    if team_logo_img is not None:
-        d = 92
-        circ = Image.new("RGBA", (d,d), (255,255,255,255))
-        circ.putalpha(_rounded_rect_mask((d,d), d//2))
-        lg = team_logo_img.convert("RGBA").resize((int(d*0.9), int(d*0.9)), Image.LANCZOS)
-        tmp = Image.new("RGBA", (d,d), (0,0,0,0))
-        tmp.alpha_composite(lg, (int((d-lg.width)/2), int((d-lg.height)/2)))
-        circ = Image.alpha_composite(circ, tmp)
-        canvas.alpha_composite(circ, (bx + PAD, by + bar_h - d - PAD))
+    # левая часть
+    left_bar = _grad_lr((main_w, BAR_H), colors[0], colors[1] if len(colors)>1 else colors[0]).convert("RGBA")
+    left_mask = _rounded_rect(main_w, BAR_H, RADIUS, round_left=False, round_right=True)
+    left_rgba = Image.new("RGBA", (main_w, BAR_H), (0,0,0,0))
+    left_rgba.paste(left_bar, (0,0), left_mask)
+    canvas.alpha_composite(left_rgba, (0, CANVAS_H - BAR_H))
+
+    # правая колонка — отдельный блок с обоими скруглениями
+    right_bar = _grad_lr((right_w, BAR_H), colors[1] if len(colors)>1 else colors[0], colors[0]).convert("RGBA")
+    right_mask = _rounded_rect(right_w, BAR_H, RADIUS, round_left=True, round_right=True)
+    right_rgba = Image.new("RGBA", (right_w, BAR_H), (0,0,0,0))
+    right_rgba.paste(right_bar, (0,0), right_mask)
+    canvas.alpha_composite(right_rgba, (main_w, CANVAS_H - BAR_H))
+
+    draw = ImageDraw.Draw(canvas)
+
+    # логотип
+    if logo is not None:
+        LOGO_D = 112
+        disc = _white_disc(LOGO_D)
+        canvas.alpha_composite(disc, (PADDING, CANVAS_H - PADDING - LOGO_D))
+        lg = logo.convert("RGBA").resize((int(LOGO_D*0.76), int(LOGO_D*0.76)), Image.LANCZOS)
+        off = (PADDING + (LOGO_D-lg.width)//2, CANVAS_H - PADDING - LOGO_D + (LOGO_D-lg.height)//2)
+        canvas.alpha_composite(lg, off)
 
     # лицо
-    _paste_circle(canvas, head_img, center_xy=(bx + 220, 0), radius=88, bottom_snap=True)
+    FACE_D = 236
+    face = _circle_crop_bottom(head, FACE_D)
+    face_x = PADDING + 96
+    face_y = CANVAS_H - PADDING - FACE_D + 8
+    canvas.alpha_composite(face, (face_x, face_y))
 
-    # левые тексты
-    _text(canvas, (bx + 320, by + 42), (ru_name or "").upper(), 60, bold=True)
-    _stats_line(canvas, bx + 320, by + 118, stats, per_cell=4, cell_w=200)
+    # имя
+    name_x = face_x + FACE_D + 24
+    name_y = CANVAS_H - BAR_H + 36
+    max_w = main_w - name_x - PADDING
+    f_name = _fit_text(draw, name.upper(), _font_exo_b, max_w, start_sz=72, min_sz=44)
+    draw.text((name_x, name_y), name.upper(), font=f_name, fill=(255,255,255,255))
 
-    # правый текст (многострочный, перенос)
-    if right_text:
-        rt = str(right_text).replace("\\n", "\n")
-        lines = []
-        # грубый перенос
-        max_w = right_w - PAD*2
-        words = rt.split()
+    stats_y = name_y + draw.textbbox((0,0), "Hg", font=f_name)[3] - name_y + 16
+    _stats_layout(draw, name_x, stats_y, 200, stats, _font_mont_b, _font_mont_sb, 56, 24)
+
+    # правая колонка текстом
+    rpad = 28
+    tx = main_w + rpad
+    ty = CANVAS_H - BAR_H + 36
+    tw = right_w - rpad*2
+    f_txt = _font_mont_sb(30)
+    # мягкие переносы
+    lines = []
+    for paragraph in (right_text or "").split("\n"):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            lines.append("")
+            continue
+        # подбираем ширину
+        words = paragraph.split()
         cur = ""
-        f = _font(44, bold=True)
         for w in words:
             test = (cur + " " + w).strip()
-            tw = f.getbbox(test)[2]
-            if tw > max_w and cur:
-                lines.append(cur); cur = w
-            else:
+            wpx = draw.textbbox((0,0), test, font=f_txt)[2]
+            if wpx <= tw:
                 cur = test
-        if cur: lines.append(cur)
-        y = by + 36
-        for i,ln in enumerate(lines[:3]):
-            _text(canvas, (rx + PAD, y), ln.upper(), 44, bold=True)
-            y += 52
+            else:
+                lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+    for i, line in enumerate(lines[:8]):
+        draw.text((tx, ty + i*38), line, font=f_txt, fill=(255,255,255,255))
 
-    out = io.BytesIO()
-    canvas.save(out, "PNG")
-    return out.getvalue()
+    return _to_png_bytes(canvas)
+
+# ---------------------------------------------------------------------------
+# BAD card (коричневая «плохая»)
+# ---------------------------------------------------------------------------
+def render_card_bad(
+    name: str, head: Image.Image, stats: List[Tuple[str,str]], team_logo_img: Optional[Image.Image]=None, **kwargs
+) -> bytes:
+    canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0,0,0,0))
+    # коричневый градиент
+    bar = _grad_lr((CANVAS_W, BAR_H), "#4E342E", "#3E2723").convert("RGBA")
+    mask = _rounded_rect(CANVAS_W, BAR_H, RADIUS, round_left=False, round_right=True)
+    bar_rgba = Image.new("RGBA", (CANVAS_W, BAR_H), (0,0,0,0))
+    bar_rgba.paste(bar, (0,0), mask)
+    canvas.alpha_composite(bar_rgba, (0, CANVAS_H - BAR_H))
+
+    draw = ImageDraw.Draw(canvas)
+
+    # какахи-эмодзи (минимал) — просто звездочка оранжевая слева как маркер
+    d = ImageDraw.Draw(canvas)
+    d.ellipse((PADDING, CANVAS_H - BAR_H + 32, PADDING+18, CANVAS_H - BAR_H + 50), fill=(255,200,0,255))
+
+    # лицо
+    FACE_D = 236
+    face = _circle_crop_bottom(head, FACE_D)
+    face_x = PADDING + 36
+    face_y = CANVAS_H - PADDING - FACE_D + 8
+    canvas.alpha_composite(face, (face_x, face_y))
+
+    # имя
+    name_x = face_x + FACE_D + 24
+    name_y = CANVAS_H - BAR_H + 36
+    max_w = CANVAS_W - name_x - PADDING
+    f_name = _fit_text(draw, name.upper(), _font_exo_b, max_w, start_sz=72, min_sz=44)
+    draw.text((name_x, name_y), name.upper(), font=f_name, fill=(255,255,255,255))
+
+    stats_y = name_y + draw.textbbox((0,0), "Hg", font=f_name)[3] - name_y + 16
+    _stats_layout(draw, name_x, stats_y, 200, stats, _font_mont_b, _font_mont_sb, 56, 24)
+
+    # логотип (необязательно)
+    if team_logo_img is not None:
+        LOGO_D = 112
+        disc = _white_disc(LOGO_D)
+        canvas.alpha_composite(disc, (CANVAS_W - PADDING - LOGO_D, CANVAS_H - PADDING - LOGO_D))
+        lg = team_logo_img.convert("RGBA").resize((int(LOGO_D*0.76), int(LOGO_D*0.76)), Image.LANCZOS)
+        off = (CANVAS_W - PADDING - LOGO_D + (LOGO_D-lg.width)//2,
+               CANVAS_H - PADDING - LOGO_D + (LOGO_D-lg.height)//2)
+        canvas.alpha_composite(lg, off)
+
+    return _to_png_bytes(canvas)
