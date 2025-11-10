@@ -54,31 +54,6 @@ def _grad_lr(size: Tuple[int,int], c1: str, c2: str) -> Image.Image:
     mask = mask.resize((w,h))
     return Image.composite(top, base, mask)
 
-def _rounded_rect(w: int, h: int, r: int, round_left=True, round_right=True) -> Image.Image:
-    """Альфа-маска для скругленных прямоугольников."""
-    r = max(0, min(r, min(w,h)//2))
-    mask = Image.new("L", (w,h), 0)
-    d = ImageDraw.Draw(mask)
-    # основной прямоугольник
-    d.rectangle((0,0,w,h), fill=255)
-    # стираем углы, которые НЕ должны быть скруглены
-    if not round_left:
-        d.rectangle((0,0,r,r), fill=255)
-        d.rectangle((0,h-r,r,h), fill=255)
-    if not round_right:
-        d.rectangle((w-r,0,w,r), fill=255)
-        d.rectangle((w-r,h-r,w,h), fill=255)
-    # рисуем скругления на нужных сторонах
-    if round_left:
-        d.pieslice((0,0,2*r,2*r), 180, 270, fill=0)
-        d.pieslice((0,h-2*r,2*r,h), 90, 180, fill=0)
-    if round_right:
-        d.pieslice((w-2*r,0,w,2*r), 270, 360, fill=0)
-        d.pieslice((w-2*r,h-2*r,w,h), 0, 90, fill=0)
-    # инвертируем (нам нужна белая фигура)
-    mask = Image.eval(mask, lambda p: 255 - p)
-    return mask
-
 def _paste_card(canvas: Image.Image, card: Image.Image, bottom: int = CANVAS_H) -> Tuple[int,int]:
     """Приклеить плашку к нижней границе."""
     x = 0
