@@ -29,7 +29,7 @@ STAT_VALUE_SIZE = 56
 STAT_LABEL_SIZE = 30
 RIGHT_TEXT_SIZE = 40
 
-# Фикс-градиенты
+# Фикс-градиенты (без парсинга из команды)
 GRAD_ORANGE_L = (255, 140, 0)
 GRAD_ORANGE_R = (255, 201, 71)
 
@@ -103,9 +103,16 @@ def _as_image(obj: Any) -> Optional[Image.Image]:
             p = os.path.join(base, obj)
             if os.path.isfile(p):
                 return Image.open(p).convert("RGBA")
-        # если это не путь — считаем отсутствующим
         return None
     return None
+
+def _ensure_canvas(canvas: Any) -> Image.Image:
+    im = _as_image(canvas)
+    if im is None:
+        im = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 255))
+    elif im.mode != "RGBA":
+        im = im.convert("RGBA")
+    return im
 
 def _paste_rgba(dst: Image.Image, src: Image.Image, xy: Tuple[int, int]) -> None:
     if src.mode != "RGBA":
@@ -124,6 +131,7 @@ def _load_icon(name: str, size: int, no_circle: bool = False) -> Image.Image:
     rel = os.path.join("icons", name)
     p = _asset_path(rel)
     if not p:
+        # фолбэк-значок
         im = Image.new("RGBA", (size, size), (255, 255, 255, 0))
         d = ImageDraw.Draw(im)
         d.ellipse((0, 0, size - 1, size - 1), outline=(255, 215, 0, 255), width=3)
@@ -206,7 +214,7 @@ def _build_left_module(
     min_w = PADDING_X + logo_w + 20 + head_w + inner_pad + max(name_w, vals_w) + PADDING_X
     block_w = min(min_w + extra_right_w, int(CANVAS_W * SAFE_W_RATIO))
 
-    # центрируем общий блок (как было)
+    # центрируем общий блок
     x0 = (CANVAS_W - block_w) // 2
     x1 = x0 + block_w
     y1 = CANVAS_H - PADDING_Y
@@ -272,15 +280,13 @@ def _build_left_module(
 
 # =============== Public API (back-compat) ===============
 def render_card(canvas, player_img, team_logo_img, name_ru, stats, *unused, **kwargs):
-    if canvas is None:
-        canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 255))
+    canvas = _ensure_canvas(canvas)
     _build_left_module(canvas, CANVAS_H - PADDING_Y, player_img, team_logo_img, name_ru, stats,
                        GRAD_ORANGE_L, GRAD_ORANGE_R, extra_right_w=0)
     return canvas
 
 def render_cardbad(canvas, player_img, team_logo_img, name_ru, stats, *unused, **kwargs):
-    if canvas is None:
-        canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 255))
+    canvas = _ensure_canvas(canvas)
     x0, y0, x1, y1 = _build_left_module(canvas, CANVAS_H - PADDING_Y, player_img, team_logo_img, name_ru, stats,
                                         GRAD_BAD_L, GRAD_BAD_R, extra_right_w=0)
     # 💩 слева от имени, без белого круга
@@ -296,9 +302,12 @@ def render_cardbad(canvas, player_img, team_logo_img, name_ru, stats, *unused, *
     _paste_rgba(canvas, poop, (max(x0 + PADDING_X, name_x - 44), name_y + (name_h - poop.height)//2))
     return canvas
 
+# alias с нижним подчёркиванием — для совместимости со старым кодом
+def render_card_bad(canvas, *args, **kwargs):
+    return render_cardbad(canvas, *args, **kwargs)
+
 def render_cards(canvas, player_img, team_logo_img, name_ru, stats, right_text="молодец", *unused, **kwargs):
-    if canvas is None:
-        canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 255))
+    canvas = _ensure_canvas(canvas)
     draw = ImageDraw.Draw(canvas)
     f_right = _font(FONT_MONTSERRAT_SEMI, RIGHT_TEXT_SIZE)
     txt_w, _ = _measure(draw, right_text, f_right)
@@ -323,8 +332,7 @@ def render_card2(canvas,
                  left_player_img, left_team_logo, left_name_ru, left_stats,
                  right_player_img, right_team_logo, right_name_ru, right_stats,
                  *unused, **kwargs):
-    if canvas is None:
-        canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 255))
+    canvas = _ensure_canvas(canvas)
 
     layer_left = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
     lx0, ly0, lx1, ly1 = _build_left_module(layer_left, CANVAS_H - PADDING_Y,
@@ -363,10 +371,9 @@ def render_card_special(canvas, *args, **kwargs):
     Если передали right_text — рендерим как render_cards,
     иначе — как обычный render_card.
     """
+    canvas = _ensure_canvas(canvas)
     right_text = kwargs.pop("right_text", None)
-    # старые сигнатуры могли передавать 5–7 позиционных аргументов
     if right_text is None and len(args) >= 6:
-        # иногда right_text прилетает 6-м позиционным
         right_text = args[5]
         args = args[:5]
     try:
@@ -375,7 +382,6 @@ def render_card_special(canvas, *args, **kwargs):
         else:
             return render_cards(canvas, *args[:5], right_text, *args[6:], **kwargs)
     except TypeError:
-        # если позиционные не совпали — пробуем безопаснее
         if right_text is None:
             return render_card(canvas, *args[:5], **kwargs)
         return render_cards(canvas, *args[:5], right_text, **kwargs)
