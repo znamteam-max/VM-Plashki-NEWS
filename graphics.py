@@ -1,75 +1,67 @@
-# api/graphics.py — cards renderer (drop-in, compat-safe)
+# api/graphics.py — DROP-IN совместимая версия под telegram.py
 from __future__ import annotations
 
 import os
 from io import BytesIO
-from functools import lru_cache
 from typing import List, Tuple, Optional, Any
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-# =============== Canvas / layout ===============
-CANVAS_W = int(os.getenv("CARD_W", 1920))
-CANVAS_H = int(os.getenv("CARD_H", 1080))
 
-BAR_H = 260
-PADDING_X = 28
-PADDING_Y = 28
-SAFE_W_RATIO = 0.92
+# -----------------------------
+# Константы макета
+# -----------------------------
+CANVAS_W = 1920
+CANVAS_H = 1080
 
-# Аватар и логотип
-HEAD_D = 360            # больше, чтобы голову не резало
-HEAD_OFFSET_Y = 110     # «выпирание» вверх из плашки
-LOGO_CIRCLE_D = 88      # белый круг меньше
-LOGO_INNER_D = 82       # сам логотип крупнее внутри круга
+# Высота нижней «шторы» — компактнее
+BAR_H = 220
+PADDING = 28
 
-# Типографика
-NAME_SIZE = 86
-STAT_VALUE_SIZE = 56
-STAT_LABEL_SIZE = 30
-RIGHT_TEXT_SIZE = 40
+# Диаметры
+HEAD_D = 300               # круг головы крупнее — не режет макушку
+LOGO_DISC_D = 92           # белый круг меньше
+LOGO_INNER_D = 86          # сам логотип внутри крупнее
+ICON_SIZE = 28             # размер иконок (звезда/какашка) без белого круга
 
-# Фикс-градиенты (без парсинга из команды)
+# Типографика (единые размеры для всех карточек)
+# Имена поменьше, цифры ещё меньше, подписи совсем маленькие
+NAME_SIZE = 64
+STAT_VALUE_SIZE = 46
+STAT_LABEL_SIZE = 22
+RIGHT_TEXT_SIZE = 30
+
+# Фикс-градиенты (по ТЗ: card/cards — оранжевый; card2 — фиолетовый + синий; cardbad — коричневый)
 GRAD_ORANGE_L = (255, 140, 0)
 GRAD_ORANGE_R = (255, 201, 71)
+
+GRAD_PURPLE_L = (79, 46, 126)
+GRAD_PURPLE_R = (45, 24, 89)
+
+GRAD_BLUE_L   = (24, 74, 130)
+GRAD_BLUE_R   = (17, 47, 89)
 
 GRAD_BAD_L = (84, 54, 48)
 GRAD_BAD_R = (66, 44, 40)
 
-GRAD_PURPLE_L = (79, 46, 126)
-GRAD_PURPLE_R = (45, 24, 89)
-GRAD_BLUE_L   = (24, 74, 130)
-GRAD_BLUE_R   = (17, 47, 89)
+# Ограничение по ширине блока (чтобы не растягивался во всю ширину без нужды)
+SAFE_W_RATIO = 0.90
 
-# =============== Paths ===============
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FONTS_DIRS = [
-    os.path.join(BASE_DIR, "fonts"),
-    os.path.join(os.path.dirname(BASE_DIR), "api", "fonts"),
-    os.path.join("/var/task", "api", "fonts"),
-]
+
+# -----------------------------
+# Пути к шрифтам и иконкам
+# -----------------------------
+HERE = os.path.dirname(os.path.abspath(__file__))
+FONT_DIR = os.path.join(HERE, "fonts")  # ИСКЛЮЧИТЕЛЬНО api/fonts — как просили
+
+FONT_EXO2_BOLD = os.path.join(FONT_DIR, "Exo2-Bold.ttf")
+FONT_MONTSERRAT_BOLD = os.path.join(FONT_DIR, "Montserrat-Bold.ttf")
+FONT_MONTSERRAT_SEMI = os.path.join(FONT_DIR, "Montserrat-SemiBold.ttf")
+
 ASSETS_DIRS = [
-    os.path.join(os.path.dirname(BASE_DIR), "assets"),
-    os.path.join(BASE_DIR, "assets"),
+    os.path.join(os.path.dirname(HERE), "assets"),
+    os.path.join(HERE, "assets"),
 ]
-
-FONT_EXO2_BOLD = "Exo2-Bold.ttf"
-FONT_MONTSERRAT_BOLD = "Montserrat-Bold.ttf"
-FONT_MONTSERRAT_SEMI = "Montserrat-SemiBold.ttf"
-
-# =============== Utils ===============
-def _find_file(name: str, folders: List[str]) -> Optional[str]:
-    for folder in folders:
-        p = os.path.join(folder, name)
-        if os.path.isfile(p):
-            return p
-    return None
-
-def _font_path(font_name: str) -> str:
-    p = _find_file(font_name, FONTS_DIRS)
-    if not p:
-        raise FileNotFoundError(f"Font not found in api/fonts: {font_name}")
-    return p
 
 def _asset_path(rel: str) -> Optional[str]:
     for base in ASSETS_DIRS:
@@ -78,16 +70,29 @@ def _asset_path(rel: str) -> Optional[str]:
             return p
     return None
 
-@lru_cache(maxsize=64)
-def _font(font_name: str, size: int) -> ImageFont.FreeTypeFont:
-    return ImageFont.truetype(_font_path(font_name), size=size)
 
-def _measure(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> Tuple[int, int]:
-    bbox = draw.textbbox((0, 0), text, font=font)
-    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+# -----------------------------
+# Утилиты: шрифты, изображение, текст
+# -----------------------------
+def _ensure_font(path: str, size: int) -> ImageFont.FreeTypeFont:
+    if not os.path.isfile(path):
+        # Явно падаем, если шрифт не найден (по ТЗ — только ваши шрифты)
+        raise FileNotFoundError(f"Font not found: {path}")
+    return ImageFont.truetype(path, size=size)
+
+def _font_name(sz: int) -> ImageFont.FreeTypeFont:
+    return _ensure_font(FONT_MONTSERRAT_BOLD, sz)
+
+def _font_value(sz: int) -> ImageFont.FreeTypeFont:
+    return _ensure_font(FONT_EXO2_BOLD, sz)
+
+def _font_label(sz: int) -> ImageFont.FreeTypeFont:
+    return _ensure_font(FONT_MONTSERRAT_SEMI, sz)
+
+def _font_right(sz: int) -> ImageFont.FreeTypeFont:
+    return _ensure_font(FONT_MONTSERRAT_SEMI, sz)
 
 def _as_image(obj: Any) -> Optional[Image.Image]:
-    """Принимает PIL.Image | bytes | str (путь / относительный путь) | None."""
     if obj is None:
         return None
     if isinstance(obj, Image.Image):
@@ -106,282 +111,313 @@ def _as_image(obj: Any) -> Optional[Image.Image]:
         return None
     return None
 
-def _ensure_canvas(canvas: Any) -> Image.Image:
-    im = _as_image(canvas)
-    if im is None:
-        im = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 255))
-    elif im.mode != "RGBA":
-        im = im.convert("RGBA")
-    return im
+def _to_png_bytes(img: Image.Image) -> bytes:
+    bio = BytesIO()
+    img.save(bio, format="PNG")
+    return bio.getvalue()
 
-def _paste_rgba(dst: Image.Image, src: Image.Image, xy: Tuple[int, int]) -> None:
-    if src.mode != "RGBA":
-        src = src.convert("RGBA")
-    dst.alpha_composite(src, xy)
+def _measure(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> Tuple[int, int]:
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
 
-def _circle_crop(im: Image.Image, diameter: int) -> Image.Image:
-    im = ImageOps.fit(im.convert("RGBA"), (diameter, diameter), Image.LANCZOS, centering=(0.5, 0.35))
-    mask = Image.new("L", (diameter, diameter), 0)
-    ImageDraw.Draw(mask).ellipse((0, 0, diameter, diameter), fill=255)
-    out = Image.new("RGBA", (diameter, diameter), (0, 0, 0, 0))
-    out.paste(im, (0, 0), mask=mask)
-    return out
-
-def _load_icon(name: str, size: int, no_circle: bool = False) -> Image.Image:
-    rel = os.path.join("icons", name)
-    p = _asset_path(rel)
-    if not p:
-        # фолбэк-значок
-        im = Image.new("RGBA", (size, size), (255, 255, 255, 0))
-        d = ImageDraw.Draw(im)
-        d.ellipse((0, 0, size - 1, size - 1), outline=(255, 215, 0, 255), width=3)
-        return im
-    im = Image.open(p).convert("RGBA")
-    im = ImageOps.contain(im, (size, size), Image.LANCZOS)
-    if no_circle:
-        return im
-    badge = Image.new("RGBA", (size + 16, size + 16), (0, 0, 0, 0))
-    d = ImageDraw.Draw(badge)
-    d.ellipse((0, 0, badge.width - 1, badge.height - 1), fill=(255, 255, 255, 255))
-    _paste_rgba(badge, im, ((badge.width - im.width)//2, (badge.height - im.height)//2))
-    return badge
-
-def _draw_gradient_rect(canvas: Image.Image, box: Tuple[int, int, int, int], c1: Tuple[int, int, int], c2: Tuple[int, int, int]) -> None:
-    x0, y0, x1, y1 = box
-    w, h = x1 - x0, y1 - y0
-    grad = Image.new("RGBA", (w, h), 0)
-    d = ImageDraw.Draw(grad)
-    for i in range(w):
-        t = i / max(w - 1, 1)
+def _grad_lr(w: int, h: int, c1: Tuple[int,int,int], c2: Tuple[int,int,int]) -> Image.Image:
+    im = Image.new("RGBA", (w, h), 0)
+    d = ImageDraw.Draw(im)
+    for x in range(w):
+        t = x / max(1, w - 1)
         r = int(c1[0] + (c2[0] - c1[0]) * t)
         g = int(c1[1] + (c2[1] - c1[1]) * t)
         b = int(c1[2] + (c2[2] - c1[2]) * t)
-        d.line([(i, 0), (i, h)], fill=(r, g, b, 255))
-    _paste_rgba(canvas, grad, (x0, y0))
+        d.line([(x,0),(x,h)], fill=(r,g,b,255))
+    return im
 
-def _split_stats(stats: str) -> List[Tuple[str, str]]:
-    if not stats:
-        return []
-    parts = [p.strip() for p in stats.replace(";", ",").split(",") if p.strip()]
-    out: List[Tuple[str, str]] = []
-    for p in parts:
-        tokens = p.split()
-        if not tokens:
-            continue
-        value = tokens[0]
-        label = " ".join(tokens[1:]) if len(tokens) > 1 else ""
-        out.append((value, label))
-    return out[:3]
+def _circle_crop_face(img: Image.Image, diam: int) -> Image.Image:
+    """
+    Вписываем голову в круг; чуть сдвигаем центр вверх, чтобы не резало макушку.
+    """
+    # Чуть смещаем центр по Y (больше "головы" выше)
+    face = ImageOps.fit(img, (diam, diam), Image.LANCZOS, centering=(0.5, 0.38))
+    mask = Image.new("L", (diam, diam), 0)
+    ImageDraw.Draw(mask).ellipse((0,0,diam,diam), fill=255)
+    out = Image.new("RGBA", (diam, diam), (0,0,0,0))
+    out.paste(face, (0,0), mask)
+    return out
 
-# =============== Core ===============
-def _build_left_module(
+def _load_icon(name: str, size: int, plain: bool=True) -> Image.Image:
+    # plain=True -> без белого круга (по ТЗ)
+    rel = os.path.join("icons", name)
+    p = _asset_path(rel)
+    if not p:
+        # Фолбэк: пустой прозрачный
+        return Image.new("RGBA", (size, size), (0,0,0,0))
+    im = Image.open(p).convert("RGBA")
+    im = ImageOps.contain(im, (size, size), Image.LANCZOS)
+    if plain:
+        return im
+    # белый круг (на всякий случай, но нам сейчас не нужен)
+    circle = Image.new("RGBA", (size+12, size+12), (0,0,0,0))
+    d = ImageDraw.Draw(circle)
+    d.ellipse((0,0,circle.width-1,circle.height-1), fill=(255,255,255,255))
+    circle.alpha_composite(im, ((circle.width-im.width)//2, (circle.height-im.height)//2))
+    return circle
+
+
+# -----------------------------
+# Вспомогательный «левый модуль»
+# (лого + голова + имя + статы)
+# -----------------------------
+def _build_left_block(
     canvas: Image.Image,
-    baseline_y: int,
-    player_img: Any,
-    team_logo_img: Any,
     name_ru: str,
-    stats: str,
-    c_left: Tuple[int, int, int],
-    c_right: Tuple[int, int, int],
-    extra_right_w: int = 0,
-) -> Tuple[int, int, int, int]:
+    team_logo_img: Optional[Image.Image],
+    headshot_img: Image.Image,
+    stats: List[Tuple[str,str]],
+    grad_left: Tuple[int,int,int],
+    grad_right: Tuple[int,int,int],
+    extra_right_w: int = 0,   # для cards (правая колонка)
+) -> Tuple[int,int,int,int]:
+    """
+    Рисует левый блок и возвращает его bounding box (x0,y0,x1,y1).
+    Блок по ширине = содержимому, ограничен SAFE_W_RATIO от ширины экрана.
+    Все тексты центрируются относительно колонны имени.
+    """
     draw = ImageDraw.Draw(canvas)
 
-    font_name = _font(FONT_MONTSERRAT_BOLD, NAME_SIZE)
-    font_stat_val = _font(FONT_EXO2_BOLD, STAT_VALUE_SIZE)
-    font_stat_lbl = _font(FONT_MONTSERRAT_SEMI, STAT_LABEL_SIZE)
+    # Приводим имя к строке (устраняет "'Image' object has no attribute 'upper'")
+    name_text = str(name_ru or "").upper()
 
-    # to images
-    player_img = _as_image(player_img)
-    team_logo_img = _as_image(team_logo_img)
+    # Шрифты
+    f_name = _font_name(NAME_SIZE)
+    f_val  = _font_value(STAT_VALUE_SIZE)
+    f_lbl  = _font_label(STAT_LABEL_SIZE)
 
-    # Name measure
-    name_text = (name_ru or "").upper()
-    name_w, name_h = _measure(draw, name_text, font_name)
+    # Метрики текста
+    name_w, name_h = _measure(draw, name_text, f_name)
 
-    stat_pairs = _split_stats(stats)
-    col_gap = 44
-    vals_w = 0
-    for value, label in stat_pairs:
-        vw, _ = _measure(draw, value, font_stat_val)
-        lw, _ = _measure(draw, label.upper(), font_stat_lbl)
-        vals_w += max(vw, lw)
-    vals_w += col_gap * max(len(stat_pairs) - 1, 0)
+    # Метрики статов
+    cols: List[Tuple[int, Tuple[str,str]]] = []
+    gap = 36
+    stats = stats[:3] if stats else []
+    total_cols_w = 0
+    for value, label in stats:
+        v = str(value)
+        l = str(label).upper()
+        vw, _ = _measure(draw, v, f_val)
+        lw, _ = _measure(draw, l, f_lbl)
+        w = max(vw, lw)
+        cols.append((w, (v, l)))
+        total_cols_w += w
+    if cols:
+        total_cols_w += gap * (len(cols) - 1)
 
-    head_w = HEAD_D
-    logo_w = LOGO_CIRCLE_D
-    inner_pad = 26
-    min_w = PADDING_X + logo_w + 20 + head_w + inner_pad + max(name_w, vals_w) + PADDING_X
-    block_w = min(min_w + extra_right_w, int(CANVAS_W * SAFE_W_RATIO))
+    # Итоговая минимальная ширина блока по контенту
+    left_fixed = PADDING + LOGO_DISC_D + 18 + HEAD_D + 24   # лого + отступ + голова + отступ до текста
+    right_text_w = max(name_w, total_cols_w)
+    min_block_w = left_fixed + right_text_w + PADDING + extra_right_w
 
-    # центрируем общий блок
+    block_w = int(min(min_block_w, CANVAS_W * SAFE_W_RATIO))
+    block_h = BAR_H
+
+    # Позиционируем блок по центру внизу
     x0 = (CANVAS_W - block_w) // 2
+    y1 = CANVAS_H - PADDING
+    y0 = y1 - block_h
     x1 = x0 + block_w
-    y1 = CANVAS_H - PADDING_Y
-    y0 = y1 - BAR_H
 
-    # фон
-    _draw_gradient_rect(canvas, (x0, y0, x1, y1), c_left, c_right)
+    # Градиентный фон без скруглений
+    bar = _grad_lr(block_w, block_h, grad_left, grad_right)
+    canvas.alpha_composite(bar, (x0, y0))
 
-    # логотип слева
-    logo_cx = x0 + PADDING_X + LOGO_CIRCLE_D // 2
-    logo_cy = y1 - BAR_H // 2 + 6
-    logo_badge = Image.new("RGBA", (LOGO_CIRCLE_D, LOGO_CIRCLE_D), (0, 0, 0, 0))
-    d = ImageDraw.Draw(logo_badge)
-    d.ellipse((0, 0, LOGO_CIRCLE_D - 1, LOGO_CIRCLE_D - 1), fill=(255, 255, 255, 255))
+    # Логотип слева в белом кружке (кружок — меньше, сам логотип — крупнее)
     if team_logo_img is not None:
-        tl = ImageOps.contain(team_logo_img, (LOGO_INNER_D, LOGO_INNER_D), Image.LANCZOS)
-        _paste_rgba(logo_badge, tl, ((logo_badge.width - tl.width)//2, (logo_badge.height - tl.height)//2))
-    _paste_rgba(canvas, logo_badge, (logo_cx - logo_badge.width//2, logo_cy - logo_badge.height//2))
-
-    # голова
-    if player_img is None:
-        head = Image.new("RGBA", (HEAD_D, HEAD_D), (0, 0, 0, 0))
+        disc = Image.new("RGBA", (LOGO_DISC_D, LOGO_DISC_D), (0,0,0,0))
+        d = ImageDraw.Draw(disc)
+        d.ellipse((0,0,LOGO_DISC_D-1,LOGO_DISC_D-1), fill=(255,255,255,255))
+        lg = ImageOps.contain(team_logo_img, (LOGO_INNER_D, LOGO_INNER_D), Image.LANCZOS)
+        disc.alpha_composite(lg, ((disc.width - lg.width)//2, (disc.height - lg.height)//2))
+        logo_x = x0 + PADDING
+        logo_y = y0 + (block_h - LOGO_DISC_D)//2
+        canvas.alpha_composite(disc, (logo_x, logo_y))
     else:
-        head = _circle_crop(player_img, HEAD_D)
-    head_x = x0 + PADDING_X + LOGO_CIRCLE_D + 20
-    head_y = y1 - HEAD_D + HEAD_OFFSET_Y - (BAR_H // 2)
-    _paste_rgba(canvas, head, (head_x, head_y))
+        logo_x = x0 + PADDING
 
-    # текстовый столбец — центр по своей области
-    text_left = head_x + HEAD_D + inner_pad
-    text_right = x1 - PADDING_X - extra_right_w
+    # Голова — круг, чуть выходит вверх/вниз от шторы, центр по высоте блока
+    face = _circle_crop_face(headshot_img, HEAD_D)
+    face_x = logo_x + LOGO_DISC_D + 18
+    face_y = y0 + (block_h - HEAD_D)//2 - 4  # слегка выше центра
+    face_y = max(0, face_y)                  # не вылезти за канвас
+    canvas.alpha_composite(face, (face_x, face_y))
+
+    # Текстовая колонна
+    text_left  = face_x + HEAD_D + 24
+    text_right = x1 - PADDING - extra_right_w
     text_center = (text_left + text_right) // 2
 
-    # имя
-    name_w, name_h = _measure(draw, name_text, font_name)
+    # Имя (по центру своей области)
     name_x = text_center - name_w // 2
-    name_y = y0 + 34
-    draw.text((name_x, name_y), name_text, font=font_name, fill=(255, 255, 255, 255))
+    name_y = y0 + 28
+    draw.text((name_x, name_y), name_text, font=f_name, fill=(255,255,255,255))
 
-    # статы
-    cols = []
-    total_cols_w = 0
-    for value, label in stat_pairs:
-        vw, _ = _measure(draw, value, font_stat_val)
-        lw, _ = _measure(draw, label.upper(), font_stat_lbl)
-        w = max(vw, lw)
-        cols.append((w, (value, label)))
-        total_cols_w += w
-    total_cols_w += col_gap * max(len(cols) - 1, 0)
-
-    stats_y_value = name_y + name_h + 28
-    stats_y_label = stats_y_value + STAT_VALUE_SIZE + 6
-
-    x = text_center - total_cols_w // 2
-    for w, (value, label) in cols:
-        vw, _ = _measure(draw, value, font_stat_val)
-        lw, _ = _measure(draw, label.upper(), font_stat_lbl)
-        draw.text((x + (w - vw)//2, stats_y_value), value, font=font_stat_val, fill=(255, 255, 255, 255))
-        draw.text((x + (w - lw)//2, stats_y_label), label.upper(), font=font_stat_lbl, fill=(255, 255, 255, 200))
-        x += w + col_gap
+    # Статы (по центру под именем)
+    if cols:
+        stats_y_val  = name_y + name_h + 18
+        stats_y_lbl  = stats_y_val + STAT_VALUE_SIZE + 6
+        cur_x = text_center - total_cols_w // 2
+        for w, (v, l) in cols:
+            vw, _ = _measure(draw, v, f_val)
+            lw, _ = _measure(draw, l, f_lbl)
+            draw.text((cur_x + (w - vw)//2, stats_y_val), v, font=f_val, fill=(255,255,255,255))
+            draw.text((cur_x + (w - lw)//2, stats_y_lbl), l, font=f_lbl, fill=(255,255,255,210))
+            cur_x += w + gap
 
     return (x0, y0, x1, y1)
 
-# =============== Public API (back-compat) ===============
-def render_card(canvas, player_img, team_logo_img, name_ru, stats, *unused, **kwargs):
-    canvas = _ensure_canvas(canvas)
-    _build_left_module(canvas, CANVAS_H - PADDING_Y, player_img, team_logo_img, name_ru, stats,
-                       GRAD_ORANGE_L, GRAD_ORANGE_R, extra_right_w=0)
-    return canvas
 
-def render_cardbad(canvas, player_img, team_logo_img, name_ru, stats, *unused, **kwargs):
-    canvas = _ensure_canvas(canvas)
-    x0, y0, x1, y1 = _build_left_module(canvas, CANVAS_H - PADDING_Y, player_img, team_logo_img, name_ru, stats,
-                                        GRAD_BAD_L, GRAD_BAD_R, extra_right_w=0)
-    # 💩 слева от имени, без белого круга
-    draw = ImageDraw.Draw(canvas)
-    font_name = _font(FONT_MONTSERRAT_BOLD, NAME_SIZE)
-    name_text = (name_ru or "").upper()
-    name_w, name_h = _measure(draw, name_text, font_name)
-    left_pad = PADDING_X + LOGO_CIRCLE_D + 20 + HEAD_D + 26
-    center = (left_pad + (x1 - PADDING_X)) // 2
-    name_x = center - name_w // 2
-    name_y = y0 + 34
-    poop = _load_icon("poop.png", size=34, no_circle=True)
-    _paste_rgba(canvas, poop, (max(x0 + PADDING_X, name_x - 44), name_y + (name_h - poop.height)//2))
-    return canvas
+# -----------------------------
+# Публичный API (СТРОГО как ждёт telegram.py)
+# -----------------------------
+def render_card(
+    mode: str,                    # "single" — игнорируем
+    player_name_ru: str,
+    subtitle: str,                # игнорируем
+    team_logo_img: Any,
+    colors: Tuple[str,str,str],   # игнорируем (у нас фикс-градиенты)
+    headshot_img: Any,
+    stats: List[Tuple[str,str]],
+    **kwargs
+) -> bytes:
+    """
+    /card <имя> | <статы>
+    Фон — оранжевый градиент.
+    """
+    # Привести входы к Image
+    head = _as_image(headshot_img)
+    logo = _as_image(team_logo_img)
+    if head is None:
+        head = Image.new("RGBA", (HEAD_D, HEAD_D), (0,0,0,0))
 
-# alias с нижним подчёркиванием — для совместимости со старым кодом
-def render_card_bad(canvas, *args, **kwargs):
-    return render_cardbad(canvas, *args, **kwargs)
+    canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0,0,0,0))
+    _build_left_block(canvas, player_name_ru, logo, head, stats, GRAD_ORANGE_L, GRAD_ORANGE_R, extra_right_w=0)
+    return _to_png_bytes(canvas)
 
-def render_cards(canvas, player_img, team_logo_img, name_ru, stats, right_text="молодец", *unused, **kwargs):
-    canvas = _ensure_canvas(canvas)
-    draw = ImageDraw.Draw(canvas)
-    f_right = _font(FONT_MONTSERRAT_SEMI, RIGHT_TEXT_SIZE)
-    txt_w, _ = _measure(draw, right_text, f_right)
-    right_w = max(320, txt_w + 120)
 
-    x0, y0, x1, y1 = _build_left_module(canvas, CANVAS_H - PADDING_Y, player_img, team_logo_img, name_ru, stats,
-                                        GRAD_ORANGE_L, GRAD_ORANGE_R, extra_right_w=right_w)
+def render_card2(
+    name1: str, logo1: Any, colors1: Tuple[str,str,str], head1: Any, stats1: List[Tuple[str,str]],
+    name2: str, logo2: Any, colors2: Tuple[str,str,str], head2: Any, stats2: List[Tuple[str,str]],
+    **kwargs
+) -> bytes:
+    """
+    /card2 <имя1> | <статы1> || <имя2> | <статы2>
+    Левая половина — фиолетовый градиент, правая — синий.
+    Плашки соединены без зазора, размеры шрифтов совпадают у обеих сторон.
+    """
+    head1 = _as_image(head1) or Image.new("RGBA", (HEAD_D, HEAD_D), (0,0,0,0))
+    head2 = _as_image(head2) or Image.new("RGBA", (HEAD_D, HEAD_D), (0,0,0,0))
+    logo1 = _as_image(logo1)
+    logo2 = _as_image(logo2)
 
-    # правый блок без зазора
-    r_x0 = x1 - right_w
-    r_x1 = x1
-    _draw_gradient_rect(canvas, (r_x0, y0, r_x1, y1), (36, 36, 36), (20, 20, 20))
+    # рендерим каждую половину на своём слое, затем обрезаем до блока и склеиваем
+    layer_l = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0,0,0,0))
+    l_box = _build_left_block(layer_l, name1, logo1, head1, stats1, GRAD_PURPLE_L, GRAD_PURPLE_R, extra_right_w=0)
+    left_crop = layer_l.crop(l_box)
 
-    star = _load_icon("star.png", size=34, no_circle=True)  # без белого круга
-    icon_y = y0 + BAR_H // 2 - star.height // 2
-    _paste_rgba(canvas, star, (r_x0 + 28, icon_y))
-    draw.text((r_x0 + 28 + star.width + 16, icon_y + (star.height - RIGHT_TEXT_SIZE)//2),
-              right_text, font=f_right, fill=(255, 255, 255, 255))
-    return canvas
+    layer_r = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0,0,0,0))
+    r_box = _build_left_block(layer_r, name2, logo2, head2, stats2, GRAD_BLUE_L, GRAD_BLUE_R, extra_right_w=0)
+    right_crop = layer_r.crop(r_box)
 
-def render_card2(canvas,
-                 left_player_img, left_team_logo, left_name_ru, left_stats,
-                 right_player_img, right_team_logo, right_name_ru, right_stats,
-                 *unused, **kwargs):
-    canvas = _ensure_canvas(canvas)
-
-    layer_left = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
-    lx0, ly0, lx1, ly1 = _build_left_module(layer_left, CANVAS_H - PADDING_Y,
-                                            left_player_img, left_team_logo, left_name_ru, left_stats,
-                                            GRAD_PURPLE_L, GRAD_PURPLE_R, extra_right_w=0)
-    left_crop = layer_left.crop((lx0, ly0, lx1, ly1))
-    left_w = left_crop.width
-
-    layer_right = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
-    rx0, ry0, rx1, ry1 = _build_left_module(layer_right, CANVAS_H - PADDING_Y,
-                                            right_player_img, right_team_logo, right_name_ru, right_stats,
-                                            GRAD_BLUE_L, GRAD_BLUE_R, extra_right_w=0)
-    right_crop = layer_right.crop((rx0, ry0, rx1, ry1))
-    right_w = right_crop.width
-
-    total_w = left_w + right_w
+    total_w = left_crop.width + right_crop.width
     max_w = int(CANVAS_W * SAFE_W_RATIO)
     scale = 1.0 if total_w <= max_w else max_w / total_w
 
     if scale < 0.999:
-        left_crop = left_crop.resize((int(left_w * scale), int(left_crop.height * scale)), Image.LANCZOS)
-        right_crop = right_crop.resize((int(right_w * scale), int(right_crop.height * scale)), Image.LANCZOS)
+        left_crop  = left_crop.resize((int(left_crop.width * scale),  int(left_crop.height * scale)),  Image.LANCZOS)
+        right_crop = right_crop.resize((int(right_crop.width * scale), int(right_crop.height * scale)), Image.LANCZOS)
 
+    canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0,0,0,0))
     total_w = left_crop.width + right_crop.width
     start_x = (CANVAS_W - total_w) // 2
-    y_bottom = CANVAS_H - PADDING_Y - left_crop.height
+    y = CANVAS_H - PADDING - left_crop.height
 
-    _paste_rgba(canvas, left_crop, (start_x, y_bottom))
-    _paste_rgba(canvas, right_crop, (start_x + left_crop.width, y_bottom))
-    return canvas
+    canvas.alpha_composite(left_crop, (start_x, y))
+    canvas.alpha_composite(right_crop, (start_x + left_crop.width, y))  # без зазора
+    return _to_png_bytes(canvas)
 
-# ---- Back-compat shim ----
-def render_card_special(canvas, *args, **kwargs):
+
+def render_card_special(
+    name: str,
+    logo: Any,
+    colors: Tuple[str,str,str],      # игнорируем
+    head: Any,
+    stats: List[Tuple[str,str]],
+    right_text: str,
+    **kwargs
+) -> bytes:
     """
-    Обратная совместимость со старыми вызовами.
-    Если передали right_text — рендерим как render_cards,
-    иначе — как обычный render_card.
+    /cards <имя> | <статы> | <правый текст>
+    Левая часть — оранжевый градиент; правая узкая панель — тёмная; иконка звезды БЕЗ белого круга.
     """
-    canvas = _ensure_canvas(canvas)
-    right_text = kwargs.pop("right_text", None)
-    if right_text is None and len(args) >= 6:
-        right_text = args[5]
-        args = args[:5]
-    try:
-        if right_text is None:
-            return render_card(canvas, *args, **kwargs)
-        else:
-            return render_cards(canvas, *args[:5], right_text, *args[6:], **kwargs)
-    except TypeError:
-        if right_text is None:
-            return render_card(canvas, *args[:5], **kwargs)
-        return render_cards(canvas, *args[:5], right_text, **kwargs)
+    head_img = _as_image(head) or Image.new("RGBA", (HEAD_D, HEAD_D), (0,0,0,0))
+    logo_img = _as_image(logo)
+
+    # прикидываем ширину правой панели (по тексту)
+    tmp_canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0,0,0,0))
+    draw = ImageDraw.Draw(tmp_canvas)
+    f_right = _font_right(RIGHT_TEXT_SIZE)
+    tw, th = _measure(draw, str(right_text or ""), f_right)
+    right_w = max(320, min(int(CANVAS_W * 0.33), tw + 120))
+
+    canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0,0,0,0))
+    x0, y0, x1, y1 = _build_left_block(canvas, name, logo_img, head_img, stats, GRAD_ORANGE_L, GRAD_ORANGE_R, extra_right_w=right_w)
+
+    # правая панель без зазора
+    rx0 = x1 - right_w
+    rx1 = x1
+    bar = _grad_lr(right_w, BAR_H, (36,36,36), (20,20,20))
+    canvas.alpha_composite(bar, (rx0, y0))
+
+    # звезда без белого круга
+    star = _load_icon("star.png", ICON_SIZE, plain=True)
+    icon_y = y0 + (BAR_H - star.height)//2
+    canvas.alpha_composite(star, (rx0 + 24, icon_y))
+
+    draw = ImageDraw.Draw(canvas)
+    draw.text((rx0 + 24 + star.width + 14, icon_y + (star.height - RIGHT_TEXT_SIZE)//2 + 2),
+              str(right_text or ""), font=f_right, fill=(255,255,255,255))
+
+    return _to_png_bytes(canvas)
+
+
+def render_card_bad(
+    name: str,
+    head: Any,
+    stats: List[Tuple[str,str]],
+    team_logo_img: Any = None,
+    **kwargs
+) -> bytes:
+    """
+    /cardbad <имя> | <статы>
+    Коричневый градиент, иконка «💩» БЕЗ белого круга, логотип команды слева рядом с головой (как у обычной карточки).
+    """
+    head_img = _as_image(head) or Image.new("RGBA", (HEAD_D, HEAD_D), (0,0,0,0))
+    logo_img = _as_image(team_logo_img)
+
+    canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0,0,0,0))
+    x0, y0, x1, y1 = _build_left_block(canvas, name, logo_img, head_img, stats, GRAD_BAD_L, GRAD_BAD_R, extra_right_w=0)
+
+    # иконка 💩 слева от имени, без белого круга
+    draw = ImageDraw.Draw(canvas)
+    f_name = _font_name(NAME_SIZE)
+    name_text = str(name or "").upper()
+    name_w, name_h = _measure(draw, name_text, f_name)
+    # вычисляем центр той же текстовой области (как в _build_left_block)
+    # повторяем расчёт: left_fixed
+    left_fixed = PADDING + LOGO_DISC_D + 18 + HEAD_D + 24
+    text_left  = x0 + left_fixed
+    text_right = x1 - PADDING
+    text_center = (text_left + text_right) // 2
+    name_x = text_center - name_w // 2
+    name_y = y0 + 28
+
+    poop = _load_icon("poop.png", ICON_SIZE, plain=True)
+    canvas.alpha_composite(poop, (max(x0 + PADDING, name_x - (poop.width + 16)), name_y + (name_h - poop.height)//2))
+    return _to_png_bytes(canvas)
