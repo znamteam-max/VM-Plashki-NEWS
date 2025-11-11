@@ -1,6 +1,6 @@
 # data.py
 from __future__ import annotations
-import os, io, json, base64, unicodedata
+import os, io, json, base64, unicodedata, time
 from typing import Any, Dict, List, Optional, Tuple, Iterable
 from urllib.request import Request as UrlRequest, urlopen as http_urlopen
 from urllib.error import HTTPError, URLError
@@ -477,7 +477,7 @@ def ensure_headshot_png(player: Any) -> Optional[bytes]:
         try:
             with open(tmp_path, "rb") as f:
                 return f.read()
-        except: 
+        except:
             pass
 
     def _download(u: str) -> Optional[bytes]:
@@ -520,7 +520,7 @@ def ensure_team_logo_png(team_id: Any) -> Optional[str]:
             return p2
         try:
             for fn in os.listdir(d):
-                if not fn.lower().endswith(".png"): 
+                if not fn.lower().endswith(".png"):
                     continue
                 if tid in fn:
                     return os.path.join(d, fn)
@@ -532,7 +532,12 @@ def ensure_team_logo_png(team_id: Any) -> Optional[str]:
     return None
 
 # ------------------ OVERRIDES (RU NAMES) ------------------
-_OV_CACHE: Optional[Dict[str, str]] = None
+# Новый, более устойчивый к 404/сетевым ошибкам блок.
+_OV_STATE: Dict[str, Any] = {
+    "map": {},     # {"2544": "ЛЕБРОН ДЖЕЙМС", ...}
+    "sha": None,   # SHA последней версии файла в GH
+    "loaded_at": 0.0,
+}
 
 def _ov_load_local() -> Dict[str, str]:
     try:
@@ -547,86 +552,131 @@ def _ov_load_local() -> Dict[str, str]:
 
 def _ov_save_local(d: Dict[str, str]) -> None:
     try:
+        os.makedirs(os.path.dirname(OV_LOCAL), exist_ok=True)
         with open(OV_LOCAL, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False)
+            json.dump(d, f, ensure_ascii=False, indent=2)
     except Exception as e:
         _log("ov local write error:", e)
 
-def _gh_get_file() -> Optional[Tuple[str, Dict[str, str]]]:
+def _ov__gh_get() -> Tuple[Dict[str, str], Optional[str]]:
+    """
+    Читает JSON из GitHub. На 404 возвращает ({}, None) — это сигнал «создадим новый файл при записи».
+    """
     if not (OV_GH_TOKEN and OV_GH_REPO and OV_GH_PATH):
-        return None
+        # нет настроек GH — читаем локальный fallback
+        return _ov_load_local(), None
+
     url = f"https://api.github.com/repos/{OV_GH_REPO}/contents/{OV_GH_PATH}?ref={OV_GH_BRANCH}"
-    req = UrlRequest(url, headers={"Authorization": f"token {OV_GH_TOKEN}", "User-Agent":"vm-plashki"})
+    req = UrlRequest(url, headers={
+        "Authorization": f"Bearer {OV_GH_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "vm-plashki-news-bot",
+    })
     try:
         with http_urlopen(req, timeout=15) as r:
             js = json.loads(r.read().decode("utf-8","ignore"))
-        content_b64 = js.get("content","")
+        content_b64 = js.get("content","") or ""
         sha = js.get("sha")
-        data = base64.b64decode(content_b64.encode("utf-8")).decode("utf-8","ignore")
-        d = json.loads(data) if data else {}
-        if not isinstance(d, dict): d = {}
-        return sha, {str(k):str(v) for k,v in d.items()}
+        try:
+            raw = base64.b64decode(content_b64.encode("utf-8")).decode("utf-8","ignore")
+            d = json.loads(raw) if raw else {}
+            if not isinstance(d, dict):
+                d = {}
+        except Exception:
+            d = {}
+        return ({str(k):str(v) for k,v in d.items()}), sha
+    except HTTPError as e:
+        if e.code == 404:
+            _log("ov gh get: 404 (will create on put)", OV_GH_PATH)
+            return {}, None
+        _log("ov gh get error:", e)
+        # если что-то иное — локальный fallback, чтобы не падать
+        return _ov_load_local(), None
+    except URLError as e:
+        _log("ov gh get urlerror:", e)
+        return _ov_load_local(), None
     except Exception as e:
         _log("ov gh get error:", e)
-        return None
+        return _ov_load_local(), None
 
-def _gh_put_file(d: Dict[str, str], prev_sha: Optional[str]) -> bool:
+def _ov__gh_put(map_obj: Dict[str, str], prev_sha: Optional[str]) -> bool:
+    """
+    Пишет JSON в GitHub. Если prev_sha нет — создаём файл; если есть — обновляем.
+    При ошибке 409 (устаревший sha) можно было бы ретраить: для простоты сейчас вернём False.
+    """
     if not (OV_GH_TOKEN and OV_GH_REPO and OV_GH_PATH):
-        return False
+        # нет GH — хотя бы локально сохраним
+        _ov_save_local(map_obj)
+        return True
+
     url = f"https://api.github.com/repos/{OV_GH_REPO}/contents/{OV_GH_PATH}"
+    content_str = json.dumps(map_obj, ensure_ascii=False, indent=2)
     payload = {
-        "message": "update players_overrides.json",
-        "content": base64.b64encode(json.dumps(d, ensure_ascii=False).encode("utf-8")).decode("utf-8"),
+        "message": "feat(overrides): update RU names via bot",
+        "content": base64.b64encode(content_str.encode("utf-8")).decode("ascii"),
         "branch": OV_GH_BRANCH,
     }
     if prev_sha:
         payload["sha"] = prev_sha
+
     body = json.dumps(payload).encode("utf-8")
     req = UrlRequest(url, data=body, headers={
-        "Authorization": f"token {OV_GH_TOKEN}",
-        "User-Agent":"vm-plashki",
-        "Content-Type":"application/json",
+        "Authorization": f"Bearer {OV_GH_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "vm-plashki-news-bot",
+        "Content-Type": "application/json",
     })
     try:
-        with http_urlopen(req, timeout=15) as r:
+        with http_urlopen(req, timeout=20) as r:
             r.read()
+        # Сохраним локальный дубликат на всякий случай
+        _ov_save_local(map_obj)
         return True
+    except HTTPError as e:
+        _log("ov gh put error:", e)
+        return False
+    except URLError as e:
+        _log("ov gh put urlerror:", e)
+        return False
     except Exception as e:
         _log("ov gh put error:", e)
         return False
 
-def _ov_load() -> Dict[str, str]:
-    global _OV_CACHE
-    if _OV_CACHE is not None:
-        return _OV_CACHE
-    d = _ov_load_local()
-    gh = _gh_get_file()
-    if gh:
-        _sha, gd = gh
-        d = gd
-    _OV_CACHE = d
-    return d
-
-def _ov_flush(d: Dict[str, str]) -> None:
-    global _OV_CACHE
-    _OV_CACHE = d
-    _ov_save_local(d)
-    gh = _gh_get_file()
-    prev_sha = gh[0] if gh else None
-    _gh_put_file(d, prev_sha)
+def _ov__ensure_loaded(ttl_seconds: int = 300) -> None:
+    """
+    Лениво подгружаем карту имён из GH (или из локального fallback) не чаще, чем раз в ttl_seconds.
+    """
+    now = time.time()
+    if (now - _OV_STATE["loaded_at"] < ttl_seconds) and _OV_STATE["map"]:
+        return
+    d, sha = _ov__gh_get()
+    _OV_STATE["map"] = d or {}
+    _OV_STATE["sha"] = sha
+    _OV_STATE["loaded_at"] = now
+    _log("overrides loaded:", len(_OV_STATE["map"]), "sha:", _OV_STATE["sha"])
 
 def overrides_get_name_ru(person_id: str) -> Optional[str]:
-    d = _ov_load()
-    return d.get(str(person_id))
+    _ov__ensure_loaded()
+    return _OV_STATE["map"].get(str(person_id).strip() or "")
 
 def overrides_save_name_ru(person_id: str, name_ru: str) -> bool:
-    person_id = str(person_id).strip()
-    if not person_id or not name_ru:
+    """
+    Обновляет имя в кэше + пишет JSON в GH.
+    """
+    pid = str(person_id or "").strip()
+    nm  = (name_ru or "").strip()
+    if not pid or not nm:
         return False
-    d = _ov_load()
-    d[person_id] = name_ru.strip()
-    _ov_flush(d)
-    return True
+
+    _ov__ensure_loaded()
+    # Обновим кэш
+    _OV_STATE["map"][pid] = nm
+
+    ok = _ov__gh_put(_OV_STATE["map"], _OV_STATE["sha"])
+    if ok:
+        # Сбросим таймер, чтобы на следующем обращении заново подтянуть sha (если нужно)
+        _OV_STATE["loaded_at"] = 0.0
+    return ok
 
 # ------------------ PUBLIC TEST HOOKS (optional) ------------------
 def search_players_loose(q: str) -> List[Dict[str, Any]]:
