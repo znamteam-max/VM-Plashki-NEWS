@@ -1,11 +1,10 @@
-# data.py
+# api/data.py
 from __future__ import annotations
 import os, io, json, base64, unicodedata
 from typing import Any, Dict, List, Optional, Tuple, Iterable
 from urllib.request import Request as UrlRequest, urlopen as http_urlopen
 from urllib.error import HTTPError, URLError
 
-# ------------------ ENV / CONFIG ------------------
 DEBUG = os.getenv("DEBUG", "1") in ("1","true","yes")
 
 ENV_URLS        = os.getenv("PLAYERS_CUSTOM_URLS","").strip()
@@ -20,13 +19,11 @@ TIMEOUT         = int(os.getenv("PLAYERS_CUSTOM_TIMEOUT","25") or "25")
 DEFAULT_PT      = f"https://nba-players-proxy.znamteam-903.workers.dev/players?season={PLAYERS_SEASON}&format=passthrough"
 DEFAULT_NORM    = f"https://nba-players-proxy.znamteam-903.workers.dev/players?season={PLAYERS_SEASON}&format=normalized"
 
-# GH overrides (не обязательно)
 OV_GH_TOKEN  = os.getenv("OVERRIDES_GH_TOKEN","").strip()
-OV_GH_REPO   = os.getenv("OVERRIDES_GH_REPO","").strip()            # "owner/repo"
-OV_GH_PATH   = os.getenv("OVERRIDES_GH_PATH","").strip()            # "assets/players_overrides.json"
+OV_GH_REPO   = os.getenv("OVERRIDES_GH_REPO","").strip()
+OV_GH_PATH   = os.getenv("OVERRIDES_GH_PATH","").strip()
 OV_GH_BRANCH = os.getenv("OVERRIDES_GH_BRANCH","main").strip()
 
-# Файловые пути
 ROOT_DIR   = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(ROOT_DIR, "assets")
 CACHE_DIR  = "/tmp"
@@ -37,13 +34,11 @@ LOGO_DIR_TEAMS  = os.path.join(ASSETS_DIR, "teams")
 
 HEADSHOT_TMP_FMT = os.path.join(CACHE_DIR, "headshot_{pid}.png")
 
-# ------------------ LOG ------------------
 def _log(*a: Any) -> None:
     if DEBUG:
         try: print("[data]", *a, flush=True)
         except: pass
 
-# ------------------ HTTP UTILS ------------------
 def _http_get(url: str, timeout: int = TIMEOUT) -> Optional[bytes]:
     req = UrlRequest(url, headers={
         "User-Agent": "vm-plashki/1.0 (+bot)",
@@ -70,7 +65,6 @@ def _try_fetch(url: str) -> Optional[Any]:
         _log("json parse error:", url, repr(last_err))
     return None
 
-# ------------------ NORMALIZE/ALIAS ------------------
 def _normalize_name(s: str) -> str:
     s = (s or "").strip().lower()
     s = unicodedata.normalize("NFKD", s)
@@ -87,8 +81,7 @@ def display_name_for(p: Dict[str, Any]) -> str:
     last  = (p.get("lastName") or "").strip()
     return (first + " " + last).strip()
 
-# ------------------ PLAYERS CACHE ------------------
-_PLAYERS: List[Dict[str, Any]] = []  # объединённый пул (мердж PT+NORM)
+_PLAYERS: List[Dict[str, Any]] = []
 
 def _index_by_pid(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
@@ -108,7 +101,6 @@ def _classify_urls() -> Tuple[List[str], List[str]]:
         urls.append(PLAYERS_URL)
     if not urls:
         urls = [DEFAULT_PT, DEFAULT_NORM]
-
     pt, norm = [], []
     for u in urls:
         lu = u.lower()
@@ -117,7 +109,6 @@ def _classify_urls() -> Tuple[List[str], List[str]]:
         elif "normalized" in lu:
             norm.append(u)
         else:
-            # неизвестно — считаем passthrough
             pt.append(u)
     if not pt:   pt   = [DEFAULT_PT]
     if not norm: norm = [DEFAULT_NORM]
@@ -125,7 +116,6 @@ def _classify_urls() -> Tuple[List[str], List[str]]:
     _log("norm_urls:", norm)
     return pt, norm
 
-# ------------------ GENERIC EXTRACT HELPERS ------------------
 def _row_from_headers(headers: List[str], row: List[Any]) -> Dict[str, Any]:
     hmap = {h.upper(): i for i, h in enumerate(headers or [])}
     def at(key: str) -> Any:
@@ -138,11 +128,9 @@ def _row_from_headers(headers: List[str], row: List[Any]) -> Dict[str, Any]:
     dn   = at("DISPLAY_FIRST_LAST") or at("PLAYER") or ""
     team = at("TEAM_ID") or at("TEAMID") or at("TEAM") or "0"
 
-    # Подчистим
     try: team = str(int(team))
     except: team = str(team or "0")
 
-    # Если имени нет – попытаться разобрать DISPLAY_FIRST_LAST
     if (not first or not last) and isinstance(dn, str) and dn.strip():
         parts = dn.strip().split()
         if len(parts) >= 2:
@@ -158,28 +146,14 @@ def _row_from_headers(headers: List[str], row: List[Any]) -> Dict[str, Any]:
     }
 
 def _iter_records(obj: Any) -> Iterable[Dict[str, Any]]:
-    """
-    Универсальный итератор по «похожим на игрока» объектам.
-    Возвращает уже нормализованные словари с personId/first/last/displayName/teamId.
-    Поддерживает:
-      - простые списки словарей
-      - {"league":{"standard":[...]}}
-      - {"players":[...]}, {"athletes":[...]} и др.
-      - {"headers":[...], "rowSet":[...]}
-      - {"resultSets":[{headers,rowSet}, ...]} / {"resultSet":{headers,rowSet}}
-      - произвольные словари с values=list
-    """
-    # Вариант: уже список словарей
     if isinstance(obj, list):
         for r in obj:
             if isinstance(r, dict):
                 yield _coerce_player_dict(r)
         return
-
     if not isinstance(obj, dict):
         return
 
-    # headers + rowSet
     hdrs = obj.get("headers")
     rows = obj.get("rowSet") or obj.get("rows")
     if isinstance(hdrs, list) and isinstance(rows, list):
@@ -189,7 +163,6 @@ def _iter_records(obj: Any) -> Iterable[Dict[str, Any]]:
                 if rec.get("personId"):
                     yield rec
 
-    # resultSets / resultSet
     rs = obj.get("resultSets") or obj.get("resultSet")
     if isinstance(rs, list):
         for block in rs:
@@ -212,7 +185,6 @@ def _iter_records(obj: Any) -> Iterable[Dict[str, Any]]:
                     if rec.get("personId"):
                         yield rec
 
-    # лига
     league = obj.get("league")
     if isinstance(league, dict):
         for key in ("standard","vegas","africa","sacramento"):
@@ -222,7 +194,6 @@ def _iter_records(obj: Any) -> Iterable[Dict[str, Any]]:
                     if isinstance(r, dict):
                         yield _coerce_player_dict(r)
 
-    # заведомые ключи
     for key in ("players","athletes","items","data","result","roster"):
         v = obj.get(key)
         if isinstance(v, list):
@@ -230,11 +201,9 @@ def _iter_records(obj: Any) -> Iterable[Dict[str, Any]]:
                 if isinstance(r, dict):
                     yield _coerce_player_dict(r)
         elif isinstance(v, dict):
-            # иногда data:{headers,rowSet} или data:{items:[...] }
             for rec in _iter_records(v):
                 yield rec
 
-    # общий перебор словаря — ищем любые list[dict]
     for v in obj.values():
         if isinstance(v, list):
             for r in v:
@@ -248,15 +217,12 @@ def _coerce_player_dict(r: Dict[str, Any]) -> Dict[str, Any]:
     dn   = r.get("displayName") or r.get("name") or r.get("fullName") or r.get("DISPLAY_FIRST_LAST")
     team = r.get("teamId") or r.get("team_id") or r.get("TEAM_ID") or r.get("team") or "0"
 
-    # team может быть dict
     if isinstance(team, dict):
         team = team.get("id") or team.get("teamId") or "0"
 
-    # подчистим
     try: team = str(int(team))
     except: team = str(team or "0")
 
-    # DN из first/last
     if not dn:
         dn = f"{first or ''} {last or ''}".strip()
 
@@ -266,20 +232,15 @@ def _coerce_player_dict(r: Dict[str, Any]) -> Dict[str, Any]:
         "lastName":  (last or "").strip(),
         "displayName": (dn or "").strip(),
         "teamId": team,
-        # перекинем возможные поля с урлами головы (пусть останутся для подсказки)
         "headshotURL": r.get("headshot") or r.get("img") or r.get("HEADSHOT") or None,
     }
 
-# ------------------ EXTRACTORS ------------------
 def _extract_normalized(j: Any) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     if j is None:
         return rows
-    # normalized обычно уже плоский список; но прогоним универсальный итератор
     for rec in _iter_records(j):
-        # у normalized часто нет имён — оставим как есть, headshot подсказка важна
         if rec.get("personId"):
-            # гарантируем headshot fallback
             if not rec.get("headshotURL"):
                 pid = rec["personId"]
                 rec["headshotURL"] = f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png"
@@ -295,15 +256,10 @@ def _extract_passthrough(j: Any) -> List[Dict[str, Any]]:
             rows.append(rec)
     return rows
 
-# ------------------ MERGE ------------------
 def _merge_pt_norm(pt: List[Dict[str, Any]], norm: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Приоритет: имена/команды — из PT, headshot — из NORM.
-    """
     ix_norm = _index_by_pid(norm)
     out: List[Dict[str, Any]] = []
     seen: set[str] = set()
-
     for p in pt:
         pid = str(p.get("personId") or "")
         if not pid:
@@ -311,12 +267,9 @@ def _merge_pt_norm(pt: List[Dict[str, Any]], norm: List[Dict[str, Any]]) -> List
         base = dict(p)
         if pid in ix_norm:
             base["headshotURL"] = ix_norm[pid].get("headshotURL") or base.get("headshotURL")
-        out.append(base)
-        seen.add(pid)
-
+        out.append(base); seen.add(pid)
     for pid, n in ix_norm.items():
-        if pid in seen:
-            continue
+        if pid in seen: continue
         out.append(dict(n))
     return out
 
@@ -332,46 +285,31 @@ def _merge_into_cache(rows: List[Dict[str, Any]]) -> None:
             dst = ix[pid]
             for k in ("displayName","firstName","lastName","teamId","headshotURL"):
                 v = r.get(k)
-                if v:
-                    dst[k] = v
+                if v: dst[k] = v
         else:
             _PLAYERS.append(r)
         changed = True
-    if changed:
-        _log("merged into cache:", len(rows), "rows")
+    if changed: _log("merged into cache:", len(rows), "rows")
 
-# ------------------ REFRESH / ACCESSORS ------------------
 def refresh_players() -> Tuple[int, str]:
-    """
-    Возвращает (count, src_text). src_text: "merged(pt+norm)" | "pt" | "norm" | "none"
-    """
     global _PLAYERS
     pt_urls, norm_urls = _classify_urls()
 
-    # 1) Пытаемся загрузить PT
     pt_rows: List[Dict[str, Any]] = []
     for u in pt_urls:
-        j = _try_fetch(u)
-        cnt = 0
+        j = _try_fetch(u); cnt = 0
         if j is not None:
-            pt_rows = _extract_passthrough(j)
-            cnt = len(pt_rows)
+            pt_rows = _extract_passthrough(j); cnt = len(pt_rows)
         _log("pt parsed:", cnt, "from", u)
-        if cnt > 0:
-            break
+        if cnt > 0: break
 
-    # 2) PLAYERS_JSON_URL fallback (в PT слот)
     if not pt_rows and PLAYERS_JSON_URL:
         _log("fallback PLAYERS_JSON_URL:", PLAYERS_JSON_URL)
         j = _try_fetch(PLAYERS_JSON_URL)
         if j is not None:
-            # пробуем как PT, затем как NORM
-            pt_rows = _extract_passthrough(j)
-            if not pt_rows:
-                pt_rows = _extract_normalized(j)
+            pt_rows = _extract_passthrough(j) or _extract_normalized(j)
         _log("PLAYERS_JSON_URL parsed:", len(pt_rows))
 
-    # 3) DEFAULT_PT fallback
     if not pt_rows and DEFAULT_PT:
         _log("fallback DEFAULT_PT:", DEFAULT_PT)
         j = _try_fetch(DEFAULT_PT)
@@ -379,32 +317,22 @@ def refresh_players() -> Tuple[int, str]:
             pt_rows = _extract_passthrough(j)
         _log("DEFAULT_PT parsed:", len(pt_rows))
 
-    # 4) Загружаем NORM
     norm_rows: List[Dict[str, Any]] = []
     for u in norm_urls:
-        j = _try_fetch(u)
-        cnt = 0
+        j = _try_fetch(u); cnt = 0
         if j is not None:
-            norm_rows = _extract_normalized(j)
-            cnt = len(norm_rows)
+            norm_rows = _extract_normalized(j); cnt = len(norm_rows)
         _log("norm parsed:", cnt, "from", u)
-        if cnt > 0:
-            break
+        if cnt > 0: break
 
-    # 5) Сшиваем
     if pt_rows and norm_rows:
-        _PLAYERS = _merge_pt_norm(pt_rows, norm_rows)
-        src_label = "merged(pt+norm)"
+        _PLAYERS = _merge_pt_norm(pt_rows, norm_rows); src_label = "merged(pt+norm)"
     elif pt_rows:
-        _PLAYERS = pt_rows
-        src_label = "pt"
+        _PLAYERS = pt_rows; src_label = "pt"
     elif norm_rows:
-        _PLAYERS = norm_rows
-        src_label = "norm"
+        _PLAYERS = norm_rows; src_label = "norm"
     else:
-        _PLAYERS = []
-        src_label = "none"
-
+        _PLAYERS = []; src_label = "none"
     _log(f"final players count: {len(_PLAYERS)} (source={src_label})")
     return len(_PLAYERS), src_label
 
@@ -414,41 +342,32 @@ def get_players(force_refresh: bool = False) -> List[Dict[str, Any]]:
         refresh_players()
     return _PLAYERS
 
-# ------------------ SEARCH ------------------
 def _online_find_in_passthrough(q: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """
-    При пустом локальном кеше имён идём прямо в PT-URL и парсим «по месту».
-    """
     qn = _normalize_name(q)
     if not qn: return []
     pt_urls, _ = _classify_urls()
     results: List[Dict[str, Any]] = []
     for u in pt_urls:
         j = _try_fetch(u)
-        if not j:
-            continue
+        if not j: continue
         rows = _extract_passthrough(j)
         for r in rows:
             hay = display_name_for(r)
             if qn in _normalize_name(hay):
                 results.append(r)
-                if len(results) >= limit:
-                    break
-        if results:
-            break
+                if len(results) >= limit: break
+        if results: break
     return results
 
 def find_player_by_name(q: str) -> List[Dict[str, Any]]:
-    if not q:
-        return []
+    if not q: return []
     qn = _normalize_name(q)
     rows = get_players(False)
     hits: List[Dict[str, Any]] = []
     for r in rows:
         if qn and qn in _normalize_name(display_name_for(r)):
             hits.append(r)
-            if len(hits) >= 10:
-                break
+            if len(hits) >= 10: break
     if not hits:
         online = _online_find_in_passthrough(q, limit=10)
         if online:
@@ -456,11 +375,7 @@ def find_player_by_name(q: str) -> List[Dict[str, Any]]:
             hits = online
     return hits
 
-# ------------------ HEADSHOT & LOGO ------------------
 def ensure_headshot_png(player: Any) -> Optional[bytes]:
-    """
-    Принимает dict игрока ИЛИ personId. Возвращает PNG как bytes (для универсальности).
-    """
     from PIL import Image
     pid = None
     url_hint = None
@@ -469,16 +384,14 @@ def ensure_headshot_png(player: Any) -> Optional[bytes]:
         url_hint = player.get("headshotURL")
     else:
         pid = str(player).strip()
-    if not pid:
-        return None
+    if not pid: return None
 
     tmp_path = HEADSHOT_TMP_FMT.format(pid=pid)
     if os.path.exists(tmp_path):
         try:
             with open(tmp_path, "rb") as f:
                 return f.read()
-        except:
-            pass
+        except: pass
 
     def _download(u: str) -> Optional[bytes]:
         if not u: return None
@@ -486,7 +399,6 @@ def ensure_headshot_png(player: Any) -> Optional[bytes]:
             req = UrlRequest(u, headers={"User-Agent":"vm-plashki/1.0"})
             with http_urlopen(req, timeout=TIMEOUT) as r:
                 data = r.read()
-            from PIL import Image
             im = Image.open(io.BytesIO(data)).convert("RGBA")
             bio = io.BytesIO(); im.save(bio, format="PNG")
             out = bio.getvalue()
@@ -497,43 +409,39 @@ def ensure_headshot_png(player: Any) -> Optional[bytes]:
             return None
 
     url_candidates: List[str] = []
-    if url_hint:
-        url_candidates.append(url_hint)
+    if url_hint: url_candidates.append(url_hint)
     url_candidates += [
         f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png",
         f"https://cdn.nba.com/headshots/nba/latest/260x190/{pid}.png",
         f"https://nba-players-proxy.znamteam-903.workers.dev/img?u={pid}",
     ]
     for u in url_candidates:
-        data = _download(u)
-        if data:
-            return data
+        data_bytes = _download(u)
+        if data_bytes: return data_bytes
     return None
 
 def ensure_team_logo_png(team_id: Any) -> Optional[str]:
     tid = str(team_id or "0")
     for d in (LOGO_DIR_CACHED, LOGO_DIR_TEAMS):
         p1 = os.path.join(d, f"{tid}.png")
-        if os.path.exists(p1):
-            return p1
+        if os.path.exists(p1): return p1
         p2 = os.path.join(d, f"logo_{tid}.png")
-        if os.path.exists(p2):
-            return p2
+        if os.path.exists(p2): return p2
         try:
             for fn in os.listdir(d):
-                if not fn.lower().endswith(".png"):
+                if not fn.lower().endswith(".png"): 
                     continue
                 if tid in fn:
                     return os.path.join(d, fn)
         except FileNotFoundError:
             pass
     gen = os.path.join(LOGO_DIR_TEAMS, "generic.png")
-    if os.path.exists(gen):
-        return gen
+    if os.path.exists(gen): return gen
     return None
 
-# ------------------ OVERRIDES (RU NAMES) ------------------
+# ------------------ OVERRIDES (RU NAMES) -------------------------------------
 _OV_CACHE: Optional[Dict[str, str]] = None
+_GH_SHA: Optional[str] = None
 
 def _ov_load_local() -> Dict[str, str]:
     try:
@@ -553,37 +461,33 @@ def _ov_save_local(d: Dict[str, str]) -> None:
     except Exception as e:
         _log("ov local write error:", e)
 
-# ----- GitHub helpers -----
-def _gh_headers() -> dict:
-    tok = OV_GH_TOKEN
-    return {
-        "Authorization": f"Bearer {tok}",                      # важно для fine-grained токена
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "vm-plashki",
-        "Content-Type": "application/json",
-    }
-
-def _gh_get_file() -> Optional[Tuple[str, Dict[str, str]]]:
+def _gh_get_file() -> Optional[Tuple[Optional[str], Dict[str, str]]]:
+    global _GH_SHA
     if not (OV_GH_TOKEN and OV_GH_REPO and OV_GH_PATH):
         return None
     url = f"https://api.github.com/repos/{OV_GH_REPO}/contents/{OV_GH_PATH}?ref={OV_GH_BRANCH}"
-    req = UrlRequest(url, headers=_gh_headers())
+    headers = {
+        "Authorization": f"Bearer {OV_GH_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "vm-plashki",
+    }
+    req = UrlRequest(url, headers=headers)
     try:
         with http_urlopen(req, timeout=15) as r:
-            js_txt = r.read().decode("utf-8", "ignore")
-        js = json.loads(js_txt)
+            if r.status == 404:
+                _log("ov gh get: 404 (will create on put)", OV_GH_PATH)
+                _GH_SHA = None
+                return (None, {})
+            js = json.loads(r.read().decode("utf-8","ignore"))
         content_b64 = js.get("content","")
         sha = js.get("sha")
         data = base64.b64decode(content_b64.encode("utf-8")).decode("utf-8","ignore")
         d = json.loads(data) if data else {}
         if not isinstance(d, dict): d = {}
-        _log("ov gh get:", "OK", OV_GH_PATH)
+        _GH_SHA = sha
+        _log("overrides loaded:", len(d), "sha:", sha)
         return sha, {str(k):str(v) for k,v in d.items()}
-    except HTTPError as e:
-        # 404 — файла нет/нет доступа. Вернём None — _gh_put_file попробует создать.
-        _log(f"ov gh get: {e.code} (will create on put) {OV_GH_PATH}")
-        return None
     except Exception as e:
         _log("ov gh get error:", e)
         return None
@@ -591,50 +495,53 @@ def _gh_get_file() -> Optional[Tuple[str, Dict[str, str]]]:
 def _gh_put_file(d: Dict[str, str], prev_sha: Optional[str]) -> bool:
     if not (OV_GH_TOKEN and OV_GH_REPO and OV_GH_PATH):
         return False
+    # Требование GitHub API: каталог должен существовать заранее!
+    # Убедись, что папка assets/ есть в репозитории.
     url = f"https://api.github.com/repos/{OV_GH_REPO}/contents/{OV_GH_PATH}"
     payload = {
         "message": "update players_overrides.json",
-        "content": base64.b64encode(json.dumps(d, ensure_ascii=False).encode("utf-8")).decode("utf-8"),
+        "content": base64.b64encode(json.dumps(d, ensure_ascii=False, indent=2).encode("utf-8")).decode("utf-8"),
         "branch": OV_GH_BRANCH,
     }
     if prev_sha:
         payload["sha"] = prev_sha
-    body = json.dumps(payload).encode("utf-8")
-    req = UrlRequest(url, data=body, headers=_gh_headers())
+    headers = {
+        "Authorization": f"Bearer {OV_GH_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "vm-plashki",
+        "Content-Type": "application/json",
+    }
+    req = UrlRequest(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
     try:
         with http_urlopen(req, timeout=15) as r:
             r.read()
-        _log("ov gh put:", "OK", OV_GH_PATH)
         return True
-    except HTTPError as e:
-        _log("ov gh put error:", e)
-        return False
     except Exception as e:
         _log("ov gh put error:", e)
         return False
 
 def _ov_load() -> Dict[str, str]:
-    global _OV_CACHE
+    global _OV_CACHE, _GH_SHA
     if _OV_CACHE is not None:
         return _OV_CACHE
-    # 1) локальный кеш
     d = _ov_load_local()
-    # 2) репозиторий
     gh = _gh_get_file()
     if gh:
-        _sha, gd = gh
-        d = gd
+        _GH_SHA, gd = gh
+        d = gd or d
     _OV_CACHE = d
-    _log("overrides loaded:", len(d), "sha:", gh[0] if gh else None)
     return d
 
 def _ov_flush(d: Dict[str, str]) -> None:
-    global _OV_CACHE
+    global _OV_CACHE, _GH_SHA
     _OV_CACHE = d
     _ov_save_local(d)
     gh = _gh_get_file()
-    prev_sha = gh[0] if gh else None
-    _gh_put_file(d, prev_sha)
+    prev_sha = gh[0] if gh else _GH_SHA
+    ok = _gh_put_file(d, prev_sha)
+    if ok:
+        _gh_get_file()  # обновим sha
 
 def overrides_get_name_ru(person_id: str) -> Optional[str]:
     d = _ov_load()
@@ -649,11 +556,7 @@ def overrides_save_name_ru(person_id: str, name_ru: str) -> bool:
     _ov_flush(d)
     return True
 
-# ------------------ PUBLIC TEST HOOKS (optional) ------------------
 def search_players_loose(q: str) -> List[Dict[str, Any]]:
-    """
-    Для /api/telegram?action=test_find — мягкий поиск: локально, затем онлайн в PT.
-    """
     qn = _normalize_name(q)
     rows = get_players(False)
     hits: List[Dict[str, Any]] = []
