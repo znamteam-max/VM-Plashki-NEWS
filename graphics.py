@@ -378,3 +378,5 @@ def render_card_bad(name_ru: str,
     _draw_name_and_stats(img, text_x, text_y, avail_w, "", stats)
 
     return _png_bytes(img)
+
+GRAPHICS_ACCESS_CHECK = "updated from codespace"
