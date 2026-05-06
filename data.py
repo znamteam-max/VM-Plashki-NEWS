@@ -1,6 +1,6 @@
 # api/data.py
 from __future__ import annotations
-import os, io, json, base64, unicodedata
+import os, io, json, base64, unicodedata, ast, re
 from typing import Any, Dict, List, Optional, Tuple, Iterable
 from urllib.request import Request as UrlRequest, urlopen as http_urlopen
 from urllib.error import HTTPError, URLError
@@ -20,19 +20,30 @@ DEFAULT_PT      = f"https://nba-players-proxy.znamteam-903.workers.dev/players?s
 DEFAULT_NORM    = f"https://nba-players-proxy.znamteam-903.workers.dev/players?season={PLAYERS_SEASON}&format=normalized"
 
 OV_GH_TOKEN  = os.getenv("OVERRIDES_GH_TOKEN","").strip()
-OV_GH_REPO   = os.getenv("OVERRIDES_GH_REPO","").strip()
-OV_GH_PATH   = os.getenv("OVERRIDES_GH_PATH","").strip()
+OV_GH_REPO   = os.getenv("OVERRIDES_GH_REPO","znamteam-max/VM-Plashki-NEWS").strip()
+OV_GH_PATH   = os.getenv("OVERRIDES_GH_PATH","assets/player_overrides.json").strip()
 OV_GH_BRANCH = os.getenv("OVERRIDES_GH_BRANCH","main").strip()
+HEADSHOTS_GH_DIR = os.getenv("OVERRIDES_HEADSHOTS_GH_DIR", "assets/headshots").strip().strip("/")
 
 ROOT_DIR   = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(ROOT_DIR, "assets")
 CACHE_DIR  = "/tmp"
 OV_LOCAL   = os.path.join(CACHE_DIR, "players_overrides.json")
+OV_SEED    = os.getenv("OVERRIDES_SEED_PATH", os.path.join(ASSETS_DIR, "player_overrides.json")).strip()
 
 LOGO_DIR_CACHED = os.path.join(ASSETS_DIR, "cache")
 LOGO_DIR_TEAMS  = os.path.join(ASSETS_DIR, "teams")
 
 HEADSHOT_TMP_FMT = os.path.join(CACHE_DIR, "headshot_{pid}.png")
+CUSTOM_HEADSHOT_DIR = os.path.join(CACHE_DIR, "player_headshots")
+CUSTOM_HEADSHOT_ASSET_DIR = os.path.join(ASSETS_DIR, "headshots")
+
+HISTORICAL_PLAYERS_URLS = [
+    u.strip() for u in os.getenv(
+        "HISTORICAL_PLAYERS_URLS",
+        "https://raw.githubusercontent.com/swar/nba_api/master/src/nba_api/stats/library/data.py",
+    ).split(",") if u.strip()
+]
 
 MANUAL_PLAYERS: List[Dict[str, Any]] = [
     {
@@ -43,6 +54,26 @@ MANUAL_PLAYERS: List[Dict[str, Any]] = [
         "teamId": "1610612751",
         "headshotURL": "https://cdn.nba.com/headshots/nba/latest/1040x760/1642856.png",
         "aliases": ["Egor Dёmin", "Egor Dëmin", "Demin", "Dёmin", "Дёмин", "Демин", "Егор Дёмин"],
+    },
+    {
+        "personId": "1642884",
+        "firstName": "Vladislav",
+        "lastName": "Goldin",
+        "displayName": "Vladislav Goldin",
+        "teamId": "1610612748",
+        "logoTeamId": "0",
+        "headshotURL": "https://cdn.nba.com/headshots/nba/latest/1040x760/1642884.png",
+        "aliases": ["Vlad Goldin", "Влад Голдин", "Владислав Голдин"],
+        "isHistorical": True,
+    },
+    {
+        "personId": "1630559",
+        "firstName": "Austin",
+        "lastName": "Reaves",
+        "displayName": "Austin Reaves",
+        "teamId": "1610612747",
+        "headshotURL": "https://cdn.nba.com/headshots/nba/latest/1040x760/1630559.png",
+        "aliases": ["Reaves", "Ривз", "Остин Ривз"],
     },
 ]
 
@@ -144,6 +175,7 @@ def display_name_for(p: Dict[str, Any]) -> str:
     return (first + " " + last).strip()
 
 _PLAYERS: List[Dict[str, Any]] = []
+_HIST_PLAYERS: Optional[List[Dict[str, Any]]] = None
 
 def _index_by_pid(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
@@ -318,6 +350,84 @@ def _extract_passthrough(j: Any) -> List[Dict[str, Any]]:
             rows.append(rec)
     return rows
 
+def _extract_swar_static_players(raw: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not raw or "players" not in raw:
+        return rows
+    try:
+        start = raw.index("players")
+        list_start = raw.index("[", start)
+        end_marker = raw.find("\nwnba_players", list_start)
+        if end_marker < 0:
+            end_marker = raw.rfind("]")
+        body = raw[list_start:end_marker].strip()
+        parsed = ast.literal_eval(body)
+    except Exception as e:
+        _log("historical parse error:", repr(e))
+        return rows
+
+    if not isinstance(parsed, list):
+        return rows
+    for item in parsed:
+        if not isinstance(item, list) or len(item) < 5:
+            continue
+        pid, last, first, full_name, is_active = item[:5]
+        pid = str(pid or "").strip()
+        if not pid:
+            continue
+        first = str(first or "").strip()
+        last = str(last or "").strip()
+        full_name = str(full_name or f"{first} {last}").strip()
+        rows.append({
+            "personId": pid,
+            "firstName": first,
+            "lastName": last,
+            "displayName": full_name,
+            "teamId": "0",
+            "logoTeamId": "0",
+            "headshotURL": f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png",
+            "isHistorical": not bool(is_active),
+        })
+    return rows
+
+def _fetch_historical_players() -> List[Dict[str, Any]]:
+    global _HIST_PLAYERS
+    if _HIST_PLAYERS is not None:
+        return _HIST_PLAYERS
+    out: List[Dict[str, Any]] = []
+    for url in HISTORICAL_PLAYERS_URLS:
+        raw = _http_get(url, timeout=min(TIMEOUT, 15))
+        if not raw:
+            continue
+        text = raw.decode("utf-8", "ignore")
+        rows: List[Dict[str, Any]] = []
+        if "players" in text and "player_index" in text:
+            rows = _extract_swar_static_players(text)
+        else:
+            try:
+                payload = json.loads(text)
+                rows = _extract_normalized(payload) or _extract_passthrough(payload)
+            except Exception:
+                rows = []
+        if rows:
+            out = _merge_manual_players(rows)
+            break
+    _HIST_PLAYERS = out
+    _log("historical players loaded:", len(out))
+    return _HIST_PLAYERS
+
+def _find_historical_players(q: str, limit: int = 10) -> List[Dict[str, Any]]:
+    qn = _normalize_name(q)
+    if not qn:
+        return []
+    hits: List[Dict[str, Any]] = []
+    for r in _fetch_historical_players():
+        if _matches_player(q, r):
+            hits.append(dict(r))
+            if len(hits) >= limit:
+                break
+    return hits
+
 def _merge_pt_norm(pt: List[Dict[str, Any]], norm: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ix_norm = _index_by_pid(norm)
     out: List[Dict[str, Any]] = []
@@ -345,7 +455,7 @@ def _merge_into_cache(rows: List[Dict[str, Any]]) -> None:
         if not pid: continue
         if pid in ix:
             dst = ix[pid]
-            for k in ("displayName","firstName","lastName","teamId","headshotURL"):
+            for k in ("displayName","firstName","lastName","teamId","logoTeamId","headshotURL","aliases","isHistorical"):
                 v = r.get(k)
                 if v: dst[k] = v
         else:
@@ -431,6 +541,11 @@ def find_player_by_name(q: str) -> List[Dict[str, Any]]:
             hits.append(r)
             if len(hits) >= 10: break
     if not hits:
+        historical = _find_historical_players(q, limit=10)
+        if historical:
+            _merge_into_cache(historical)
+            hits = historical
+    if not hits:
         online = _online_find_in_passthrough(q, limit=10)
         if online:
             _merge_into_cache(online)
@@ -447,6 +562,16 @@ def ensure_headshot_png(player: Any) -> Optional[bytes]:
     else:
         pid = str(player).strip()
     if not pid: return None
+
+    custom_local = os.path.join(CUSTOM_HEADSHOT_DIR, f"{pid}.png")
+    custom_asset = os.path.join(CUSTOM_HEADSHOT_ASSET_DIR, f"{pid}.png")
+    for path in (custom_local, custom_asset):
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    return f.read()
+            except Exception:
+                pass
 
     tmp_path = HEADSHOT_TMP_FMT.format(pid=pid)
     if os.path.exists(tmp_path):
@@ -472,6 +597,8 @@ def ensure_headshot_png(player: Any) -> Optional[bytes]:
 
     url_candidates: List[str] = []
     if url_hint: url_candidates.append(url_hint)
+    if OV_GH_REPO and HEADSHOTS_GH_DIR:
+        url_candidates.append(f"https://raw.githubusercontent.com/{OV_GH_REPO}/{OV_GH_BRANCH}/{HEADSHOTS_GH_DIR}/{pid}.png")
     url_candidates += [
         f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png",
         f"https://cdn.nba.com/headshots/nba/latest/260x190/{pid}.png",
@@ -501,9 +628,108 @@ def ensure_team_logo_png(team_id: Any) -> Optional[str]:
     if os.path.exists(gen): return gen
     return None
 
+def _gh_get_sha(path: str) -> Optional[str]:
+    if not (OV_GH_TOKEN and OV_GH_REPO and path):
+        return None
+    url = f"https://api.github.com/repos/{OV_GH_REPO}/contents/{path}?ref={OV_GH_BRANCH}"
+    headers = {
+        "Authorization": f"Bearer {OV_GH_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "vm-plashki",
+    }
+    try:
+        req = UrlRequest(url, headers=headers)
+        with http_urlopen(req, timeout=15) as r:
+            js = json.loads(r.read().decode("utf-8", "ignore"))
+        return js.get("sha")
+    except HTTPError as e:
+        if getattr(e, "code", None) != 404:
+            _log("gh sha error:", path, e)
+        return None
+    except Exception as e:
+        _log("gh sha error:", path, e)
+        return None
+
+def _gh_put_bytes(path: str, content: bytes, message: str) -> bool:
+    if not (OV_GH_TOKEN and OV_GH_REPO and path):
+        return False
+    url = f"https://api.github.com/repos/{OV_GH_REPO}/contents/{path}"
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content).decode("utf-8"),
+        "branch": OV_GH_BRANCH,
+    }
+    sha = _gh_get_sha(path)
+    if sha:
+        payload["sha"] = sha
+    headers = {
+        "Authorization": f"Bearer {OV_GH_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "vm-plashki",
+        "Content-Type": "application/json",
+    }
+    try:
+        req = UrlRequest(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+        with http_urlopen(req, timeout=20) as r:
+            r.read()
+        return True
+    except Exception as e:
+        _log("gh put bytes error:", path, e)
+        return False
+
+def save_custom_headshot(person_id: str, image_bytes: bytes, filename: str = "headshot") -> bool:
+    from PIL import Image
+    person_id = str(person_id or "").strip()
+    if not person_id or not image_bytes:
+        return False
+    try:
+        im = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+        bio = io.BytesIO()
+        im.save(bio, format="PNG")
+        png = bio.getvalue()
+    except Exception as e:
+        _log("custom headshot decode error:", e)
+        return False
+
+    os.makedirs(CUSTOM_HEADSHOT_DIR, exist_ok=True)
+    local_path = os.path.join(CUSTOM_HEADSHOT_DIR, f"{person_id}.png")
+    tmp_path = HEADSHOT_TMP_FMT.format(pid=person_id)
+    try:
+        with open(local_path, "wb") as f:
+            f.write(png)
+        with open(tmp_path, "wb") as f:
+            f.write(png)
+    except Exception as e:
+        _log("custom headshot local write error:", e)
+        return False
+
+    try:
+        os.makedirs(CUSTOM_HEADSHOT_ASSET_DIR, exist_ok=True)
+        with open(os.path.join(CUSTOM_HEADSHOT_ASSET_DIR, f"{person_id}.png"), "wb") as f:
+            f.write(png)
+    except Exception:
+        pass
+
+    if HEADSHOTS_GH_DIR:
+        _gh_put_bytes(f"{HEADSHOTS_GH_DIR}/{person_id}.png", png, f"update custom headshot {person_id}")
+    return True
+
 # ------------------ OVERRIDES (RU NAMES) -------------------------------------
 _OV_CACHE: Optional[Dict[str, str]] = None
 _GH_SHA: Optional[str] = None
+
+def _ov_load_seed() -> Dict[str, str]:
+    try:
+        if OV_SEED and os.path.exists(OV_SEED):
+            with open(OV_SEED, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                return {str(k): str(v) for k, v in d.items()}
+    except Exception as e:
+        _log("ov seed read error:", e)
+    return {}
 
 def _ov_load_local() -> Dict[str, str]:
     try:
@@ -587,11 +813,13 @@ def _ov_load() -> Dict[str, str]:
     global _OV_CACHE, _GH_SHA
     if _OV_CACHE is not None:
         return _OV_CACHE
-    d = _ov_load_local()
+    d = _ov_load_seed()
+    d.update(_ov_load_local())
     gh = _gh_get_file()
     if gh:
         _GH_SHA, gd = gh
-        d = gd or d
+        if gd:
+            d.update(gd)
     _OV_CACHE = d
     return d
 
@@ -627,6 +855,11 @@ def search_players_loose(q: str) -> List[Dict[str, Any]]:
             hits.append(r)
             if len(hits) >= 10:
                 break
+    if not hits:
+        historical = _find_historical_players(q, limit=10)
+        if historical:
+            _merge_into_cache(historical)
+            hits = historical
     if not hits:
         online = _online_find_in_passthrough(q, limit=10)
         if online:

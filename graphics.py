@@ -6,7 +6,7 @@ import math
 import os
 from typing import List, Optional, Tuple
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 W, H = 1920, 1080
 
@@ -299,7 +299,28 @@ def _draw_headshot(base: Image.Image, head_img: Image.Image, left: int = HEAD_LE
 
     out_w = max(1, int(round(HEAD_H * im.width / im.height)))
     im = im.resize((out_w, HEAD_H), Image.LANCZOS)
+    im.putalpha(ImageChops.multiply(im.getchannel("A"), _bottom_arc_mask(out_w, HEAD_H)))
     base.alpha_composite(im, (left, top))
+
+
+def _bottom_arc_mask(width: int, height: int) -> Image.Image:
+    mask = Image.new("L", (width, height), 255)
+    pix = mask.load()
+    cx = width / 2.0
+    rx = max(1.0, width * 0.74)
+    ry = max(1.0, min(height * 0.32, width * 0.48))
+    cy = height - ry
+    for x in range(width):
+        dx = (x - cx) / rx
+        if abs(dx) >= 1:
+            boundary = cy
+        else:
+            boundary = cy + ry * math.sqrt(1 - dx * dx)
+        b = int(boundary)
+        for y in range(max(0, b), height):
+            fade = max(0, min(255, int((boundary - y + 1.0) * 255)))
+            pix[x, y] = min(pix[x, y], fade)
+    return mask.filter(ImageFilter.GaussianBlur(0.4))
 
 
 def _stats_area_width(stats: List[Tuple[str, str]], min_w: int = MIN_STATS_AREA_W) -> int:
@@ -383,26 +404,68 @@ def _wrap_lines(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont,
     words = [w for w in (text or "").strip().upper().split() if w]
     lines: List[str] = []
     line = ""
+    def split_word(word: str) -> List[str]:
+        if _text_width(draw, word, font) <= max_w:
+            return [word]
+        chunks: List[str] = []
+        chunk = ""
+        for ch in word:
+            test = chunk + ch
+            if chunk and _text_width(draw, test, font) > max_w:
+                chunks.append(chunk)
+                chunk = ch
+            else:
+                chunk = test
+        if chunk:
+            chunks.append(chunk)
+        return chunks
+
     for word in words:
-        test = word if not line else f"{line} {word}"
-        if line and _text_width(draw, test, font) > max_w:
-            lines.append(line)
-            line = word
-        else:
-            line = test
+        pieces = split_word(word)
+        for piece_i, piece in enumerate(pieces):
+            if piece_i > 0 and line:
+                lines.append(line)
+                line = ""
+            word = piece
+            test = word if not line else f"{line} {word}"
+            if line and _text_width(draw, test, font) > max_w:
+                lines.append(line)
+                line = word
+            else:
+                line = test
     if line:
         lines.append(line)
     return lines or []
 
 
-def _preferred_info_lines(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_w: int) -> List[str]:
+def _wrap_semantic_lines(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_w: int) -> List[str]:
     words = [w for w in (text or "").strip().upper().split() if w]
     if "ПО" in words:
         idx = words.index("ПО")
         if 0 < idx < len(words) - 1:
-            semantic = [" ".join(words[:idx]), "ПО", " ".join(words[idx + 1 :])]
-            return semantic
+            chunks = [" ".join(words[:idx]), "ПО", " ".join(words[idx + 1 :])]
+            lines: List[str] = []
+            for chunk in chunks:
+                lines.extend(_wrap_lines(draw, chunk, font, max_w))
+            return lines
     return _wrap_lines(draw, text, font, max_w)
+
+
+def _fit_side_info(draw: ImageDraw.ImageDraw, info: str, max_w: int, max_h: int) -> Tuple[ImageFont.ImageFont, List[str], int]:
+    for size in range(50, 11, -2):
+        f = font_name(size)
+        lines = _wrap_semantic_lines(draw, info, f, max_w)
+        line_h = max(13, int(size * 1.06))
+        fits_width = all(_text_width(draw, line, f) <= max_w for line in lines)
+        if fits_width and line_h * len(lines) <= max_h:
+            return f, lines, line_h
+    f = font_name(12)
+    lines = _wrap_semantic_lines(draw, info, f, max_w)
+    return f, lines, 13
+
+
+def _preferred_info_lines(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_w: int) -> List[str]:
+    return _wrap_semantic_lines(draw, text, font, max_w)
 
 
 def _draw_side_info(base: Image.Image, x: int, y: int, width: int, info_text: str) -> None:
@@ -420,23 +483,13 @@ def _draw_side_info(base: Image.Image, x: int, y: int, width: int, info_text: st
         _draw_star(draw, star_x + 18, star_top + 19, 18)
 
     text_x = x + 68
-    text_top = y + 28
-    max_w = width - 72
-    size = 50
-    while size > 34:
-        f = font_name(size)
-        lines = _preferred_info_lines(draw, info, f, max_w)
-        line_h = int(size * 1.08)
-        fits_width = all(_text_width(draw, line, f) <= max_w for line in lines)
-        if len(lines) <= 3 and fits_width and text_top + line_h * len(lines) <= y + CARD_H - 20:
-            break
-        size -= 2
-    f = font_name(size)
-    lines = _preferred_info_lines(draw, info, f, max_w)[:3]
-    line_h = int(size * 1.08)
+    max_w = width - 86
+    max_h = CARD_H - 38
+    f, lines, line_h = _fit_side_info(draw, info, max_w, max_h)
+    total_h = line_h * len(lines)
+    text_top = y + max(20, (CARD_H - total_h) // 2)
     for i, line in enumerate(lines):
         _draw_text_left_top(draw, text_x, text_top + i * line_h, line, f)
-
 
 def render_card(
     mode: str,
@@ -507,7 +560,7 @@ def render_card_special(
 
     primary, dark, _ = team_colors
     main = _main_bar(main_w, CARD_H, _to_rgb(dark), _to_rgb(primary), corners="right")
-    side = _main_bar(SIDE_W, CARD_H, _to_rgb(dark), _to_rgb(primary), corners="right")
+    side = _main_bar(SIDE_W, CARD_H, _to_rgb(dark), _to_rgb(primary), corners="all")
     img.alpha_composite(main, (0, CARD_TOP))
     img.alpha_composite(side, (side_x, CARD_TOP))
 

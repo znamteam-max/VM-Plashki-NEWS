@@ -30,11 +30,11 @@ def _safe_import(modname:str, names:List[str]):
 _data_mod, _data_objs, _data_err = _safe_import("data", [
     "get_players","refresh_players","find_player_by_name","display_name_for",
     "overrides_save_name_ru","overrides_get_name_ru",
-    "ensure_headshot_png","ensure_team_logo_png",
+    "ensure_headshot_png","ensure_team_logo_png","save_custom_headshot",
 ])
 (get_players, refresh_players, find_player_by_name, display_name_for,
  overrides_save_name_ru, overrides_get_name_ru,
- ensure_headshot_png, ensure_team_logo_png) = ([_ for _ in _data_objs] + [None]*8)[:8]
+ ensure_headshot_png, ensure_team_logo_png, save_custom_headshot) = ([_ for _ in _data_objs] + [None]*9)[:9]
 
 # фолбэк-хранилище имён, если в data не реализовано
 if overrides_save_name_ru is None or overrides_get_name_ru is None:
@@ -55,11 +55,29 @@ _graphics_mod, _graphics_objs, _graphics_err = _safe_import("graphics", [
 (render_card, render_card2, render_card_special, render_card_bad) = ([_ for _ in _graphics_objs] + [None]*4)[:4]
 
 app = FastAPI()
+_BOT_MENU_SET = False
 
 try:
     from teams import TEAMS
 except Exception:
     TEAMS = {}
+
+def _ensure_bot_commands()->None:
+    global _BOT_MENU_SET
+    if _BOT_MENU_SET or not BOT_TOKEN:
+        return
+    commands=[
+        {"command":"menu","description":"Все опции бота"},
+        {"command":"find","description":"Найти игрока или выбрать команду"},
+        {"command":"card","description":"Обычная плашка"},
+        {"command":"card2","description":"Двойная плашка"},
+        {"command":"cards","description":"Плашка с правым окном"},
+        {"command":"cardbad","description":"BAD-плашка"},
+        {"command":"refresh","description":"Обновить базу игроков"},
+        {"command":"stop","description":"Сбросить текущий сценарий"},
+    ]
+    res=_tg_post("setMyCommands", {"commands":commands})
+    _BOT_MENU_SET=bool(res.get("ok"))
 
 # ------------- Telegram HTTP -------------
 def _tg_url(m:str)->str: return f"https://api.telegram.org/bot{BOT_TOKEN}/{m}"
@@ -123,6 +141,19 @@ def _tg_send_png_as_document(chat_id:int, png:bytes, filename:str="card.png", ca
         raw = r.read().decode("utf-8","ignore")
         try: return json.loads(raw)
         except Exception: return {"ok":False,"raw":raw}
+
+def _tg_get_file_bytes(file_id:str)->Tuple[Optional[bytes], Optional[str]]:
+    try:
+        info=_tg_post("getFile", {"file_id":file_id})
+        if not info.get("ok"):
+            return None, info.get("description") or info.get("error") or "getFile failed"
+        file_path=(info.get("result") or {}).get("file_path")
+        if not file_path:
+            return None, "Telegram не вернул file_path"
+        with http_urlopen(_tg_url("").replace("/bot", "/file/bot") + file_path, timeout=35) as r:
+            return r.read(), None
+    except Exception as e:
+        return None, repr(e)
 
 # ------------- utils -------------
 _RU_TO_LAT = str.maketrans({
@@ -310,7 +341,7 @@ def _similar_players(q:str, limit:int=8)->List[Dict[str,Any]]:
     scored.sort(key=lambda x: x[0], reverse=True)
     return [dict(p) for _,p in scored[:limit]]
 
-def _team_keyboard(prefix:str):
+def _team_keyboard(prefix:str, *, back_data:Optional[str]=None):
     rows=[]; row=[]
     for team_id, info in sorted((TEAMS or {}).items(), key=lambda kv: (kv[1].get("name","") if isinstance(kv[1],dict) else kv[0])):
         label=(info.get("abbr") or team_id).upper() if isinstance(info, dict) else team_id
@@ -319,15 +350,19 @@ def _team_keyboard(prefix:str):
             rows.append(row); row=[]
     if row:
         rows.append(row)
+    if back_data:
+        rows.append([{"text":"Назад", "callback_data":back_data}])
     return {"inline_keyboard":rows}
 
-def _player_keyboard(players:List[Dict[str,Any]], prefix:str, *, max_items:int=30):
+def _player_keyboard(players:List[Dict[str,Any]], prefix:str, *, max_items:int=30, back_data:Optional[str]=None):
     rows=[]
     for p in players[:max_items]:
         pid=_player_id(p)
         if not pid:
             continue
         rows.append([{"text":f"{_player_name(p)} · {_team_label(str(p.get('teamId') or '0'))}", "callback_data":f"{prefix}:{pid}"}])
+    if back_data:
+        rows.append([{"text":"Назад", "callback_data":back_data}])
     return {"inline_keyboard":rows} if rows else None
 
 def _candidate_keyboard(players:List[Dict[str,Any]], prefix:str):
@@ -337,19 +372,20 @@ def _candidate_keyboard(players:List[Dict[str,Any]], prefix:str):
         if pid:
             rows.append([{"text":f"{_player_name(p)} · {_team_label(str(p.get('teamId') or '0'))}", "callback_data":f"{prefix}:{pid}"}])
     rows.append([{"text":"Выбрать команду", "callback_data":"pick:teams"}])
+    rows.append([{"text":"Назад", "callback_data":"menu:main"}])
     return {"inline_keyboard":rows}
 
-def _store_pending_pick(st:Dict[str,Any], mode:str, stats, *, info:str=""):
-    st["pending_pick"]={"mode":mode, "stats":stats or [], "info":info or ""}
+def _store_pending_pick(st:Dict[str,Any], mode:str, stats, *, info:str="", query:str=""):
+    st["pending_pick"]={"mode":mode, "stats":stats or [], "info":info or "", "query":query or ""}
 
 def _ask_player_not_found(chat_id:int, name_q:str, mode:str, stats, *, info:str=""):
     st=_ctx(chat_id)
-    _store_pending_pick(st, mode, stats, info=info)
+    _store_pending_pick(st, mode, stats, info=info, query=name_q)
     similar=_similar_players(name_q)
     if similar:
         _status_update(chat_id, f"Не нашёл точное совпадение: {name_q}\nВыберите похожего игрока или команду.", keep_kb=_candidate_keyboard(similar, "pick:player"))
     else:
-        _status_update(chat_id, f"Не нашёл игрока: {name_q}\nВыберите команду, потом игрока из состава.", keep_kb=_team_keyboard("pick:team"))
+        _status_update(chat_id, f"Не нашёл игрока: {name_q}\nВыберите команду, потом игрока из состава.", keep_kb=_team_keyboard("pick:team", back_data="menu:main"))
 
 def _continue_with_player(chat_id:int, p:Dict[str,Any]):
     st=_ctx(chat_id)
@@ -461,16 +497,27 @@ def _kb_ok_or_fix():
          {"text":"Нужно исправить ✏️","callback_data":"fix:menu"}]
     ]}
 
+def _menu_keyboard():
+    return {"inline_keyboard":[
+        [{"text":"Обычная card","callback_data":"menu:card"},
+         {"text":"Двойная card2","callback_data":"menu:card2"}],
+        [{"text":"BAD cardbad","callback_data":"menu:cardbad"},
+         {"text":"Особая cards","callback_data":"menu:cards"}],
+        [{"text":"Поиск игрока","callback_data":"menu:find"},
+         {"text":"Обновить базу","callback_data":"menu:refresh"}],
+    ]}
+
 def _menu_text()->str:
     return (
-        "Меню плашек:\n"
+        "Меню бота:\n"
         "• /card <игрок> | <статы> — обычная плашка, длина зависит от количества стат.\n"
         "• /card2 <игрок1> | <статы1> || <игрок2> | <статы2> — двойная плашка на всю ширину.\n"
         "• /cardbad <игрок> | <статы> — коричневая BAD-плашка с иконкой.\n"
         "• /cards <игрок> | <статы> | <текст справа> — особая плашка с дополнительным окном.\n"
-        "• /find <имя> — поиск игрока; если не найдёт, можно выбрать команду.\n"
+        "• /find <имя> — поиск игрока, похожие варианты, текущие и исторические игроки.\n"
+        "• /refresh — обновить базу игроков.\n"
         "• /stop — сброс текущего сценария.\n\n"
-        "После генерации можно исправить имя, цвет, команду или логотип."
+        "После генерации можно исправить имя, цвет, команду/логотип или заменить фото игрока."
     )
 
 def _ctx_players(st:Dict[str,Any])->List[Tuple[str,Dict[str,Any]]]:
@@ -523,6 +570,7 @@ def _fix_team_player_keyboard(st:Dict[str,Any]):
     rows=[]
     for slot,p in _ctx_players(st):
         rows.append([{"text":f"Игрок {slot}: {_player_name(p)}", "callback_data":f"fix:teamplayer:{slot}"}])
+    rows.append([{"text":"Назад", "callback_data":"fix:menu"}])
     return {"inline_keyboard":rows} if rows else None
 
 def _set_ctx_player_team(chat_id:int, slot:str, team_id:str):
@@ -534,6 +582,71 @@ def _set_ctx_player_team(chat_id:int, slot:str, team_id:str):
     st[key]=_with_team_override(st[key], team_id)
     _status_update(chat_id,f"Поставил логотип/команду: {_team_label(team_id)}. Пересобираю плашку…")
     _render_ctx(chat_id)
+
+def _fix_photo_player_keyboard(st:Dict[str,Any]):
+    rows=[]
+    for slot,p in _ctx_players(st):
+        rows.append([{"text":f"Игрок {slot}: {_player_name(p)}", "callback_data":f"fix:photoplayer:{slot}"}])
+    rows.append([{"text":"Назад", "callback_data":"fix:menu"}])
+    return {"inline_keyboard":rows} if rows else None
+
+def _ask_custom_photo(chat_id:int, slot:str):
+    st=_ctx(chat_id)
+    key="p2" if slot=="2" else "p1"
+    p=st.get(key)
+    if not p:
+        _status_update(chat_id,"Не вижу игрока для замены фото. Сделайте новую плашку.")
+        return
+    st["waiting_photo_slot"]=slot
+    _status_update(
+        chat_id,
+        f"Пришлите новое фото для {_player_name(p)} как изображение или документ PNG/JPG/JPEG/WEBP. Я поставлю его вместо основного и пересоберу плашку.",
+        keep_kb={"inline_keyboard":[[{"text":"Назад","callback_data":"fix:menu"}]]}
+    )
+
+def _save_uploaded_photo(chat_id:int, msg:Dict[str,Any])->bool:
+    st=_ctx(chat_id)
+    slot=str(st.get("waiting_photo_slot") or "1")
+    key="p2" if slot=="2" else "p1"
+    p=st.get(key)
+    if not p:
+        st.pop("waiting_photo_slot", None)
+        _status_update(chat_id,"Не вижу игрока для замены фото. Сделайте новую плашку.")
+        return True
+
+    file_id=None; filename="headshot"
+    photos=msg.get("photo") or []
+    if photos:
+        file_id=photos[-1].get("file_id")
+        filename="photo.jpg"
+    doc=msg.get("document") or {}
+    if doc:
+        mime=(doc.get("mime_type") or "").lower()
+        name=(doc.get("file_name") or "headshot").lower()
+        if mime.startswith("image/") or name.endswith((".png",".jpg",".jpeg",".webp")):
+            file_id=doc.get("file_id")
+            filename=doc.get("file_name") or filename
+    if not file_id:
+        _status_update(chat_id,"Жду фото PNG/JPG/JPEG/WEBP как изображение или документ.")
+        return True
+
+    _status_update(chat_id,"Загружаю новое фото…")
+    raw, err=_tg_get_file_bytes(file_id)
+    if not raw:
+        _fail(chat_id, f"Не удалось скачать фото: {err}")
+        return True
+    if not save_custom_headshot:
+        _fail(chat_id, "Сохранение фото сейчас недоступно.")
+        return True
+    pid=_player_id(p)
+    ok=save_custom_headshot(pid, raw, filename)
+    if not ok:
+        _fail(chat_id,"Не смог обработать фото. Попробуйте PNG/JPG/JPEG/WEBP без сжатия.")
+        return True
+    st.pop("waiting_photo_slot", None)
+    _status_update(chat_id,"Фото заменено. Пересобираю плашку…")
+    _render_ctx(chat_id)
+    return True
 
 # ---------- secret ----------
 from starlette.responses import PlainTextResponse
@@ -669,13 +782,36 @@ async def webhook_query(request:Request):
     if cb:
         try:
             chat_id=cb["from"]["id"]; data=cb.get("data") or ""; st=_ctx(chat_id)
+            if data=="menu:main":
+                _status_update(chat_id, _menu_text(), keep_kb=_menu_keyboard()); return PlainTextResponse("OK")
+            if data.startswith("menu:"):
+                topic=data.split(":",1)[1]
+                hints={
+                    "card":"Обычная card:\n/card lebron | 30 очков, 11 подборов, 10 передач",
+                    "card2":"Двойная card2:\n/card2 lebron | 30 очков || doncic | 28 очков",
+                    "cardbad":"BAD cardbad:\n/cardbad reaves | 5 очков, 5-18 с игры, 3 потери",
+                    "cards":"Особая cards:\n/cards doncic | 30 очков, 10 передач | лидер лиги по трехочковым",
+                    "find":"Поиск:\n/find shai\nЕсли точного совпадения нет, появятся похожие игроки и выбор команды.",
+                    "refresh":"Обновляю базу игроков…",
+                }
+                if topic=="refresh":
+                    try:
+                        cnt, src = refresh_players() if refresh_players else (0, "n/a")
+                        _status_update(chat_id, f"База обновлена: {cnt} игроков ({src}).", keep_kb=_menu_keyboard())
+                    except Exception as e:
+                        _fail(chat_id, f"Не удалось обновить базу: {repr(e)}")
+                else:
+                    _status_update(chat_id, hints.get(topic, _menu_text()), keep_kb={"inline_keyboard":[[{"text":"Назад","callback_data":"menu:main"}]]})
+                return PlainTextResponse("OK")
             if data=="fix:ok":
                 _ctx_clear(chat_id); _tg_send_message(chat_id,"Готово ✅"); return PlainTextResponse("OK")
             if data=="fix:menu":
                 _status_update(chat_id,"Что исправить?", keep_kb={"inline_keyboard":[
                     [{"text":"Имена игроков","callback_data":"fix:names"},
                      {"text":"Цвет плашки","callback_data":"fix:color"}],
-                    [{"text":"Команда / логотип","callback_data":"fix:teams"}]
+                    [{"text":"Команда / логотип","callback_data":"fix:teams"},
+                     {"text":"Фото игрока","callback_data":"fix:photo"}],
+                    [{"text":"Назад","callback_data":"menu:main"}]
                 ]}); return PlainTextResponse("OK")
             if data=="fix:names":
                 players=_ctx_players(st)
@@ -734,30 +870,50 @@ async def webhook_query(request:Request):
                 if not players:
                     _status_update(chat_id,"Не вижу последнюю плашку для исправления. Сделайте новую командой /card."); return PlainTextResponse("OK")
                 if len(players)==1:
-                    _status_update(chat_id,"Выберите логотип/команду для игрока.", keep_kb=_team_keyboard("fix:teamset:1"))
+                    _status_update(chat_id,"Выберите логотип/команду для игрока.", keep_kb=_team_keyboard("fix:teamset:1", back_data="fix:menu"))
                 else:
                     _status_update(chat_id,"Для какого игрока поменять логотип/команду?", keep_kb=_fix_team_player_keyboard(st))
                 return PlainTextResponse("OK")
             if data.startswith("fix:teamplayer:"):
                 slot=data.rsplit(":",1)[-1]
-                _status_update(chat_id,"Выберите логотип/команду.", keep_kb=_team_keyboard(f"fix:teamset:{slot}"))
+                _status_update(chat_id,"Выберите логотип/команду.", keep_kb=_team_keyboard(f"fix:teamset:{slot}", back_data="fix:teams"))
                 return PlainTextResponse("OK")
             if data.startswith("fix:teamset:"):
                 parts=data.split(":")
                 if len(parts)>=4:
                     _set_ctx_player_team(chat_id, parts[2], parts[3])
                 return PlainTextResponse("OK")
+            if data=="fix:photo":
+                players=_ctx_players(st)
+                if not players:
+                    _status_update(chat_id,"Не вижу последнюю плашку для замены фото. Сделайте новую командой /card."); return PlainTextResponse("OK")
+                if len(players)==1:
+                    _ask_custom_photo(chat_id, "1")
+                else:
+                    _status_update(chat_id,"Для какого игрока заменить фото?", keep_kb=_fix_photo_player_keyboard(st))
+                return PlainTextResponse("OK")
+            if data.startswith("fix:photoplayer:"):
+                _ask_custom_photo(chat_id, data.rsplit(":",1)[-1])
+                return PlainTextResponse("OK")
+            if data=="pick:back":
+                pending=st.get("pending_pick") or {}
+                q=pending.get("query") or ""
+                if q:
+                    _ask_player_not_found(chat_id, q, pending.get("mode") or "single", pending.get("stats") or [], info=pending.get("info") or "")
+                else:
+                    _status_update(chat_id, _menu_text(), keep_kb=_menu_keyboard())
+                return PlainTextResponse("OK")
             if data=="pick:teams":
-                _status_update(chat_id,"Выберите команду, потом игрока из состава.", keep_kb=_team_keyboard("pick:team"))
+                _status_update(chat_id,"Выберите команду, потом игрока из состава.", keep_kb=_team_keyboard("pick:team", back_data="pick:back"))
                 return PlainTextResponse("OK")
             if data.startswith("pick:team:"):
                 team_id=data.rsplit(":",1)[-1]
                 players=_players_for_team(team_id)
-                kb=_player_keyboard(players, "pick:player")
-                if kb:
+                kb=_player_keyboard(players, "pick:player", back_data="pick:teams")
+                if players:
                     _status_update(chat_id,f"{_team_label(team_id)}: выберите игрока.", keep_kb=kb)
                 else:
-                    _status_update(chat_id,f"Не нашёл игроков команды {_team_label(team_id)} в текущей базе.")
+                    _status_update(chat_id,f"Не нашёл игроков команды {_team_label(team_id)} в текущей базе.", keep_kb=kb)
                 return PlainTextResponse("OK")
             if data.startswith("pick:player:"):
                 pid=data.rsplit(":",1)[-1]
@@ -772,9 +928,9 @@ async def webhook_query(request:Request):
                 players=_players_for_team(team_id)
                 if players:
                     lines=[f"{_player_name(p)} (id={_player_id(p)}, teamId={p.get('teamId')})" for p in players[:40]]
-                    _status_update(chat_id, f"{_team_label(team_id)}:\n" + "\n".join(lines))
+                    _status_update(chat_id, f"{_team_label(team_id)}:\n" + "\n".join(lines), keep_kb={"inline_keyboard":[[{"text":"Назад","callback_data":"menu:main"}]]})
                 else:
-                    _status_update(chat_id,f"Не нашёл игроков команды {_team_label(team_id)}.")
+                    _status_update(chat_id,f"Не нашёл игроков команды {_team_label(team_id)}.", keep_kb={"inline_keyboard":[[{"text":"Назад","callback_data":"menu:main"}]]})
                 return PlainTextResponse("OK")
             return PlainTextResponse("OK")
         except Exception as e:
@@ -784,6 +940,11 @@ async def webhook_query(request:Request):
     if not msg: return PlainTextResponse("OK")
     chat_id=msg["chat"]["id"]; text=(msg.get("text") or "").strip()
     st=_ctx(chat_id); st.setdefault("last_cmd_msg_id", msg.get("message_id"))
+    _ensure_bot_commands()
+
+    if st.get("waiting_photo_slot") and (msg.get("photo") or msg.get("document")):
+        _save_uploaded_photo(chat_id, msg)
+        return PlainTextResponse("OK")
 
     # аварийный выход
     if text.lower().startswith("/stop"):
@@ -852,12 +1013,22 @@ async def webhook_query(request:Request):
 
     # команды
     low=text.lower()
+    if low.startswith("/") and not any(low.startswith(x) for x in ("/start", "/menu", "/help", "/stop")):
+        _status_update(chat_id, "Думаю…")
 
     if low.startswith("/start") or low.startswith("/menu"):
-        _status_update(chat_id, _menu_text()); return PlainTextResponse("OK")
+        _status_update(chat_id, _menu_text(), keep_kb=_menu_keyboard()); return PlainTextResponse("OK")
 
     if low.startswith("/help"):
-        _status_update(chat_id, _menu_text()); return PlainTextResponse("OK")
+        _status_update(chat_id, _menu_text(), keep_kb=_menu_keyboard()); return PlainTextResponse("OK")
+
+    if low.startswith("/refresh"):
+        try:
+            cnt, src = refresh_players() if refresh_players else (0, "n/a")
+            _status_update(chat_id, f"База обновлена: {cnt} игроков ({src}).", keep_kb=_menu_keyboard())
+        except Exception as e:
+            _fail(chat_id, f"Не удалось обновить базу: {repr(e)}")
+        return PlainTextResponse("OK")
 
     if low.startswith("/find"):
         q = text[text.find(" "):].strip() if " " in text else ""
@@ -866,9 +1037,9 @@ async def webhook_query(request:Request):
             similar=_similar_players(q)
             if similar:
                 lines=[f"{_player_name(h)} (id={_player_id(h)}, teamId={h.get('teamId')})" for h in similar[:8]]
-                _status_update(chat_id, "Точного совпадения нет. Похожие:\n" + "\n".join(lines) + "\n\nМожно выбрать команду:", keep_kb=_team_keyboard("find:team"))
+                _status_update(chat_id, "Точного совпадения нет. Похожие:\n" + "\n".join(lines) + "\n\nМожно выбрать команду:", keep_kb=_team_keyboard("find:team", back_data="menu:main"))
             else:
-                _status_update(chat_id,"Ничего не нашёл. Можно выбрать команду:", keep_kb=_team_keyboard("find:team"))
+                _status_update(chat_id,"Ничего не нашёл. Можно выбрать команду:", keep_kb=_team_keyboard("find:team", back_data="menu:main"))
             return PlainTextResponse("OK")
         lines=[f"{h.get('displayName')} (id={h.get('personId')}, teamId={h.get('teamId')})" for h in hits[:8]]
         _status_update(chat_id, "\n".join(lines)); return PlainTextResponse("OK")
@@ -995,5 +1166,5 @@ async def webhook_query(request:Request):
         return PlainTextResponse("OK")
 
     # fallback
-    _status_update(chat_id, _menu_text())
+    _status_update(chat_id, _menu_text(), keep_kb=_menu_keyboard())
     return PlainTextResponse("OK")

@@ -132,11 +132,14 @@ def _find_in_dirs(team_id: str) -> Optional[str]:
     for d in TEAM_LOGO_DIRS:
         p = os.path.join(d, f"{team_id}.png")
         if os.path.exists(p): return p
+        p_logo = os.path.join(d, f"logo_{team_id}.png")
+        if os.path.exists(p_logo): return p_logo
     for d in TEAM_LOGO_DIRS:
         try:
             for fn in os.listdir(d):
                 if not fn.lower().endswith(".png"): continue
-                if team_id in fn:
+                stem = os.path.splitext(fn)[0].lower()
+                if stem == str(team_id).lower() or stem == f"logo_{team_id}".lower():
                     return os.path.join(d, fn)
         except FileNotFoundError:
             continue

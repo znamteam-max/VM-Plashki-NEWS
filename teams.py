@@ -5,6 +5,7 @@ from typing import Dict, Any
 # Базовая карта команд NBA: teamId -> данные бренда
 # Цвета: primary (официальный), dark/light будут вычислены в data.get_team_brand при необходимости
 TEAMS: Dict[str, Dict[str, Any]] = {
+    "0":          {"name": "NBA",                    "abbr": "nba", "espn": "nba", "primary": "#1D428A"},
     "1610612737": {"name": "Atlanta Hawks",         "abbr": "atl", "espn": "atl", "primary": "#E03A3E"},
     "1610612738": {"name": "Boston Celtics",        "abbr": "bos", "espn": "bos", "primary": "#007A33"},
     "1610612751": {"name": "Brooklyn Nets",         "abbr": "bkn", "espn": "bkn", "primary": "#000000"},
