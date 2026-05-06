@@ -293,6 +293,52 @@ def _kb_ok_or_fix():
          {"text":"Нужно исправить ✏️","callback_data":"fix:menu"}]
     ]}
 
+def _ctx_players(st:Dict[str,Any])->List[Tuple[str,Dict[str,Any]]]:
+    out=[]
+    if st.get("p1"): out.append(("1", st["p1"]))
+    if st.get("mode")=="duo" and st.get("p2"): out.append(("2", st["p2"]))
+    return out
+
+def _render_ctx(chat_id:int):
+    st=_ctx(chat_id)
+    mode=st.get("mode")
+    if mode=="single":
+        _render_single(chat_id, st["p1"], st.get("ru1") or "", st.get("stats1") or [])
+    elif mode=="special":
+        _render_special(chat_id, st["p1"], st.get("ru1") or "", st.get("stats1") or [], st.get("info") or "")
+    elif mode=="bad":
+        _render_bad(chat_id, st["p1"], st.get("ru1") or "", st.get("stats1") or [])
+    elif mode=="duo":
+        _render_duo(chat_id, st["p1"], st.get("ru1") or "", st.get("stats1") or [],
+                    st["p2"], st.get("ru2") or "", st.get("stats2") or [])
+
+def _color_menu_for_team(team_id:str):
+    if not (get_team_brand and set_team_primary_color):
+        return None
+    try:
+        _, _, palette, has_saved = get_team_brand(team_id)
+    except Exception:
+        palette, has_saved = [], False
+    rows=[]
+    for hexv in (palette or [])[:6]:
+        clean=hexv.strip().upper().lstrip("#")
+        label_name = color_name_ru(hexv) if color_name_ru else "цвет"
+        rows.append([{"text":f"{label_name} #{clean}", "callback_data":f"fix:color:set:{team_id}:{clean}"}])
+    rows.append([{"text":"Ввести HEX", "callback_data":f"fix:color:manual:{team_id}"}])
+    if has_saved:
+        rows.append([{"text":"AUTO", "callback_data":f"fix:color:set:{team_id}:AUTO"}])
+    return {"inline_keyboard":rows}
+
+def _color_team_choice_keyboard(st:Dict[str,Any]):
+    seen=set(); rows=[]
+    for slot,p in _ctx_players(st):
+        team_id=str(p.get("teamId") or "0")
+        if team_id in seen: continue
+        seen.add(team_id)
+        label=p.get("teamName") or p.get("teamId") or team_id
+        rows.append([{"text":f"Команда {slot}: {label}", "callback_data":f"fix:color:team:{team_id}"}])
+    return {"inline_keyboard":rows} if rows else None
+
 # ---------- secret ----------
 from starlette.responses import PlainTextResponse
 def _check_secret(request:Request):
@@ -432,6 +478,61 @@ async def webhook_query(request:Request):
                      {"text":"Цвет плашки","callback_data":"fix:color"}],
                     [{"text":"Команды","callback_data":"fix:teams"}]
                 ]}); return PlainTextResponse("OK")
+            if data=="fix:names":
+                players=_ctx_players(st)
+                if not players:
+                    _status_update(chat_id,"Не вижу последнюю плашку для исправления. Сделайте новую командой /card."); return PlainTextResponse("OK")
+                st.pop("waiting_color_team", None)
+                if st.get("mode")=="duo":
+                    st["ru1"]=None; st["ru2"]=None
+                else:
+                    st["ru1"]=None
+                slot,p=players[0]
+                _ask_ru_name(chat_id, str(p.get("personId") or ""), p.get("displayName") or "", reply_to=st.get("last_cmd_msg_id"))
+                _status_update(chat_id,"Жду новое русское имя… Ответьте на сообщение выше."); return PlainTextResponse("OK")
+            if data=="fix:color":
+                kb=_color_team_choice_keyboard(st)
+                if not kb:
+                    _status_update(chat_id,"Не вижу команду для исправления цвета. Сделайте новую плашку."); return PlainTextResponse("OK")
+                if len(kb["inline_keyboard"])==1:
+                    cbdata=kb["inline_keyboard"][0][0]["callback_data"]
+                    team_id=cbdata.rsplit(":",1)[-1]
+                    pal_kb=_color_menu_for_team(team_id)
+                    if pal_kb:
+                        _status_update(chat_id,"Выберите цвет плашки или введите свой HEX.", keep_kb=pal_kb)
+                    else:
+                        _status_update(chat_id,"Сейчас не удалось открыть палитру команды.")
+                    return PlainTextResponse("OK")
+                _status_update(chat_id,"Для какой команды поменять цвет?", keep_kb=kb); return PlainTextResponse("OK")
+            if data.startswith("fix:color:team:"):
+                team_id=data.rsplit(":",1)[-1]
+                kb=_color_menu_for_team(team_id)
+                if kb:
+                    _status_update(chat_id,"Выберите цвет плашки или введите свой HEX.", keep_kb=kb)
+                else:
+                    _status_update(chat_id,"Сейчас не удалось открыть палитру команды.")
+                return PlainTextResponse("OK")
+            if data.startswith("fix:color:manual:"):
+                team_id=data.rsplit(":",1)[-1]
+                st["waiting_color_team"]=team_id
+                _status_update(chat_id,f"Пришлите HEX для teamId={team_id}, например #552583. Можно написать AUTO для сброса.")
+                return PlainTextResponse("OK")
+            if data.startswith("fix:color:set:"):
+                parts=data.split(":")
+                if len(parts)>=5 and set_team_primary_color:
+                    team_id, raw = parts[3], parts[4]
+                    value = "AUTO" if raw.upper()=="AUTO" else f"#{raw.upper().lstrip('#')}"
+                    ok=set_team_primary_color(team_id, value)
+                    if ok:
+                        st.pop("waiting_color_team", None)
+                        _status_update(chat_id,f"Сохранил цвет команды {team_id}: {value}. Пересобираю плашку…")
+                        _render_ctx(chat_id)
+                    else:
+                        _status_update(chat_id,"Не смог сохранить цвет. Проверьте HEX: нужен формат #RRGGBB.")
+                return PlainTextResponse("OK")
+            if data=="fix:teams":
+                _status_update(chat_id,"Команда берётся из базы NBA по игроку. Сейчас можно исправить имя игрока или цвет плашки.", keep_kb=_kb_ok_or_fix())
+                return PlainTextResponse("OK")
             return PlainTextResponse("OK")
         except Exception as e:
             _fail(cb["from"]["id"], f"Ошибка: {repr(e)}"); return PlainTextResponse("OK")
@@ -478,6 +579,33 @@ async def webhook_query(request:Request):
                 elif mode=="special": _render_special(chat_id, st["p1"], st["ru1"], st.get("stats1") or [], st.get("info") or "")
                 elif mode=="bad": _render_bad(chat_id, st["p1"], st["ru1"], st.get("stats1") or [])
             return PlainTextResponse("OK")
+
+    if st.get("waiting_color_team") and text:
+        team_id=str(st.get("waiting_color_team") or "")
+        raw=text.strip().upper()
+        if raw=="AUTO":
+            value="AUTO"
+        else:
+            if not raw.startswith("#"):
+                raw="#"+raw
+            value=raw
+        if value!="AUTO" and not re.fullmatch(r"#[0-9A-F]{6}", value):
+            _status_update(chat_id,"HEX не похож на #RRGGBB. Например: #552583. Можно написать AUTO.")
+            return PlainTextResponse("OK")
+        if not set_team_primary_color:
+            _status_update(chat_id,"Сохранение цвета сейчас недоступно.")
+            return PlainTextResponse("OK")
+        try:
+            ok=set_team_primary_color(team_id, value)
+            if not ok:
+                _status_update(chat_id,"Не смог сохранить цвет. Проверьте формат HEX.")
+                return PlainTextResponse("OK")
+            st.pop("waiting_color_team", None)
+            _status_update(chat_id,f"Сохранил цвет команды {team_id}: {value}. Пересобираю плашку…")
+            _render_ctx(chat_id)
+        except Exception as e:
+            _fail(chat_id, f"Не удалось сохранить цвет: {repr(e)}")
+        return PlainTextResponse("OK")
 
     # команды
     low=text.lower()

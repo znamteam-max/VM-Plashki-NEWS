@@ -29,7 +29,13 @@ TEAMS_PRESET: Dict[str, List[str]] = {
     "1610612737": ["#E03A3E", "#C1D32F", "#000000"],  # Hawks
     "1610612747": ["#552583", "#FDB927", "#000000"],  # Lakers
     "1610612742": ["#00538C", "#002B5E", "#B8C4CA"],  # Mavericks
+    "1610612751": ["#000000", "#FFFFFF", "#707271"],  # Nets
 }
+
+try:
+    from teams import TEAMS as _TEAM_PRIMARY_PRESETS
+except Exception:
+    _TEAM_PRIMARY_PRESETS = {}
 
 def _log(*a: Any) -> None:
     try: print("[team_brand]", *a, flush=True)
@@ -161,6 +167,11 @@ def _merge_unique_hex(primary: List[str], extra: List[str], limit: int = 3) -> L
 def list_palette_for_team(team_id: str) -> List[str]:
     team_id = str(team_id or "0")
     preset = TEAMS_PRESET.get(team_id) or []
+    if not preset:
+        team_row = _TEAM_PRIMARY_PRESETS.get(team_id) if isinstance(_TEAM_PRIMARY_PRESETS, dict) else None
+        primary = team_row.get("primary") if isinstance(team_row, dict) else None
+        if isinstance(primary, str) and primary.startswith("#"):
+            preset = [primary]
     extracted: List[str] = []
     logo = get_team_logo_path(team_id)
     if logo and os.path.exists(logo):
