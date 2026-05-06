@@ -34,6 +34,26 @@ LOGO_DIR_TEAMS  = os.path.join(ASSETS_DIR, "teams")
 
 HEADSHOT_TMP_FMT = os.path.join(CACHE_DIR, "headshot_{pid}.png")
 
+MANUAL_PLAYERS: List[Dict[str, Any]] = [
+    {
+        "personId": "1642856",
+        "firstName": "Egor",
+        "lastName": "Demin",
+        "displayName": "Egor Demin",
+        "teamId": "1610612751",
+        "headshotURL": "https://cdn.nba.com/headshots/nba/latest/1040x760/1642856.png",
+        "aliases": ["Egor Dёmin", "Egor Dëmin", "Demin", "Dёmin", "Дёмин", "Демин", "Егор Дёмин"],
+    },
+]
+
+_RU_TO_LAT = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+})
+
 def _log(*a: Any) -> None:
     if DEBUG:
         try: print("[data]", *a, flush=True)
@@ -66,12 +86,54 @@ def _try_fetch(url: str) -> Optional[Any]:
     return None
 
 def _normalize_name(s: str) -> str:
-    s = (s or "").strip().lower()
+    s = (s or "").strip().lower().replace("ё", "е").replace("ë", "e")
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    keep = "abcdefghijklmnopqrstuvwxyzабвгдеёжзийклмнопрстуфхцчшщьыъэюя -'"
+    keep = "abcdefghijklmnopqrstuvwxyzабвгдеежзийклмнопрстуфхцчшщьыъэюя -'"
     s = "".join(ch for ch in s if ch in keep)
     return " ".join(s.split())
+
+def _translit_ru_to_lat(s: str) -> str:
+    return (s or "").lower().replace("ё", "е").translate(_RU_TO_LAT)
+
+def _query_variants(s: str) -> set[str]:
+    raw = s or ""
+    variants = {_normalize_name(raw), _normalize_name(_translit_ru_to_lat(raw))}
+    return {v for v in variants if v}
+
+def _player_search_blob(p: Dict[str, Any]) -> str:
+    parts = [
+        display_name_for(p),
+        p.get("firstName") or "",
+        p.get("lastName") or "",
+    ]
+    aliases = p.get("aliases")
+    if isinstance(aliases, list):
+        parts += [str(a) for a in aliases]
+    text = " ".join(part for part in parts if part)
+    variants = _query_variants(text)
+    variants.add(_normalize_name(text))
+    return " ".join(v for v in variants if v)
+
+def _matches_player(q: str, p: Dict[str, Any]) -> bool:
+    qvars = _query_variants(q)
+    if not qvars:
+        return False
+    blob = _player_search_blob(p)
+    return any(qv in blob for qv in qvars)
+
+def _merge_manual_players(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = [dict(r) for r in (rows or [])]
+    ix = _index_by_pid(out)
+    for manual in MANUAL_PLAYERS:
+        pid = str(manual.get("personId") or "")
+        if not pid:
+            continue
+        if pid in ix:
+            ix[pid].update({k: v for k, v in manual.items() if v})
+        else:
+            out.append(dict(manual))
+    return out
 
 def display_name_for(p: Dict[str, Any]) -> str:
     dn = (p.get("displayName") or "").strip()
@@ -333,6 +395,7 @@ def refresh_players() -> Tuple[int, str]:
         _PLAYERS = norm_rows; src_label = "norm"
     else:
         _PLAYERS = []; src_label = "none"
+    _PLAYERS = _merge_manual_players(_PLAYERS)
     _log(f"final players count: {len(_PLAYERS)} (source={src_label})")
     return len(_PLAYERS), src_label
 
@@ -352,8 +415,7 @@ def _online_find_in_passthrough(q: str, limit: int = 10) -> List[Dict[str, Any]]
         if not j: continue
         rows = _extract_passthrough(j)
         for r in rows:
-            hay = display_name_for(r)
-            if qn in _normalize_name(hay):
+            if qn and _matches_player(q, r):
                 results.append(r)
                 if len(results) >= limit: break
         if results: break
@@ -365,7 +427,7 @@ def find_player_by_name(q: str) -> List[Dict[str, Any]]:
     rows = get_players(False)
     hits: List[Dict[str, Any]] = []
     for r in rows:
-        if qn and qn in _normalize_name(display_name_for(r)):
+        if qn and _matches_player(q, r):
             hits.append(r)
             if len(hits) >= 10: break
     if not hits:
@@ -561,7 +623,7 @@ def search_players_loose(q: str) -> List[Dict[str, Any]]:
     rows = get_players(False)
     hits: List[Dict[str, Any]] = []
     for r in rows:
-        if qn in _normalize_name(display_name_for(r)):
+        if qn and _matches_player(q, r):
             hits.append(r)
             if len(hits) >= 10:
                 break

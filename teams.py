@@ -34,7 +34,7 @@ TEAMS: Dict[str, Dict[str, Any]] = {
     "1610612761": {"name": "Toronto Raptors",       "abbr": "tor", "espn": "tor", "primary": "#CE1141"},
     "1610612762": {"name": "Utah Jazz",             "abbr": "uta", "espn": "uta", "primary": "#002B5C"},
     "1610612764": {"name": "Washington Wizards",    "abbr": "wsh", "espn": "wsh", "primary": "#002B5C"},
-    "1610612767": {"name": "New Orleans Pelicans",  "abbr": "no",  "espn": "no",  "primary": "#0C2340"},
+    "1610612740": {"name": "New Orleans Pelicans",  "abbr": "no",  "espn": "no",  "primary": "#0C2340"},
 }
 
 GENERIC_NBA_PRIMARY = "#1D428A"  # синий NBA по умолчанию

@@ -1,6 +1,7 @@
 # api/telegram.py — стабильные статусы, память имён, рендер 1920x1080
 from __future__ import annotations
 import os, io, re, json, unicodedata, uuid, inspect
+from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Request
@@ -54,6 +55,11 @@ _graphics_mod, _graphics_objs, _graphics_err = _safe_import("graphics", [
 (render_card, render_card2, render_card_special, render_card_bad) = ([_ for _ in _graphics_objs] + [None]*4)[:4]
 
 app = FastAPI()
+
+try:
+    from teams import TEAMS
+except Exception:
+    TEAMS = {}
 
 # ------------- Telegram HTTP -------------
 def _tg_url(m:str)->str: return f"https://api.telegram.org/bot{BOT_TOKEN}/{m}"
@@ -119,13 +125,27 @@ def _tg_send_png_as_document(chat_id:int, png:bytes, filename:str="card.png", ca
         except Exception: return {"ok":False,"raw":raw}
 
 # ------------- utils -------------
+_RU_TO_LAT = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+})
+
 def _normalize(s:str)->str:
-    s=(s or "").strip().lower().replace("ё","е")
+    s=(s or "").strip().lower().replace("ё","е").replace("ë","e")
     s=unicodedata.normalize("NFKD", s)
     s="".join(ch for ch in s if not unicodedata.combining(ch))
-    keep="abcdefghijklmnopqrstuvwxyzабвгдеэжзийклмнопрстуфхцчшщьыъэюя -'0123456789+/%"
+    keep="abcdefghijklmnopqrstuvwxyzабвгдеежзийклмнопрстуфхцчшщьыъэюя -'0123456789+/%"
     s="".join(ch for ch in s if ch in keep)
     return " ".join(s.split())
+
+def _translit_ru_to_lat(s:str)->str:
+    return (s or "").lower().replace("ё","е").translate(_RU_TO_LAT)
+
+def _query_variants(s:str)->set[str]:
+    return {v for v in {_normalize(s), _normalize(_translit_ru_to_lat(s))} if v}
 
 LABEL_TOKENS=[
     ("плюс/минус","+/-"),("plus/minus","+/-"),("pm","+/-"),("+/-","+/-"),
@@ -196,7 +216,6 @@ def _get_players(force=False):
     return ps or []
 
 def search_players_loose(q:str):
-    qn=_normalize(q)
     ps=_get_players(False)
     if find_player_by_name:
         try:
@@ -204,12 +223,161 @@ def search_players_loose(q:str):
             if hits: return hits
         except Exception: pass
     out=[]
+    qvars=_query_variants(q)
     for p in ps:
         dn=p.get("displayName") or f"{p.get('firstName','')} {p.get('lastName','')}"
-        if dn and qn in _normalize(dn):
+        aliases=p.get("aliases") if isinstance(p.get("aliases"), list) else []
+        hay=" ".join([dn] + [str(a) for a in aliases])
+        blob=" ".join(_query_variants(hay))
+        if dn and qvars and any(qv in blob for qv in qvars):
             out.append(p)
             if len(out)>=10: break
     return out
+
+def _player_id(p:Dict[str,Any])->str:
+    return str(p.get("personId") or p.get("id") or "").strip()
+
+def _player_name(p:Dict[str,Any])->str:
+    if display_name_for:
+        try:
+            return display_name_for(p)
+        except Exception:
+            pass
+    return p.get("displayName") or f"{p.get('firstName','')} {p.get('lastName','')}".strip()
+
+def _find_player_by_id(pid:str)->Optional[Dict[str,Any]]:
+    pid=str(pid or "").strip()
+    for p in _get_players(False):
+        if _player_id(p)==pid:
+            return dict(p)
+    return None
+
+def _team_label(team_id:str)->str:
+    row = TEAMS.get(str(team_id or "")) if isinstance(TEAMS, dict) else None
+    if isinstance(row, dict):
+        abbr = (row.get("abbr") or "").upper()
+        return f"{row.get('name') or team_id}" + (f" ({abbr})" if abbr else "")
+    return str(team_id or "0")
+
+def _effective_team_id(p:Dict[str,Any])->str:
+    return str(p.get("logoTeamId") or p.get("teamId") or "0")
+
+def _with_team_override(p:Dict[str,Any], team_id:str)->Dict[str,Any]:
+    out=dict(p or {})
+    team_id=str(team_id or "0")
+    out["teamId"]=team_id
+    out["logoTeamId"]=team_id
+    row=TEAMS.get(team_id) if isinstance(TEAMS, dict) else None
+    if isinstance(row, dict):
+        out["teamName"]=row.get("name")
+    return out
+
+def _players_for_team(team_id:str)->List[Dict[str,Any]]:
+    team_id=str(team_id or "0")
+    rows=[]
+    seen=set()
+    for p in _get_players(False):
+        if str(p.get("teamId") or "0") != team_id:
+            continue
+        pid=_player_id(p)
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        rows.append(dict(p))
+    rows.sort(key=lambda p: _normalize(_player_name(p)))
+    return rows
+
+def _similar_players(q:str, limit:int=8)->List[Dict[str,Any]]:
+    qvars=_query_variants(q)
+    if not qvars:
+        return []
+    scored=[]
+    for p in _get_players(False):
+        name=_player_name(p)
+        aliases=p.get("aliases") if isinstance(p.get("aliases"), list) else []
+        variants=_query_variants(" ".join([name] + [str(a) for a in aliases]))
+        score=0.0
+        for qv in qvars:
+            for nv in variants:
+                if qv and qv in nv:
+                    score=max(score, 1.0)
+                elif qv and nv:
+                    score=max(score, SequenceMatcher(None, qv, nv).ratio())
+                    for part in nv.split():
+                        score=max(score, SequenceMatcher(None, qv, part).ratio())
+        if score >= 0.55:
+            scored.append((score, p))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [dict(p) for _,p in scored[:limit]]
+
+def _team_keyboard(prefix:str):
+    rows=[]; row=[]
+    for team_id, info in sorted((TEAMS or {}).items(), key=lambda kv: (kv[1].get("name","") if isinstance(kv[1],dict) else kv[0])):
+        label=(info.get("abbr") or team_id).upper() if isinstance(info, dict) else team_id
+        row.append({"text":label, "callback_data":f"{prefix}:{team_id}"})
+        if len(row)==3:
+            rows.append(row); row=[]
+    if row:
+        rows.append(row)
+    return {"inline_keyboard":rows}
+
+def _player_keyboard(players:List[Dict[str,Any]], prefix:str, *, max_items:int=30):
+    rows=[]
+    for p in players[:max_items]:
+        pid=_player_id(p)
+        if not pid:
+            continue
+        rows.append([{"text":f"{_player_name(p)} · {_team_label(str(p.get('teamId') or '0'))}", "callback_data":f"{prefix}:{pid}"}])
+    return {"inline_keyboard":rows} if rows else None
+
+def _candidate_keyboard(players:List[Dict[str,Any]], prefix:str):
+    rows=[]
+    for p in players[:8]:
+        pid=_player_id(p)
+        if pid:
+            rows.append([{"text":f"{_player_name(p)} · {_team_label(str(p.get('teamId') or '0'))}", "callback_data":f"{prefix}:{pid}"}])
+    rows.append([{"text":"Выбрать команду", "callback_data":"pick:teams"}])
+    return {"inline_keyboard":rows}
+
+def _store_pending_pick(st:Dict[str,Any], mode:str, stats, *, info:str=""):
+    st["pending_pick"]={"mode":mode, "stats":stats or [], "info":info or ""}
+
+def _ask_player_not_found(chat_id:int, name_q:str, mode:str, stats, *, info:str=""):
+    st=_ctx(chat_id)
+    _store_pending_pick(st, mode, stats, info=info)
+    similar=_similar_players(name_q)
+    if similar:
+        _status_update(chat_id, f"Не нашёл точное совпадение: {name_q}\nВыберите похожего игрока или команду.", keep_kb=_candidate_keyboard(similar, "pick:player"))
+    else:
+        _status_update(chat_id, f"Не нашёл игрока: {name_q}\nВыберите команду, потом игрока из состава.", keep_kb=_team_keyboard("pick:team"))
+
+def _continue_with_player(chat_id:int, p:Dict[str,Any]):
+    st=_ctx(chat_id)
+    pending=st.get("pending_pick") or {}
+    mode=pending.get("mode") or st.get("mode") or "single"
+    stats=pending.get("stats") or st.get("stats1") or []
+    info=pending.get("info") or st.get("info") or ""
+    keep_status=st.get("status_mid")
+    last_cmd=st.get("last_cmd_msg_id")
+    st.clear()
+    st.update({"mode":mode, "p1":dict(p), "stats1":stats, "info":info, "status_mid":keep_status, "last_cmd_msg_id":last_cmd})
+    pid=_player_id(p)
+    ru=None
+    try:
+        ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
+    except Exception:
+        pass
+    if not ru:
+        _ask_ru_name(chat_id, pid, _player_name(p), reply_to=st.get("last_cmd_msg_id"))
+        _status_update(chat_id,"Жду русское имя… Ответьте на сообщение выше.")
+        return
+    st["ru1"]=ru
+    if mode=="bad":
+        _render_bad(chat_id, p, ru, stats)
+    elif mode=="special":
+        _render_special(chat_id, p, ru, stats, info)
+    else:
+        _render_single(chat_id, p, ru, stats)
 
 # ---------- images/brand ----------
 def _ensure_headshot_image(p:Dict[str,Any]):
@@ -293,6 +461,18 @@ def _kb_ok_or_fix():
          {"text":"Нужно исправить ✏️","callback_data":"fix:menu"}]
     ]}
 
+def _menu_text()->str:
+    return (
+        "Меню плашек:\n"
+        "• /card <игрок> | <статы> — обычная плашка, длина зависит от количества стат.\n"
+        "• /card2 <игрок1> | <статы1> || <игрок2> | <статы2> — двойная плашка на всю ширину.\n"
+        "• /cardbad <игрок> | <статы> — коричневая BAD-плашка с иконкой.\n"
+        "• /cards <игрок> | <статы> | <текст справа> — особая плашка с дополнительным окном.\n"
+        "• /find <имя> — поиск игрока; если не найдёт, можно выбрать команду.\n"
+        "• /stop — сброс текущего сценария.\n\n"
+        "После генерации можно исправить имя, цвет, команду или логотип."
+    )
+
 def _ctx_players(st:Dict[str,Any])->List[Tuple[str,Dict[str,Any]]]:
     out=[]
     if st.get("p1"): out.append(("1", st["p1"]))
@@ -332,12 +512,28 @@ def _color_menu_for_team(team_id:str):
 def _color_team_choice_keyboard(st:Dict[str,Any]):
     seen=set(); rows=[]
     for slot,p in _ctx_players(st):
-        team_id=str(p.get("teamId") or "0")
+        team_id=_effective_team_id(p)
         if team_id in seen: continue
         seen.add(team_id)
-        label=p.get("teamName") or p.get("teamId") or team_id
+        label=_team_label(team_id)
         rows.append([{"text":f"Команда {slot}: {label}", "callback_data":f"fix:color:team:{team_id}"}])
     return {"inline_keyboard":rows} if rows else None
+
+def _fix_team_player_keyboard(st:Dict[str,Any]):
+    rows=[]
+    for slot,p in _ctx_players(st):
+        rows.append([{"text":f"Игрок {slot}: {_player_name(p)}", "callback_data":f"fix:teamplayer:{slot}"}])
+    return {"inline_keyboard":rows} if rows else None
+
+def _set_ctx_player_team(chat_id:int, slot:str, team_id:str):
+    st=_ctx(chat_id)
+    key="p2" if slot=="2" else "p1"
+    if not st.get(key):
+        _status_update(chat_id,"Не вижу игрока для исправления. Сделайте новую плашку.")
+        return
+    st[key]=_with_team_override(st[key], team_id)
+    _status_update(chat_id,f"Поставил логотип/команду: {_team_label(team_id)}. Пересобираю плашку…")
+    _render_ctx(chat_id)
 
 # ---------- secret ----------
 from starlette.responses import PlainTextResponse
@@ -391,8 +587,9 @@ def _render_single(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,st
         _status_update(chat_id, "Готовлю плашку…")
         head=_ensure_headshot_image(p)
         if head is None: _fail(chat_id,"Не удалось получить фото игрока."); return
-        logo=_ensure_team_logo_image(str(p.get("teamId") or "0"))
-        colors=_team_colors(str(p.get("teamId") or "0"))
+        team_id=_effective_team_id(p)
+        logo=_ensure_team_logo_image(team_id)
+        colors=_team_colors(team_id)
         # приводим статы
         stats=[(str(v), str(l)) for (v,l) in (stats or [])]
         png=_call_render(render_card, "single", ru, "", logo, colors, head, stats)
@@ -408,7 +605,7 @@ def _render_bad(chat_id:int, p:Dict[str,Any], ru:str, stats:List[Tuple[str,str]]
         _status_update(chat_id, "Готовлю BAD-плашку…")
         head=_ensure_headshot_image(p)
         if head is None: _fail(chat_id,"Не удалось получить фото игрока."); return
-        logo=_ensure_team_logo_image(str(p.get("teamId") or "0"))
+        logo=_ensure_team_logo_image(_effective_team_id(p))
         stats=[(str(v), str(l)) for (v,l) in (stats or [])]
         png=_call_render(render_card_bad, ru, head, stats, team_logo_img=logo)
         sent=_tg_send_png_as_document(chat_id, png, filename=f"cardBAD_{p.get('personId','x')}.png", caption=_stats_text(stats))
@@ -423,9 +620,10 @@ def _render_duo(chat_id:int, p1:Dict[str,Any], ru1:str, st1, p2:Dict[str,Any], r
         _status_update(chat_id, "Готовлю двойную плашку…")
         h1=_ensure_headshot_image(p1); h2=_ensure_headshot_image(p2)
         if h1 is None or h2 is None: _fail(chat_id,"Не удалось получить фото одного из игроков."); return
-        l1=_ensure_team_logo_image(str(p1.get("teamId") or "0"))
-        l2=_ensure_team_logo_image(str(p2.get("teamId") or "0"))
-        c1=_team_colors(str(p1.get("teamId") or "0")); c2=_team_colors(str(p2.get("teamId") or "0"))
+        t1=_effective_team_id(p1); t2=_effective_team_id(p2)
+        l1=_ensure_team_logo_image(t1)
+        l2=_ensure_team_logo_image(t2)
+        c1=_team_colors(t1); c2=_team_colors(t2)
         st1=[(str(v), str(l)) for (v,l) in (st1 or [])]
         st2=[(str(v), str(l)) for (v,l) in (st2 or [])]
         png=_call_render(render_card2, ru1, l1, c1, h1, st1, ru2, l2, c2, h2, st2)
@@ -442,8 +640,9 @@ def _render_special(chat_id:int, p:Dict[str,Any], ru:str, stats, info_text:str):
         _status_update(chat_id, "Готовлю плашку с правой колонкой…")
         head=_ensure_headshot_image(p)
         if head is None: _fail(chat_id,"Не удалось получить фото игрока."); return
-        logo=_ensure_team_logo_image(str(p.get("teamId") or "0"))
-        colors=_team_colors(str(p.get("teamId") or "0"))
+        team_id=_effective_team_id(p)
+        logo=_ensure_team_logo_image(team_id)
+        colors=_team_colors(team_id)
         stats=[(str(v), str(l)) for (v,l) in (stats or [])]
         png=_call_render(render_card_special, ru, logo, colors, head, stats, (info_text or ""))
         sent=_tg_send_png_as_document(chat_id, png, filename=f"cards_{p.get('personId','x')}.png", caption=_stats_text(stats))
@@ -476,7 +675,7 @@ async def webhook_query(request:Request):
                 _status_update(chat_id,"Что исправить?", keep_kb={"inline_keyboard":[
                     [{"text":"Имена игроков","callback_data":"fix:names"},
                      {"text":"Цвет плашки","callback_data":"fix:color"}],
-                    [{"text":"Команды","callback_data":"fix:teams"}]
+                    [{"text":"Команда / логотип","callback_data":"fix:teams"}]
                 ]}); return PlainTextResponse("OK")
             if data=="fix:names":
                 players=_ctx_players(st)
@@ -531,7 +730,51 @@ async def webhook_query(request:Request):
                         _status_update(chat_id,"Не смог сохранить цвет. Проверьте HEX: нужен формат #RRGGBB.")
                 return PlainTextResponse("OK")
             if data=="fix:teams":
-                _status_update(chat_id,"Команда берётся из базы NBA по игроку. Сейчас можно исправить имя игрока или цвет плашки.", keep_kb=_kb_ok_or_fix())
+                players=_ctx_players(st)
+                if not players:
+                    _status_update(chat_id,"Не вижу последнюю плашку для исправления. Сделайте новую командой /card."); return PlainTextResponse("OK")
+                if len(players)==1:
+                    _status_update(chat_id,"Выберите логотип/команду для игрока.", keep_kb=_team_keyboard("fix:teamset:1"))
+                else:
+                    _status_update(chat_id,"Для какого игрока поменять логотип/команду?", keep_kb=_fix_team_player_keyboard(st))
+                return PlainTextResponse("OK")
+            if data.startswith("fix:teamplayer:"):
+                slot=data.rsplit(":",1)[-1]
+                _status_update(chat_id,"Выберите логотип/команду.", keep_kb=_team_keyboard(f"fix:teamset:{slot}"))
+                return PlainTextResponse("OK")
+            if data.startswith("fix:teamset:"):
+                parts=data.split(":")
+                if len(parts)>=4:
+                    _set_ctx_player_team(chat_id, parts[2], parts[3])
+                return PlainTextResponse("OK")
+            if data=="pick:teams":
+                _status_update(chat_id,"Выберите команду, потом игрока из состава.", keep_kb=_team_keyboard("pick:team"))
+                return PlainTextResponse("OK")
+            if data.startswith("pick:team:"):
+                team_id=data.rsplit(":",1)[-1]
+                players=_players_for_team(team_id)
+                kb=_player_keyboard(players, "pick:player")
+                if kb:
+                    _status_update(chat_id,f"{_team_label(team_id)}: выберите игрока.", keep_kb=kb)
+                else:
+                    _status_update(chat_id,f"Не нашёл игроков команды {_team_label(team_id)} в текущей базе.")
+                return PlainTextResponse("OK")
+            if data.startswith("pick:player:"):
+                pid=data.rsplit(":",1)[-1]
+                p=_find_player_by_id(pid)
+                if not p:
+                    _status_update(chat_id,"Не смог открыть выбранного игрока. Попробуйте /refresh или /find.")
+                    return PlainTextResponse("OK")
+                _continue_with_player(chat_id, p)
+                return PlainTextResponse("OK")
+            if data.startswith("find:team:"):
+                team_id=data.rsplit(":",1)[-1]
+                players=_players_for_team(team_id)
+                if players:
+                    lines=[f"{_player_name(p)} (id={_player_id(p)}, teamId={p.get('teamId')})" for p in players[:40]]
+                    _status_update(chat_id, f"{_team_label(team_id)}:\n" + "\n".join(lines))
+                else:
+                    _status_update(chat_id,f"Не нашёл игроков команды {_team_label(team_id)}.")
                 return PlainTextResponse("OK")
             return PlainTextResponse("OK")
         except Exception as e:
@@ -610,24 +853,23 @@ async def webhook_query(request:Request):
     # команды
     low=text.lower()
 
-    if low.startswith("/start"):
-        _status_update(chat_id, "Я здесь. Готов работать 💼"); return PlainTextResponse("OK")
+    if low.startswith("/start") or low.startswith("/menu"):
+        _status_update(chat_id, _menu_text()); return PlainTextResponse("OK")
 
     if low.startswith("/help"):
-        _status_update(chat_id,
-            "Команды:\n"
-            "• /find <имя>\n"
-            "• /card <имя> | <статы>\n"
-            "• /card2 <имя1> | <статы1> || <имя2> | <статы2>\n"
-            "• /cards <имя> | <статы> | <текст справа>\n"
-            "• /cardbad <имя> | <статы> (или /bad)\n"
-            "• /stop — сброс сценария\n"
-        ); return PlainTextResponse("OK")
+        _status_update(chat_id, _menu_text()); return PlainTextResponse("OK")
 
     if low.startswith("/find"):
         q = text[text.find(" "):].strip() if " " in text else ""
         hits=search_players_loose(q)
-        if not hits: _status_update(chat_id,"Ничего не нашёл 🤷"); return PlainTextResponse("OK")
+        if not hits:
+            similar=_similar_players(q)
+            if similar:
+                lines=[f"{_player_name(h)} (id={_player_id(h)}, teamId={h.get('teamId')})" for h in similar[:8]]
+                _status_update(chat_id, "Точного совпадения нет. Похожие:\n" + "\n".join(lines) + "\n\nМожно выбрать команду:", keep_kb=_team_keyboard("find:team"))
+            else:
+                _status_update(chat_id,"Ничего не нашёл. Можно выбрать команду:", keep_kb=_team_keyboard("find:team"))
+            return PlainTextResponse("OK")
         lines=[f"{h.get('displayName')} (id={h.get('personId')}, teamId={h.get('teamId')})" for h in hits[:8]]
         _status_update(chat_id, "\n".join(lines)); return PlainTextResponse("OK")
 
@@ -640,10 +882,13 @@ async def webhook_query(request:Request):
             stats=parse_stats_list(stats_raw)
             _status_update(chat_id,"Ищу игрока…")
             hits=search_players_loose(name_q)
-            if not hits: _status_update(chat_id,f"Не нашёл игрока: {name_q}"); return PlainTextResponse("OK")
+            if not hits:
+                _ask_player_not_found(chat_id, name_q, "single", stats)
+                return PlainTextResponse("OK")
             p=hits[0]; pid=str(p.get("personId") or "")
+            keep_status=st.get("status_mid")
             st.clear(); st.update({"mode":"single","p1":p,"stats1":stats,"last_cmd_msg_id":msg.get("message_id"),
-                                   "status_mid": st.get("status_mid")})
+                                   "status_mid": keep_status})
             ru=None
             try: ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
             except Exception: pass
@@ -669,10 +914,18 @@ async def webhook_query(request:Request):
             _status_update(chat_id,"Ищу игроков…")
             h1, h2 = search_players_loose(n1), search_players_loose(n2)
             if not h1 or not h2:
-                _status_update(chat_id,"Не нашёл одного из игроков, уточните имена."); return PlainTextResponse("OK")
+                missing = n1 if not h1 else n2
+                similar=_similar_players(missing)
+                if similar:
+                    lines=[f"{_player_name(h)} (id={_player_id(h)}, teamId={h.get('teamId')})" for h in similar[:8]]
+                    _status_update(chat_id, f"Не нашёл игрока: {missing}\nПохожие:\n" + "\n".join(lines) + "\n\nМожно выбрать команду через /find.")
+                else:
+                    _status_update(chat_id,f"Не нашёл игрока: {missing}. Можно посмотреть состав через /find и выбор команды.")
+                return PlainTextResponse("OK")
             p1, p2 = h1[0], h2[0]
+            keep_status=st.get("status_mid")
             st.clear(); st.update({"mode":"duo","p1":p1,"stats1":st1,"p2":p2,"stats2":st2,
-                                   "last_cmd_msg_id":msg.get("message_id"),"status_mid": st.get("status_mid")})
+                                   "last_cmd_msg_id":msg.get("message_id"),"status_mid": keep_status})
             pid1, pid2 = str(p1.get("personId") or ""), str(p2.get("personId") or "")
             ru1 = overrides_get_name_ru(pid1) if overrides_get_name_ru else None
             ru2 = overrides_get_name_ru(pid2) if overrides_get_name_ru else None
@@ -698,10 +951,13 @@ async def webhook_query(request:Request):
             stats=parse_stats_list(stats_raw)
             _status_update(chat_id,"Ищу игрока…")
             hits=search_players_loose(name_q)
-            if not hits: _status_update(chat_id,f"Не нашёл игрока: {name_q}"); return PlainTextResponse("OK")
+            if not hits:
+                _ask_player_not_found(chat_id, name_q, "special", stats, info=info_text)
+                return PlainTextResponse("OK")
             p=hits[0]; pid=str(p.get("personId") or "")
+            keep_status=st.get("status_mid")
             st.clear(); st.update({"mode":"special","p1":p,"stats1":stats,"info":info_text,
-                                   "last_cmd_msg_id":msg.get("message_id"),"status_mid": st.get("status_mid")})
+                                   "last_cmd_msg_id":msg.get("message_id"),"status_mid": keep_status})
             ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
             if not ru:
                 _ask_ru_name(chat_id, pid, p.get("displayName") or "", reply_to=st.get("last_cmd_msg_id"))
@@ -721,10 +977,13 @@ async def webhook_query(request:Request):
             stats=parse_stats_list(stats_raw)
             _status_update(chat_id,"Ищу игрока…")
             hits=search_players_loose(name_q)
-            if not hits: _status_update(chat_id,f"Не нашёл игрока: {name_q}"); return PlainTextResponse("OK")
+            if not hits:
+                _ask_player_not_found(chat_id, name_q, "bad", stats)
+                return PlainTextResponse("OK")
             p=hits[0]; pid=str(p.get("personId") or "")
+            keep_status=st.get("status_mid")
             st.clear(); st.update({"mode":"bad","p1":p,"stats1":stats,"last_cmd_msg_id":msg.get("message_id"),
-                                   "status_mid": st.get("status_mid")})
+                                   "status_mid": keep_status})
             ru = overrides_get_name_ru(pid) if overrides_get_name_ru else None
             if not ru:
                 _ask_ru_name(chat_id, pid, p.get("displayName") or "", reply_to=st.get("last_cmd_msg_id"))
@@ -736,12 +995,5 @@ async def webhook_query(request:Request):
         return PlainTextResponse("OK")
 
     # fallback
-    _status_update(chat_id,
-        "Команды:\n"
-        "• /find <имя>\n"
-        "• /card <имя> | <статы>\n"
-        "• /card2 <имя1> | <статы1> || <имя2> | <статы2>\n"
-        "• /cards <имя> | <статы> | <текст справа>\n"
-        "• /cardbad <имя> | <статы> (или /bad)\n"
-        "• /stop — сброс сценария\n")
+    _status_update(chat_id, _menu_text())
     return PlainTextResponse("OK")

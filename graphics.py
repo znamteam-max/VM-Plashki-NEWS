@@ -506,8 +506,8 @@ def render_card_special(
     side_x = min(W - SIDE_W, main_w + SIDE_GAP)
 
     primary, dark, _ = team_colors
-    main = _main_bar(main_w, CARD_H, _to_rgb(dark), _to_rgb(primary), corners="all")
-    side = _main_bar(SIDE_W, CARD_H, _to_rgb(dark), _to_rgb(primary), corners="all")
+    main = _main_bar(main_w, CARD_H, _to_rgb(dark), _to_rgb(primary), corners="right")
+    side = _main_bar(SIDE_W, CARD_H, _to_rgb(dark), _to_rgb(primary), corners="right")
     img.alpha_composite(main, (0, CARD_TOP))
     img.alpha_composite(side, (side_x, CARD_TOP))
 
@@ -527,7 +527,7 @@ def render_card_bad(
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     card_w, area_w = _card_width(name_ru, stats, bad=True)
 
-    bar = _main_bar(card_w, CARD_H, BROWN_LEFT, BROWN_RIGHT, corners="all")
+    bar = _main_bar(card_w, CARD_H, BROWN_LEFT, BROWN_RIGHT, corners="right")
     img.alpha_composite(bar, (0, CARD_TOP))
 
     _draw_player_stack(img, team_logo_img, head_img)
